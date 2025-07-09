@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::ffi::OsStr;
-use std::fs::{File, OpenOptions};
-use std::io::{Read, Write, Seek, SeekFrom};
+use std::io::{Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -12,11 +11,13 @@ use fuser::{
 };
 use libc::ENOENT;
 use tokio::sync::RwLock;
-use tracing::{debug, info, warn};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, AsyncSeekExt};
+use tracing::{debug, info, warn, error};
 
 use crate::cache::manager::CacheManager;
 use crate::cache::state::CachePriority;
 use crate::core::config::Config;
+use crate::core::error::CacheFsError;
 use crate::fs::inode::{InodeManager, FileAttr as InternalFileAttr, FileType as InternalFileType};
 
 /// NFS-CacheFS 文件系统实现
@@ -28,9 +29,11 @@ pub struct CacheFs {
     /// 缓存管理器
     cache_manager: Arc<CacheManager>,
     /// 打开的文件句柄
-    open_files: Arc<RwLock<HashMap<u64, Arc<RwLock<File>>>>>,
+    open_files: Arc<RwLock<HashMap<u64, Arc<RwLock<tokio::fs::File>>>>>,
     /// 下一个文件句柄
     next_fh: Arc<RwLock<u64>>,
+    /// Tokio 运行时句柄
+    runtime_handle: tokio::runtime::Handle,
 }
 
 impl CacheFs {
@@ -47,6 +50,7 @@ impl CacheFs {
             cache_manager,
             open_files: Arc::new(RwLock::new(HashMap::new())),
             next_fh: Arc::new(RwLock::new(1)),
+            runtime_handle: tokio::runtime::Handle::current(),
         })
     }
     
@@ -72,7 +76,7 @@ impl CacheFs {
     async fn get_nfs_attr(&self, path: &Path) -> Result<InternalFileAttr, i32> {
         let nfs_path = self.get_nfs_path(path);
         
-        match std::fs::metadata(&nfs_path) {
+        match tokio::fs::metadata(&nfs_path).await {
             Ok(metadata) => {
                 let inode = self.inode_manager.get_inode(path)
                     .unwrap_or_else(|| self.inode_manager.allocate_inode());
@@ -143,12 +147,31 @@ impl CacheFs {
             warn!("Failed to trigger cache for {}: {}", path.display(), e);
         }
     }
+
+    /// 原子性缓存失效操作
+    async fn invalidate_cache(&self, path: &Path) -> Result<(), CacheFsError> {
+        let cache_path = self.get_cache_path(path);
+        
+        // 1. 更新缓存管理器状态
+        self.cache_manager.invalidate_cache_entry(&cache_path).await?;
+        
+        // 2. 删除物理文件
+        if tokio::fs::try_exists(&cache_path).await.unwrap_or(false) {
+            if let Err(e) = tokio::fs::remove_file(&cache_path).await {
+                error!("Failed to remove cache file {}: {}", cache_path.display(), e);
+                return Err(CacheFsError::IoError(e));
+            }
+        }
+        
+        info!("Invalidated cache for modified file: {}", path.display());
+        Ok(())
+    }
     
     /// 从缓存或 NFS 读取文件数据
     async fn read_file_data(&self, path: &Path, offset: i64, size: u32) -> Result<Vec<u8>, i32> {
         // 首先尝试从缓存读取
         let cache_path = self.get_cache_path(path);
-        if cache_path.exists() {
+        if tokio::fs::try_exists(&cache_path).await.unwrap_or(false) {
             debug!("Reading from cache: {}", cache_path.display());
             match self.read_from_file(&cache_path, offset, size).await {
                 Ok(data) => {
@@ -159,7 +182,9 @@ impl CacheFs {
                 Err(e) => {
                     warn!("Failed to read from cache {}: {}", cache_path.display(), e);
                     // 缓存文件损坏，删除它
-                    let _ = std::fs::remove_file(&cache_path);
+                    if let Err(invalidate_err) = self.invalidate_cache(path).await {
+                        warn!("Failed to invalidate corrupted cache: {}", invalidate_err);
+                    }
                 }
             }
         }
@@ -174,7 +199,7 @@ impl CacheFs {
                 self.cache_manager.record_access(&path.to_path_buf());
                 
                 // 如果文件应该被缓存，触发异步缓存
-                if let Ok(metadata) = std::fs::metadata(&nfs_path) {
+                if let Ok(metadata) = tokio::fs::metadata(&nfs_path).await {
                     if self.should_cache(path, metadata.len()) {
                         self.trigger_cache(path, CachePriority::Normal).await;
                     }
@@ -188,17 +213,17 @@ impl CacheFs {
     
     /// 从指定文件读取数据
     async fn read_from_file(&self, file_path: &Path, offset: i64, size: u32) -> Result<Vec<u8>, i32> {
-        let mut file = match File::open(file_path) {
+        let mut file = match tokio::fs::File::open(file_path).await {
             Ok(f) => f,
             Err(_) => return Err(ENOENT),
         };
         
-        if let Err(_) = file.seek(SeekFrom::Start(offset as u64)) {
+        if let Err(_) = file.seek(SeekFrom::Start(offset as u64)).await {
             return Err(libc::EINVAL);
         }
         
         let mut buffer = vec![0; size as usize];
-        match file.read(&mut buffer) {
+        match file.read(&mut buffer).await {
             Ok(bytes_read) => {
                 buffer.truncate(bytes_read);
                 Ok(buffer)
@@ -211,26 +236,25 @@ impl CacheFs {
     async fn write_file_data(&self, path: &Path, offset: i64, data: &[u8]) -> Result<u32, i32> {
         let nfs_path = self.get_nfs_path(path);
         
-        let mut file = match OpenOptions::new()
+        let mut file = match tokio::fs::OpenOptions::new()
             .write(true)
             .create(true)
             .open(&nfs_path)
+            .await
         {
             Ok(f) => f,
             Err(_) => return Err(libc::EACCES),
         };
         
-        if let Err(_) = file.seek(SeekFrom::Start(offset as u64)) {
+        if let Err(_) = file.seek(SeekFrom::Start(offset as u64)).await {
             return Err(libc::EINVAL);
         }
         
-        match file.write(data) {
+        match file.write(data).await {
             Ok(bytes_written) => {
-                // 写入后需要使缓存无效
-                let cache_path = self.get_cache_path(path);
-                if cache_path.exists() {
-                    let _ = std::fs::remove_file(&cache_path);
-                    info!("Invalidated cache for modified file: {}", path.display());
+                // 写入后需要使缓存无效（原子性操作）
+                if let Err(e) = self.invalidate_cache(path).await {
+                    warn!("Failed to invalidate cache after write: {}", e);
                 }
                 
                 Ok(bytes_written as u32)
@@ -243,19 +267,14 @@ impl CacheFs {
     async fn list_directory(&self, path: &Path) -> Result<Vec<(String, InternalFileAttr)>, i32> {
         let nfs_path = self.get_nfs_path(path);
         
-        let entries = match std::fs::read_dir(&nfs_path) {
+        let mut entries = match tokio::fs::read_dir(&nfs_path).await {
             Ok(entries) => entries,
             Err(_) => return Err(ENOENT),
         };
         
         let mut result = Vec::new();
         
-        for entry in entries {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-            
+        while let Ok(Some(entry)) = entries.next_entry().await {
             let name = entry.file_name().to_string_lossy().to_string();
             let entry_path = path.join(&name);
             
@@ -273,26 +292,23 @@ impl Filesystem for CacheFs {
         let inode_manager = Arc::clone(&self.inode_manager);
         let config = self.config.clone();
         let name = name.to_os_string();
+        let runtime_handle = self.runtime_handle.clone();
         
-        tokio::spawn(async move {
+        // 使用 block_on 避免在同步回调中使用异步
+        let result = runtime_handle.block_on(async move {
             let parent_path = if parent == FUSE_ROOT_ID {
                 PathBuf::from("/")
             } else {
                 match inode_manager.get_path(parent) {
                     Some(path) => path,
-                    None => {
-                        reply.error(ENOENT);
-                        return;
-                    }
+                    None => return Err(ENOENT),
                 }
             };
             
             let file_path = parent_path.join(&name);
-            
-            // 从 NFS 后端获取属性
             let nfs_path = config.nfs_backend_path.join(file_path.strip_prefix("/").unwrap_or(&file_path));
             
-            match std::fs::metadata(&nfs_path) {
+            match tokio::fs::metadata(&nfs_path).await {
                 Ok(metadata) => {
                     let inode = inode_manager.get_inode(&file_path)
                         .unwrap_or_else(|| inode_manager.allocate_inode());
@@ -323,25 +339,30 @@ impl Filesystem for CacheFs {
                     };
                     
                     inode_manager.insert_mapping(file_path, inode, attr.clone());
-                    let fuse_attr: FileAttr = attr.into();
-                    reply.entry(&Duration::from_secs(1), &fuse_attr, 0);
+                    Ok(attr)
                 }
-                Err(_) => reply.error(ENOENT),
+                Err(_) => Err(ENOENT),
             }
         });
+        
+        match result {
+            Ok(attr) => {
+                let fuse_attr: FileAttr = attr.into();
+                reply.entry(&Duration::from_secs(1), &fuse_attr, 0);
+            }
+            Err(err) => reply.error(err),
+        }
     }
     
     fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
         let inode_manager = Arc::clone(&self.inode_manager);
         
-        tokio::spawn(async move {
-            if let Some(attr) = inode_manager.get_attr(ino) {
-                let fuse_attr: FileAttr = attr.into();
-                reply.attr(&Duration::from_secs(1), &fuse_attr);
-            } else {
-                reply.error(ENOENT);
-            }
-        });
+        if let Some(attr) = inode_manager.get_attr(ino) {
+            let fuse_attr: FileAttr = attr.into();
+            reply.attr(&Duration::from_secs(1), &fuse_attr);
+        } else {
+            reply.error(ENOENT);
+        }
     }
     
     fn read(
@@ -357,40 +378,39 @@ impl Filesystem for CacheFs {
     ) {
         let inode_manager = Arc::clone(&self.inode_manager);
         let config = self.config.clone();
-        let _cache_manager = Arc::clone(&self.cache_manager);
+        let runtime_handle = self.runtime_handle.clone();
         
-        tokio::spawn(async move {
+        let result = runtime_handle.block_on(async move {
             let path = match inode_manager.get_path(ino) {
                 Some(path) => path,
-                None => {
-                    reply.error(ENOENT);
-                    return;
-                }
+                None => return Err(ENOENT),
             };
             
-            // 简化的读取实现
             let nfs_path = config.nfs_backend_path.join(path.strip_prefix("/").unwrap_or(&path));
             
-            match std::fs::File::open(&nfs_path) {
-                Ok(mut file) => {
-                    use std::io::{Read, Seek, SeekFrom};
-                    if let Err(_) = file.seek(SeekFrom::Start(offset as u64)) {
-                        reply.error(libc::EINVAL);
-                        return;
-                    }
-                    
-                    let mut buffer = vec![0; size as usize];
-                    match file.read(&mut buffer) {
-                        Ok(bytes_read) => {
-                            buffer.truncate(bytes_read);
-                            reply.data(&buffer);
-                        }
-                        Err(_) => reply.error(libc::EIO),
-                    }
+            let mut file = match tokio::fs::File::open(&nfs_path).await {
+                Ok(f) => f,
+                Err(_) => return Err(ENOENT),
+            };
+            
+            if let Err(_) = file.seek(SeekFrom::Start(offset as u64)).await {
+                return Err(libc::EINVAL);
+            }
+            
+            let mut buffer = vec![0; size as usize];
+            match file.read(&mut buffer).await {
+                Ok(bytes_read) => {
+                    buffer.truncate(bytes_read);
+                    Ok(buffer)
                 }
-                Err(_) => reply.error(ENOENT),
+                Err(_) => Err(libc::EIO),
             }
         });
+        
+        match result {
+            Ok(data) => reply.data(&data),
+            Err(err) => reply.error(err),
+        }
     }
     
     fn write(
@@ -408,35 +428,40 @@ impl Filesystem for CacheFs {
         let inode_manager = Arc::clone(&self.inode_manager);
         let config = self.config.clone();
         let data = data.to_vec();
+        let runtime_handle = self.runtime_handle.clone();
         
-        tokio::spawn(async move {
+        let result = runtime_handle.block_on(async move {
             let path = match inode_manager.get_path(ino) {
                 Some(path) => path,
-                None => {
-                    reply.error(ENOENT);
-                    return;
-                }
+                None => return Err(ENOENT),
             };
             
-            // 简化的写入实现
             let nfs_path = config.nfs_backend_path.join(path.strip_prefix("/").unwrap_or(&path));
             
-            match std::fs::OpenOptions::new().write(true).create(true).open(&nfs_path) {
-                Ok(mut file) => {
-                    use std::io::{Write, Seek, SeekFrom};
-                    if let Err(_) = file.seek(SeekFrom::Start(offset as u64)) {
-                        reply.error(libc::EINVAL);
-                        return;
-                    }
-                    
-                    match file.write(&data) {
-                        Ok(bytes_written) => reply.written(bytes_written as u32),
-                        Err(_) => reply.error(libc::EIO),
-                    }
-                }
-                Err(_) => reply.error(libc::EACCES),
+            let mut file = match tokio::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .open(&nfs_path)
+                .await
+            {
+                Ok(f) => f,
+                Err(_) => return Err(libc::EACCES),
+            };
+            
+            if let Err(_) = file.seek(SeekFrom::Start(offset as u64)).await {
+                return Err(libc::EINVAL);
+            }
+            
+            match file.write(&data).await {
+                Ok(bytes_written) => Ok(bytes_written as u32),
+                Err(_) => Err(libc::EIO),
             }
         });
+        
+        match result {
+            Ok(bytes_written) => reply.written(bytes_written),
+            Err(err) => reply.error(err),
+        }
     }
     
     fn open(&mut self, _req: &Request, ino: u64, _flags: i32, reply: ReplyOpen) {
@@ -444,31 +469,33 @@ impl Filesystem for CacheFs {
         let config = self.config.clone();
         let open_files = Arc::clone(&self.open_files);
         let next_fh = Arc::clone(&self.next_fh);
+        let runtime_handle = self.runtime_handle.clone();
         
-        tokio::spawn(async move {
+        let result = runtime_handle.block_on(async move {
             let path = match inode_manager.get_path(ino) {
                 Some(path) => path,
-                None => {
-                    reply.error(ENOENT);
-                    return;
-                }
+                None => return Err(ENOENT),
             };
             
-            // 简化实现：直接使用 NFS 路径
             let nfs_path = config.nfs_backend_path.join(path.strip_prefix("/").unwrap_or(&path));
             
-            match File::open(&nfs_path) {
+            match tokio::fs::File::open(&nfs_path).await {
                 Ok(file) => {
                     let mut next = next_fh.write().await;
                     let fh = *next;
                     *next += 1;
                     
                     open_files.write().await.insert(fh, Arc::new(RwLock::new(file)));
-                    reply.opened(fh, 0);
+                    Ok(fh)
                 }
-                Err(_) => reply.error(ENOENT),
+                Err(_) => Err(ENOENT),
             }
         });
+        
+        match result {
+            Ok(fh) => reply.opened(fh, 0),
+            Err(err) => reply.error(err),
+        }
     }
     
     fn readdir(
@@ -481,77 +508,82 @@ impl Filesystem for CacheFs {
     ) {
         let inode_manager = Arc::clone(&self.inode_manager);
         let config = self.config.clone();
+        let runtime_handle = self.runtime_handle.clone();
         
-        tokio::spawn(async move {
+        let result = runtime_handle.block_on(async move {
             let path = if ino == FUSE_ROOT_ID {
                 PathBuf::from("/")
             } else {
                 match inode_manager.get_path(ino) {
                     Some(path) => path,
-                    None => {
-                        reply.error(ENOENT);
-                        return;
-                    }
+                    None => return Err(ENOENT),
                 }
             };
             
-            // 简化的目录读取实现
             let nfs_path = config.nfs_backend_path.join(path.strip_prefix("/").unwrap_or(&path));
             
-            match std::fs::read_dir(&nfs_path) {
-                Ok(entries) => {
-                    let mut index = 0;
-                    
-                    // 添加 . 和 .. 条目
-                    if offset <= index {
-                        if reply.add(ino, index + 1, FileType::Directory, ".") {
-                            reply.ok();
-                            return;
-                        }
-                    }
-                    index += 1;
-                    
-                    if offset <= index {
-                        let parent_ino = if ino == FUSE_ROOT_ID {
-                            FUSE_ROOT_ID
-                        } else {
-                            FUSE_ROOT_ID
-                        };
-                        
-                        if reply.add(parent_ino, index + 1, FileType::Directory, "..") {
-                            reply.ok();
-                            return;
-                        }
-                    }
-                    index += 1;
-                    
-                    // 添加实际的目录条目
-                    for entry in entries {
-                        if let Ok(entry) = entry {
-                            if offset <= index {
-                                let name = entry.file_name().to_string_lossy().to_string();
-                                let file_type = if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                                    FileType::Directory
-                                } else {
-                                    FileType::RegularFile
-                                };
-                                
-                                // 分配临时 inode
-                                let temp_ino = inode_manager.allocate_inode();
-                                
-                                if reply.add(temp_ino, index + 1, file_type, &name) {
-                                    break;
-                                }
-                            }
-                            index += 1;
-                        }
-                    }
-                    
-                    reply.ok();
-                }
-                Err(_) => reply.error(ENOENT),
+            let mut entries = match tokio::fs::read_dir(&nfs_path).await {
+                Ok(entries) => entries,
+                Err(_) => return Err(ENOENT),
+            };
+            
+            let mut result = Vec::new();
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let name = entry.file_name().to_string_lossy().to_string();
+                let file_type = if entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false) {
+                    FileType::Directory
+                } else {
+                    FileType::RegularFile
+                };
+                
+                let temp_ino = inode_manager.allocate_inode();
+                result.push((temp_ino, name, file_type));
             }
+            
+            Ok(result)
         });
+        
+        match result {
+            Ok(entries) => {
+                let mut index = 0;
+                
+                // 添加 . 和 .. 条目
+                if offset <= index {
+                    if reply.add(ino, index + 1, FileType::Directory, ".") {
+                        reply.ok();
+                        return;
+                    }
+                }
+                index += 1;
+                
+                if offset <= index {
+                    let parent_ino = if ino == FUSE_ROOT_ID {
+                        FUSE_ROOT_ID
+                    } else {
+                        FUSE_ROOT_ID
+                    };
+                    
+                    if reply.add(parent_ino, index + 1, FileType::Directory, "..") {
+                        reply.ok();
+                        return;
+                    }
+                }
+                index += 1;
+                
+                // 添加实际的目录条目
+                for (temp_ino, name, file_type) in entries {
+                    if offset <= index {
+                        if reply.add(temp_ino, index + 1, file_type, &name) {
+                            break;
+                        }
+                    }
+                    index += 1;
+                }
+                
+                reply.ok();
+            }
+            Err(err) => reply.error(err),
+        }
     }
     
     fn release(
@@ -565,10 +597,12 @@ impl Filesystem for CacheFs {
         reply: fuser::ReplyEmpty,
     ) {
         let open_files = Arc::clone(&self.open_files);
+        let runtime_handle = self.runtime_handle.clone();
         
-        tokio::spawn(async move {
+        runtime_handle.block_on(async move {
             open_files.write().await.remove(&fh);
-            reply.ok();
         });
+        
+        reply.ok();
     }
 } 

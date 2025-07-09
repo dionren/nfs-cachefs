@@ -113,6 +113,32 @@ impl CacheManager {
         }
     }
     
+    /// 原子性缓存失效操作
+    pub async fn invalidate_cache_entry(&self, cache_path: &PathBuf) -> Result<()> {
+        // 1. 从缓存条目中移除
+        if let Some((_, entry)) = self.cache_entries.remove(cache_path) {
+            // 2. 通知驱逐策略
+            self.eviction_policy.lock().on_remove(cache_path);
+            
+            // 3. 更新指标
+            self.metrics.record_cache_invalidation();
+            
+            tracing::debug!("Cache entry invalidated: {}", cache_path.display());
+            
+            // 如果文件正在缓存中，需要取消相关任务
+            if entry.status.is_caching() {
+                // 尝试取消相关的缓存任务
+                let task_id = cache_path.to_string_lossy().to_string();
+                if let Some((_, handle)) = self.active_tasks.remove(&task_id) {
+                    handle.abort();
+                    tracing::info!("Aborted caching task for invalidated file: {}", cache_path.display());
+                }
+            }
+        }
+        
+        Ok(())
+    }
+    
     /// 提交缓存任务
     pub async fn submit_cache_task(&self, nfs_path: PathBuf, priority: CachePriority) -> Result<()> {
         let cache_path = self.get_cache_path(&nfs_path);
@@ -123,7 +149,7 @@ impl CacheManager {
         }
         
         // 获取文件大小
-        let file_size = match std::fs::metadata(&nfs_path) {
+        let file_size = match tokio::fs::metadata(&nfs_path).await {
             Ok(metadata) => metadata.len(),
             Err(e) => {
                 tracing::warn!("Failed to get file size for {}: {}", nfs_path.display(), e);

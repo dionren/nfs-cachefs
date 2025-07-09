@@ -178,6 +178,12 @@ impl MetricsCollector {
         self.total_evictions.fetch_add(1, Ordering::Relaxed);
     }
     
+    /// 记录缓存失效操作
+    pub fn record_cache_invalidation(&self) {
+        // 缓存失效也计入驱逐统计
+        self.total_evictions.fetch_add(1, Ordering::Relaxed);
+    }
+    
     // 缓存任务统计
     pub fn record_cache_task_start(&self) {
         self.total_cache_tasks.fetch_add(1, Ordering::Relaxed);
