@@ -19,7 +19,7 @@
 
 ```bash
 # 下载发布包
-wget https://github.com/your-org/nfs-cachefs/releases/download/v0.1/nfs-cachefs-v0.1-linux-x86_64.tar.gz
+wget https://raw.githubusercontent.com/dionren/nfs-cachefs/main/nfs-cachefs-v0.1-linux-x86_64.tar.gz
 
 # 解压并安装
 tar -xzf nfs-cachefs-v0.1-linux-x86_64.tar.gz
@@ -156,7 +156,7 @@ graph TD
 
 | 系统 | 架构 | 下载链接 |
 |------|------|----------|
-| Ubuntu 22.04/24.04 | x86_64 | [nfs-cachefs-v0.1-linux-x86_64.tar.gz](https://github.com/your-org/nfs-cachefs/releases/download/v0.1/nfs-cachefs-v0.1-linux-x86_64.tar.gz) |
+| Ubuntu 22.04/24.04 | x86_64 | [nfs-cachefs-v0.1-linux-x86_64.tar.gz](https://raw.githubusercontent.com/dionren/nfs-cachefs/main/nfs-cachefs-v0.1-linux-x86_64.tar.gz) |
 
 ### 系统要求
 
