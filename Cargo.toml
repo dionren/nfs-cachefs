@@ -1,0 +1,57 @@
+[package]
+name = "nfs-cachefs"
+version = "0.1.0"
+edition = "2021"
+authors = ["NFS-CacheFS Team"]
+description = "High-performance asynchronous cache filesystem for NFS"
+license = "MIT"
+
+[dependencies]
+# FUSE绑定
+fuser = "0.14"
+
+# 异步运行时
+tokio = { version = "1.35", features = ["full"] }
+
+# LRU缓存
+lru = "0.12"
+
+# 日志
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# 错误处理
+thiserror = "1.0"
+anyhow = "1.0"
+
+# 并发数据结构
+dashmap = "5.5"
+parking_lot = "0.12"
+
+# 系统调用
+nix = { version = "0.27", features = ["fs", "mount"] }
+libc = "0.2"
+
+# 工具
+rand = "0.8"
+
+# 序列化（用于配置）
+serde = { version = "1.0", features = ["derive"] }
+
+# 时间处理
+chrono = { version = "0.4", features = ["serde"] }
+
+# 哈希计算（用于校验和）
+sha2 = "0.10"
+
+# 命令行参数解析
+clap = { version = "4.4", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3.8"
+criterion = "0.5"
+tokio-test = "0.4"
+
+[[bench]]
+name = "cache_benchmark"
+harness = false
