@@ -13,16 +13,9 @@ use nfs_cachefs::fs::cachefs::CacheFs;
 
 /// 检查是否以mount helper模式运行
 fn is_mount_helper_mode() -> bool {
-    let args: Vec<String> = env::args().collect();
-    eprintln!("Debug: checking mount helper mode, args: {:?}", args);
-    
     if let Some(program_name) = env::args().next() {
-        eprintln!("Debug: program name: {}", program_name);
-        let is_helper = program_name.ends_with("mount.cachefs");
-        eprintln!("Debug: is mount helper mode: {}", is_helper);
-        is_helper
+        program_name.ends_with("mount.cachefs")
     } else {
-        eprintln!("Debug: no program name found");
         false
     }
 }
@@ -30,9 +23,6 @@ fn is_mount_helper_mode() -> bool {
 /// 解析mount helper模式的参数
 fn parse_mount_helper_args() -> Result<(Config, PathBuf, Vec<MountOption>), String> {
     let args: Vec<String> = env::args().collect();
-    
-    // 添加调试信息
-    eprintln!("Debug: mount helper args: {:?}", args);
     
     if args.len() < 3 {
         return Err("Usage: mount.cachefs <device> <mountpoint> [-o options]".to_string());
@@ -42,8 +32,6 @@ fn parse_mount_helper_args() -> Result<(Config, PathBuf, Vec<MountOption>), Stri
     // mount.cachefs cachefs /mnt/chenyu-nfs -o nfs_backend=/mnt/chenyu-nvme,cache_dir=/mnt/nvme/cachefs,cache_size_gb=1000,allow_other
     let _device = &args[1]; // 通常是 "cachefs"
     let mountpoint = PathBuf::from(&args[2]);
-    
-    eprintln!("Debug: device = {}, mountpoint = {}", _device, mountpoint.display());
     
     // 解析 -o 选项
     let mut mount_options = Vec::new();
@@ -57,7 +45,6 @@ fn parse_mount_helper_args() -> Result<(Config, PathBuf, Vec<MountOption>), Stri
     while i < args.len() {
         if args[i] == "-o" && i + 1 < args.len() {
             let options_str = &args[i + 1];
-            eprintln!("Debug: found -o option: {}", options_str);
             
             for option in options_str.split(',') {
                 let option = option.trim();
@@ -65,18 +52,14 @@ fn parse_mount_helper_args() -> Result<(Config, PathBuf, Vec<MountOption>), Stri
                     continue;
                 }
                 
-                eprintln!("Debug: parsing option: {}", option);
-                
                 // 解析 key=value 格式的选项
                 if let Some((key, value)) = option.split_once('=') {
                     config_options.insert(key.to_string(), value.to_string());
-                    eprintln!("Debug: parsed config option: {} = {}", key, value);
                 } else {
                     // 处理标志选项
                     match option {
                         "ro" => {
                             // 已经默认设置为只读，忽略
-                            eprintln!("Debug: ignoring ro option (already set)");
                         }
                         "rw" => {
                             warn!("Read-write mode is not supported, filesystem will be mounted read-only");
@@ -84,20 +67,16 @@ fn parse_mount_helper_args() -> Result<(Config, PathBuf, Vec<MountOption>), Stri
                         }
                         "allow_other" => {
                             mount_options.push(MountOption::AllowOther);
-                            eprintln!("Debug: added allow_other mount option");
                         }
                         "allow_root" => {
                             mount_options.push(MountOption::AllowRoot);
-                            eprintln!("Debug: added allow_root mount option");
                         }
                         "auto_unmount" => {
                             mount_options.push(MountOption::AutoUnmount);
-                            eprintln!("Debug: added auto_unmount mount option");
                         }
                         _ => {
                             // 未知选项，作为自定义选项处理
                             mount_options.push(MountOption::CUSTOM(option.to_string()));
-                            eprintln!("Debug: added custom mount option: {}", option);
                         }
                     }
                 }
@@ -107,14 +86,10 @@ fn parse_mount_helper_args() -> Result<(Config, PathBuf, Vec<MountOption>), Stri
         i += 1;
     }
     
-    eprintln!("Debug: config_options = {:?}", config_options);
-    
     // 从配置选项创建Config
     let nfs_backend = config_options.get("nfs_backend")
         .ok_or("Missing required option: nfs_backend")?;
     let nfs_backend_path = PathBuf::from(nfs_backend);
-    
-    eprintln!("Debug: nfs_backend_path = {}", nfs_backend_path.display());
     
     let cache_dir = config_options.get("cache_dir")
         .map(PathBuf::from)
