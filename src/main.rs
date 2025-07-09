@@ -1,6 +1,7 @@
 // use std::env;
 use std::path::PathBuf;
 use std::process;
+use std::env;
 
 use clap::{Arg, Command};
 use fuser::MountOption;
@@ -10,10 +11,135 @@ use tracing_subscriber;
 use nfs_cachefs::core::config::Config;
 use nfs_cachefs::fs::cachefs::CacheFs;
 
+/// 检查是否以mount helper模式运行
+fn is_mount_helper_mode() -> bool {
+    if let Some(program_name) = env::args().next() {
+        program_name.ends_with("mount.cachefs")
+    } else {
+        false
+    }
+}
+
+/// 解析mount helper模式的参数
+fn parse_mount_helper_args() -> Result<(Config, PathBuf, Vec<MountOption>), String> {
+    let args: Vec<String> = env::args().collect();
+    
+    if args.len() < 3 {
+        return Err("Usage: mount.cachefs <device> <mountpoint> [-o options]".to_string());
+    }
+    
+    // mount.cachefs 的参数格式：
+    // mount.cachefs cachefs /mnt/chenyu-nfs -o nfs_backend=/mnt/chenyu-nvme,cache_dir=/mnt/nvme/cachefs,cache_size_gb=1000,allow_other
+    let _device = &args[1]; // 通常是 "cachefs"
+    let mountpoint = PathBuf::from(&args[2]);
+    
+    // 解析 -o 选项
+    let mut mount_options = Vec::new();
+    let mut config_options = std::collections::HashMap::new();
+    
+    // 强制只读模式
+    mount_options.push(MountOption::RO);
+    
+    // 查找 -o 选项
+    let mut i = 3;
+    while i < args.len() {
+        if args[i] == "-o" && i + 1 < args.len() {
+            let options_str = &args[i + 1];
+            
+            for option in options_str.split(',') {
+                let option = option.trim();
+                if option.is_empty() {
+                    continue;
+                }
+                
+                // 解析 key=value 格式的选项
+                if let Some((key, value)) = option.split_once('=') {
+                    config_options.insert(key.to_string(), value.to_string());
+                } else {
+                    // 处理标志选项
+                    match option {
+                        "ro" => {
+                            // 已经默认设置为只读，忽略
+                        }
+                        "rw" => {
+                            warn!("Read-write mode is not supported, filesystem will be mounted read-only");
+                            // 不添加 RW 选项，保持只读
+                        }
+                        "allow_other" => {
+                            mount_options.push(MountOption::AllowOther);
+                        }
+                        "allow_root" => {
+                            mount_options.push(MountOption::AllowRoot);
+                        }
+                        "auto_unmount" => {
+                            mount_options.push(MountOption::AutoUnmount);
+                        }
+                        _ => {
+                            // 未知选项，作为自定义选项处理
+                            mount_options.push(MountOption::CUSTOM(option.to_string()));
+                        }
+                    }
+                }
+            }
+            break;
+        }
+        i += 1;
+    }
+    
+    // 从配置选项创建Config
+    let nfs_backend = config_options.get("nfs_backend")
+        .ok_or("Missing required option: nfs_backend")?;
+    let nfs_backend_path = PathBuf::from(nfs_backend);
+    
+    let cache_dir = config_options.get("cache_dir")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp/nfs-cachefs"));
+    
+    let cache_size_gb = config_options.get("cache_size_gb")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10);
+    
+    let block_size_mb = config_options.get("block_size_mb")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(64);
+    
+    let max_concurrent_caching = config_options.get("max_concurrent")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10);
+    
+    let config = Config {
+        nfs_backend_path,
+        cache_dir,
+        mount_point: mountpoint.clone(),
+        max_cache_size_bytes: cache_size_gb * 1024 * 1024 * 1024,
+        cache_block_size: block_size_mb * 1024 * 1024,
+        max_concurrent_caching,
+        enable_checksums: true,
+        cache_ttl_seconds: None,
+        eviction_policy: nfs_cachefs::core::config::EvictionPolicy::Lru,
+        direct_io: true,
+        readahead_bytes: 1024 * 1024,
+    };
+    
+    Ok((config, mountpoint, mount_options))
+}
+
 /// 解析命令行参数
 fn parse_args() -> (Config, PathBuf, Vec<MountOption>) {
+    // 检查是否以mount helper模式运行
+    if is_mount_helper_mode() {
+        match parse_mount_helper_args() {
+            Ok(result) => return result,
+            Err(e) => {
+                error!("Mount helper mode error: {}", e);
+                process::exit(1);
+            }
+        }
+    }
+    
+    // 原有的命令行参数解析逻辑
     let matches = Command::new("nfs-cachefs")
-        .version("0.1.0")
+        .version("0.2.0")
         .author("NFS-CacheFS Team")
         .about("High-performance read-only asynchronous caching filesystem for NFS")
         .arg(
@@ -268,7 +394,7 @@ async fn main() {
     // 初始化日志系统
     init_logging("info");
     
-    info!("Starting NFS-CacheFS v0.1.0 (READ-ONLY MODE)");
+    info!("Starting NFS-CacheFS v0.2.0 (READ-ONLY MODE)");
     info!("NFS Backend: {}", config.nfs_backend_path.display());
     info!("Cache Directory: {}", config.cache_dir.display());
     info!("Mount Point: {}", mountpoint.display());
