@@ -13,15 +13,35 @@
 
 ## 快速开始
 
-### 依赖要求
+### 方法一：使用预编译二进制包（推荐）
+
+适用于 Ubuntu 22.04/24.04 x86_64 系统：
+
+```bash
+# 下载发布包
+wget https://github.com/your-org/nfs-cachefs/releases/download/v0.1.0/nfs-cachefs-v0.1.0-linux-x86_64.tar.gz
+
+# 解压并安装
+tar -xzf nfs-cachefs-v0.1.0-linux-x86_64.tar.gz
+cd nfs-cachefs-v0.1.0-linux-x86_64
+sudo ./install.sh
+```
+
+### 方法二：源码编译安装
+
+#### 依赖要求
 
 - Rust 1.75+
 - FUSE 3.0+
 - Linux Kernel 5.4+
 
-### 编译安装
+#### 编译步骤
 
 ```bash
+# 安装依赖
+sudo apt update
+sudo apt install -y libfuse3-dev libfuse-dev pkg-config
+
 # 克隆项目
 git clone https://github.com/your-org/nfs-cachefs.git
 cd nfs-cachefs
@@ -31,20 +51,24 @@ cargo build --release
 
 # 安装到系统
 sudo cp target/release/nfs-cachefs /usr/local/bin/
+sudo ln -sf /usr/local/bin/nfs-cachefs /sbin/mount.cachefs
 ```
 
 ### 基本使用
 
 ```bash
-# 创建 mount helper 链接（首次安装）
-sudo ln -s /usr/local/bin/nfs-cachefs /sbin/mount.cachefs
+# 验证安装
+nfs-cachefs --version
 
 # 创建挂载点和缓存目录
-sudo mkdir -p /mnt/cached /mnt/nvme/cache
+sudo mkdir -p /mnt/cached /mnt/cache
 
-# 手动挂载 (自动强制只读模式)
+# 先挂载NFS后端（必需）
+sudo mount -t nfs 192.168.1.100:/share /mnt/nfs-share
+
+# 手动挂载CacheFS (自动强制只读模式)
 sudo mount -t cachefs cachefs /mnt/cached \
-    -o nfs_backend=/mnt/nfs-share,cache_dir=/mnt/nvme/cache,cache_size_gb=50,allow_other
+    -o nfs_backend=/mnt/nfs-share,cache_dir=/mnt/cache,cache_size_gb=50,allow_other
 ```
 
 ### 通过fstab自动挂载
@@ -124,6 +148,34 @@ graph TD
     B --> F[异步缓存管理器]
     F --> G[后台复制任务]
     G --> D
+```
+
+## 下载安装
+
+### 预编译二进制包
+
+| 系统 | 架构 | 下载链接 |
+|------|------|----------|
+| Ubuntu 22.04/24.04 | x86_64 | [nfs-cachefs-v0.1.0-linux-x86_64.tar.gz](https://github.com/your-org/nfs-cachefs/releases/download/v0.1.0/nfs-cachefs-v0.1.0-linux-x86_64.tar.gz) |
+
+### 系统要求
+
+- **操作系统**: Ubuntu 22.04 LTS / Ubuntu 24.04 LTS
+- **架构**: x86_64 (64位)
+- **内核**: Linux 5.4+
+- **依赖**: libfuse3-3, fuse3
+
+### 安装验证
+
+```bash
+# 检查版本
+nfs-cachefs --version
+
+# 查看帮助
+nfs-cachefs --help
+
+# 检查依赖
+ldd /usr/local/bin/nfs-cachefs
 ```
 
 ## 性能对比
