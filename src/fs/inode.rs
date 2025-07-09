@@ -126,7 +126,7 @@ impl InodeManager {
             ctime: now,
             crtime: now,
             kind: FileType::Directory,
-            perm: 0o755,
+            perm: 0o555, // 只读权限
             nlink: 2,
             uid: 0,
             gid: 0,
@@ -246,7 +246,7 @@ impl InodeManager {
             ctime: now,
             crtime: now,
             kind: FileType::Directory,
-            perm: 0o755,
+            perm: 0o555, // 只读权限
             nlink: 2,
             uid: 0,
             gid: 0,

@@ -1,441 +1,414 @@
-# NFS-CacheFS: 高性能异步缓存文件系统
+# NFS-CacheFS: 高性能只读缓存文件系统
 
 ## 项目概述
 
-NFS-CacheFS 是一个基于 FUSE 的高性能异步缓存文件系统，专门设计用于加速 NFS 上大型文件（如深度学习模型）的访问。通过将文件异步缓存到本地 NVMe SSD，实现对应用程序完全透明的加速。
+NFS-CacheFS 是一个基于 FUSE 的**高性能只读**异步缓存文件系统，专门设计用于加速 NFS 上大型文件（如深度学习模型、数据集）的读取访问。通过将文件异步缓存到本地高速存储设备，实现对应用程序完全透明的性能提升。
 
-### 背景与需求
+### 核心特性
 
-- **场景**：在深度学习训练环境中，需要频繁从NFS读取大型模型文件（10-100GB），网络带宽成为瓶颈
-- **目标**：利用本地NVMe SSD作为透明缓存层，加速文件访问，同时保持对应用完全透明
-- **挑战**：传统缓存方案在首次读取时会因为缓存填充而导致延迟
+- **只读设计**：专门针对大文件读取场景优化，不支持写入操作
+- **零延迟首次访问**：首次读取直接穿透到 NFS，避免缓存等待
+- **异步后台缓存**：在后台独立完成文件复制，不影响前台操作
+- **智能缓存管理**：基于 LRU 的自动驱逐策略，高效利用存储空间
+- **透明部署**：通过 fstab 配置即可使用，无需修改应用程序
 
-### 核心创新
+### 目标场景
 
-1. **零延迟首次访问**：首次读取直接穿透到 NFS，不会被缓存操作阻塞
-2. **异步后台缓存**：在后台独立线程中完成文件复制，不影响前台操作
-3. **原子性保证**：使用临时文件+rename确保缓存文件始终完整
-4. **智能缓存管理**：基于 LRU 的自动驱逐策略，高效利用有限的 SSD 空间
+- **深度学习训练**：加速大型模型文件（10-100GB）的读取
+- **数据分析**：提升大型数据集的访问性能
+- **批处理任务**：优化需要频繁读取大文件的批处理作业
+- **高并发读取**：支持多个进程同时读取同一文件
 
-## 技术架构
+## 系统架构
 
-### 系统架构
+### 整体架构
 
-```
-┌─────────────────┐
-│   应用程序      │
-│  (PyTorch等)    │
-└────────┬────────┘
-         │ 文件操作
-         ▼
-┌─────────────────┐
-│   CacheFS       │
-│  (FUSE层)       │
-├─────────────────┤
-│ • 请求路由      │
-│ • 状态管理      │
-│ • 异步调度      │
-└────┬────────┬───┘
-     │        │
-     ▼        ▼
-┌────────┐ ┌────────┐
-│  NFS   │ │ NVMe   │
-│ Backend│ │ Cache  │
-└────────┘ └────────┘
+```mermaid
+graph TB
+    subgraph "用户空间"
+        A[应用程序<br/>PyTorch/TensorFlow等] 
+        B[NFS-CacheFS<br/>FUSE文件系统]
+        C[缓存管理器<br/>异步后台任务]
+    end
+    
+    subgraph "存储层"
+        D[NFS服务器<br/>网络存储]
+        E[本地高速存储<br/>NVMe SSD]
+    end
+    
+    A --> B
+    B --> C
+    B --> D
+    C --> E
+    C --> D
+    
+    style A fill:#e1f5fe
+    style B fill:#f3e5f5
+    style C fill:#e8f5e8
+    style D fill:#fff3e0
+    style E fill:#fce4ec
 ```
 
 ### 文件缓存状态机
 
-```
-NotCached ──────┐
-    │           │
-    │ open()    │
-    ▼           │
-CachingInProgress─┤
-    │           │
-    │ 复制完成  │
-    ▼           │
-Cached ─────────┘
-    │
-    │ LRU驱逐
-    ▼
-NotCached
+```mermaid
+stateDiagram-v2
+    [*] --> NotCached
+    NotCached --> CachingInProgress : 文件读取触发
+    CachingInProgress --> Cached : 后台缓存完成
+    Cached --> NotCached : LRU驱逐
+    CachingInProgress --> NotCached : 缓存失败
+    
+    note right of NotCached
+        文件未缓存
+        读取直接从NFS
+    end note
+    
+    note right of CachingInProgress
+        后台正在缓存
+        读取仍从NFS
+    end note
+    
+    note right of Cached
+        文件已缓存
+        读取从本地存储
+    end note
 ```
 
 ### 技术栈
 
-- **编程语言**: Rust (性能和内存安全)
-- **核心框架**: FUSE (用户态文件系统)
-- **异步运行时**: Tokio
-- **主要依赖**:
-  - `fuser`: Rust FUSE 绑定
-  - `lru`: LRU 缓存实现
-  - `dashmap`: 并发安全的 HashMap
-  - `tracing`: 结构化日志
-  - `parking_lot`: 高性能同步原语
+- **编程语言**：Rust（高性能和内存安全）
+- **文件系统框架**：FUSE（用户态文件系统）
+- **异步运行时**：Tokio（高并发异步处理）
+- **核心组件**：
+  - `fuser`：Rust FUSE 绑定
+  - `lru`：LRU 缓存实现
+  - `dashmap`：并发安全的哈希表
+  - `tracing`：结构化日志
+  - `parking_lot`：高性能同步原语
 
-## 关键设计
+## 核心设计原则
 
-### 1. 核心数据结构
+### 1. 只读优先
 
-```rust
-// 文件缓存状态
-#[derive(Debug, Clone, PartialEq)]
-enum CacheStatus {
-    NotCached,
-    CachingInProgress {
-        started_at: Instant,
-        progress: Arc<AtomicU64>, // 已复制字节数
-    },
-    Cached {
-        cached_at: Instant,
-        last_accessed: Instant,
-    },
-}
+- **设计理念**：专门为大文件读取场景优化，不处理写入操作
+- **安全保障**：强制只读模式，防止意外修改原始数据
+- **性能优化**：简化文件系统逻辑，专注于读取性能
 
-// 缓存条目
-struct CacheEntry {
-    size: u64,
-    status: CacheStatus,
-    access_count: u64,
-    checksum: Option<u64>, // 用于验证数据完整性
-}
+### 2. 异步缓存策略
 
-// 文件系统配置 - 从fstab挂载选项解析
-#[derive(Debug, Clone)]
-struct CacheFsConfig {
-    nfs_backend_path: PathBuf,
-    cache_dir: PathBuf,
-    max_cache_size_gb: u64,
-    
-    // 高级配置（带默认值）
-    cache_block_size: usize,    // 默认: 1MB
-    max_concurrent_caching: u32, // 默认: 4
-    cache_eviction_policy: EvictionPolicy, // 默认: LRU
-    enable_checksum: bool,       // 默认: false
-    cache_ttl_hours: Option<u64>, // 默认: 无限制
-    direct_io: bool,            // 默认: true
-    readahead_mb: u32,          // 默认: 4MB
-}
-```
+- **首次访问**：直接从 NFS 读取，不等待缓存完成
+- **后台缓存**：独立线程异步复制文件到本地存储
+- **原子操作**：使用临时文件+重命名确保缓存文件完整性
+- **并发控制**：限制同时进行的缓存任务数量
 
-### 2. 配置解析
+### 3. 智能缓存管理
 
-配置直接从 fstab 挂载选项解析，无需额外配置文件：
+- **LRU 驱逐**：基于最近最少使用算法自动清理缓存
+- **空间监控**：实时监控缓存空间使用情况
+- **完整性校验**：可选的文件校验和验证机制
+- **性能指标**：详细的缓存命中率和性能统计
 
-```rust
-impl CacheFsConfig {
-    fn from_mount_options(options: &str) -> Result<Self> {
-        let mut config = Self::default();
-        
-        for opt in options.split(',') {
-            let parts: Vec<&str> = opt.split('=').collect();
-            match parts[0] {
-                "nfs_backend" => config.nfs_backend_path = PathBuf::from(parts[1]),
-                "cache_dir" => config.cache_dir = PathBuf::from(parts[1]),
-                "cache_size_gb" => config.max_cache_size_gb = parts[1].parse()?,
-                // ... 其他选项解析
-            }
-        }
-        Ok(config)
-    }
-}
-```
+### 4. 透明部署
 
-### 3. 关键设计决策
+- **标准挂载**：通过 `/etc/fstab` 配置，无需额外配置文件
+- **应用无感知**：对应用程序完全透明，无需修改代码
+- **灵活配置**：支持多种配置参数优化性能
 
-1. **异步缓存而非同步缓存**
-   - 避免首次访问延迟
-   - 提供更好的用户体验
-   - 后台任务独立管理
+## 核心模块
 
-2. **用户态文件系统（FUSE）**
-   - 无需修改内核
-   - 易于部署和维护
-   - 对应用程序完全透明
+### 文件系统层
+- **功能**：实现 FUSE 接口，处理文件系统操作
+- **特性**：支持 lookup、getattr、open、read、readdir 等操作
+- **限制**：不支持写入操作（write、create、mkdir 等）
 
-3. **Rust 语言选择**
-   - 高性能，接近 C/C++
-   - 内存安全，避免常见错误
-   - 优秀的并发支持
+### 缓存管理器
+- **功能**：管理后台缓存任务和缓存状态
+- **特性**：异步任务调度、并发控制、错误处理
+- **策略**：LRU 驱逐、空间管理、完整性校验
 
-4. **LRU 缓存驱逐**
-   - 简单有效的缓存管理策略
-   - 可扩展为更复杂的算法（LFU、ARC）
+### 异步执行器
+- **功能**：处理异步文件系统操作
+- **特性**：高并发处理、任务队列、资源管理
+- **优化**：减少系统调用、批量处理
 
-## 核心模块设计
-
-### 模块1: 文件系统层 (`src/fs.rs`)
-
-实现 FUSE 接口，处理所有文件系统操作：
-
-```rust
-impl Filesystem for CacheFs {
-    fn lookup(&mut self, req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry);
-    fn getattr(&mut self, req: &Request, ino: u64, reply: ReplyAttr);
-    fn open(&mut self, req: &Request, ino: u64, flags: i32, reply: ReplyOpen);
-    fn read(&mut self, req: &Request, ino: u64, fh: u64, offset: i64, size: u32, flags: i32, lock: Option<u64>, reply: ReplyData);
-    fn readdir(&mut self, req: &Request, ino: u64, fh: u64, offset: i64, reply: ReplyDirectory);
-    fn release(&mut self, req: &Request, ino: u64, fh: u64, flags: i32, lock: Option<u64>, flush: bool, reply: ReplyEmpty);
-}
-```
-
-### 模块2: 异步缓存管理器 (`src/cache_manager.rs`)
-
-管理后台缓存任务，控制并发和资源使用：
-
-```rust
-struct CacheManager {
-    pending_tasks: Arc<Mutex<VecDeque<CacheTask>>>,
-    active_tasks: Arc<DashMap<PathBuf, JoinHandle<()>>>,
-    semaphore: Arc<Semaphore>, // 限制并发缓存任务数
-    stats: Arc<CacheStats>,
-}
-
-impl CacheManager {
-    async fn submit_cache_task(&self, task: CacheTask) -> Result<()>;
-    async fn execute_cache_copy(&self, task: &CacheTask) -> Result<()>;
-    async fn verify_cache_integrity(&self, path: &Path) -> Result<bool>;
-}
-```
-
-### 模块3: 缓存驱逐策略 (`src/eviction.rs`)
-
-实现可扩展的缓存驱逐机制：
-
-```rust
-trait EvictionPolicy: Send + Sync {
-    fn should_evict(&self, entry: &CacheEntry, cache_pressure: f64) -> bool;
-    fn select_victims(&self, entries: &[CacheEntry], bytes_needed: u64) -> Vec<PathBuf>;
-}
-
-struct AdaptiveLRU {
-    age_weight: f64,
-    frequency_weight: f64,
-    size_weight: f64,
-}
-```
-
-### 模块4: 监控与诊断 (`src/metrics.rs`)
-
-提供详细的性能指标和诊断信息：
-
-```rust
-struct CacheStats {
-    cache_hits: AtomicU64,
-    cache_misses: AtomicU64,
-    bytes_served_from_cache: AtomicU64,
-    bytes_served_from_nfs: AtomicU64,
-    ongoing_cache_operations: AtomicU32,
-    completed_cache_operations: AtomicU64,
-    failed_cache_operations: AtomicU64,
-    read_latency_histogram: Mutex<Histogram>,
-}
-```
+### 监控系统
+- **功能**：收集和报告性能指标
+- **指标**：缓存命中率、读取延迟、存储使用率
+- **输出**：结构化日志、Prometheus 指标
 
 ## 性能优化
 
-### 1. 零拷贝优化
+### 1. 零拷贝技术
+- 使用 Linux 特定系统调用减少数据复制
+- 内存映射优化大文件访问
+- 直接 I/O 绕过系统缓存
 
-使用 Linux 特定的系统调用减少数据复制：
+### 2. 预读取策略
+- 智能预取提高顺序访问性能
+- 基于访问模式的预测算法
+- 可配置的预读取大小
 
-```rust
-#[cfg(target_os = "linux")]
-fn zero_copy_transfer(src_fd: RawFd, dst_fd: RawFd, len: usize) -> io::Result<usize> {
-    use nix::fcntl::{splice, SpliceFFlags};
-    // 使用 splice 实现零拷贝
-}
-```
+### 3. 并发优化
+- 高效的并发数据结构
+- 无锁算法减少竞争
+- 任务队列优化
 
-### 2. 内存映射优化
+## 配置参数
 
-对大文件使用 mmap 提高性能：
+### 必需参数
+- `nfs_backend`：NFS 后端目录路径
+- `cache_dir`：本地缓存目录路径
+- `cache_size_gb`：最大缓存大小（GB）
 
-```rust
-struct MmapCache {
-    cached_mappings: LruCache<PathBuf, Arc<Mmap>>,
-    max_mapped_files: usize,
-}
-```
-
-### 3. 预读取优化
-
-智能预取机制提高顺序访问性能：
-
-```rust
-struct PrefetchPredictor {
-    access_history: LruCache<PathBuf, Vec<Instant>>,
-    directory_patterns: HashMap<PathBuf, AccessPattern>,
-}
-```
-
-## 错误处理与容错
-
-### 错误分层
-
-```rust
-#[derive(Debug, thiserror::Error)]
-enum CacheFsError {
-    #[error("NFS backend error: {0}")]
-    NfsError(#[source] io::Error),
-    
-    #[error("Cache operation failed: {0}")]
-    CacheError(String),
-    
-    #[error("Insufficient cache space")]
-    InsufficientSpace,
-    
-    #[error("Checksum mismatch for file: {path}")]
-    ChecksumMismatch { path: PathBuf },
-}
-```
-
-### 容错机制
-
-1. **部分缓存恢复**：系统重启后自动扫描并恢复未完成的缓存操作
-2. **损坏检测**：定期校验缓存文件完整性
-3. **自动清理**：清理损坏或过期的缓存条目
-4. **优雅降级**：缓存失败时自动降级到直接 NFS 访问
+### 可选参数
+- `block_size_mb`：缓存块大小（MB，默认 1）
+- `max_concurrent`：最大并发缓存任务数（默认 4）
+- `eviction`：缓存驱逐策略（lru/lfu/arc，默认 lru）
+- `checksum`：是否启用校验和（true/false，默认 false）
+- `ttl_hours`：缓存过期时间（小时，默认无限制）
+- `direct_io`：是否使用直接 I/O（true/false，默认 true）
+- `readahead_mb`：预读取大小（MB，默认 4）
 
 ## 部署配置
 
 ### 安装步骤
 
-```bash
-# 编译程序
-cargo build --release
+1. **编译程序**
+   ```bash
+   cargo build --release
+   ```
 
-# 安装二进制文件
-sudo cp target/release/nfs-cachefs /usr/local/bin/
+2. **安装二进制文件**
+   ```bash
+   sudo cp target/release/nfs-cachefs /usr/local/bin/
+   ```
 
-# 创建 mount helper 链接（重要！）
-sudo ln -s /usr/local/bin/nfs-cachefs /sbin/mount.cachefs
-```
+3. **创建 mount helper 链接**
+   ```bash
+   sudo ln -s /usr/local/bin/nfs-cachefs /sbin/mount.cachefs
+   ```
 
 ### fstab 配置
 
-```fstab
-# /etc/fstab 配置示例
+#### 基本配置格式
 
+```fstab
+cachefs /挂载点 cachefs 选项列表 0 0
+```
+
+#### 最小配置示例
+
+```fstab
 # 1. 挂载 NFS（必须在 CacheFS 之前）
-10.20.66.201:/share    /mnt/nfs    nfs    defaults,_netdev    0 0
+10.20.66.201:/share  /mnt/nfs  nfs  defaults,_netdev  0 0
 
 # 2. 挂载本地缓存磁盘
-/dev/nvme0n1    /mnt/nvme    xfs    defaults,noatime    0 0
+/dev/nvme0n1  /mnt/nvme  xfs  defaults,noatime  0 0
 
-# 3. 挂载 CacheFS
-cachefs    /mnt/cached    cachefs    nfs_backend=/mnt/nfs,cache_dir=/mnt/nvme/cache,cache_size_gb=50,direct_io=true,allow_other,_netdev    0 0
+# 3. 挂载 CacheFS（只读模式）
+cachefs  /mnt/cached  cachefs  nfs_backend=/mnt/nfs,cache_dir=/mnt/nvme/cache,cache_size_gb=50,ro,allow_other,_netdev  0 0
 ```
 
-### 配置参数说明
+#### 完整配置示例
 
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `nfs_backend` | 必需 | NFS 后端挂载路径 |
-| `cache_dir` | 必需 | 本地缓存目录路径 |
-| `cache_size_gb` | 必需 | 最大缓存大小（GB） |
-| `block_size_mb` | 1 | 缓存块大小（MB） |
-| `max_concurrent` | 4 | 最大并发缓存任务数 |
-| `eviction` | lru | 缓存驱逐策略（lru/lfu/arc） |
-| `direct_io` | true | 是否使用直接I/O |
-| `readahead_mb` | 4 | 预读取大小（MB） |
+```fstab
+# 带有所有高级选项的配置
+cachefs  /mnt/cached  cachefs  nfs_backend=/mnt/nfs,cache_dir=/mnt/nvme/cache,cache_size_gb=100,block_size_mb=4,max_concurrent=8,eviction=lru,checksum=true,ttl_hours=24,direct_io=true,readahead_mb=8,ro,allow_other,_netdev  0 0
+```
 
-## 性能指标
+#### 配置参数详解
 
-基于设计和类似系统的经验，预期性能提升：
+**必需参数**：
+- `nfs_backend=/mnt/nfs` - NFS 后端挂载路径
+- `cache_dir=/mnt/nvme/cache` - 本地缓存目录路径
+- `cache_size_gb=50` - 最大缓存大小（GB）
 
-| 指标 | 提升幅度 | 说明 |
-|------|----------|------|
-| 顺序读取 | 10-20x | 取决于网络速度 |
-| 随机访问 | 50-100x | NVMe延迟远低于网络 |
-| 延迟 | 100-1000x | 本地访问 vs 网络访问 |
-| 缓存命中率 | >90% | 稳定工作负载下 |
+**可选参数**：
+- `block_size_mb=4` - 缓存块大小（MB，默认 1）
+- `max_concurrent=8` - 最大并发缓存任务数（默认 4）
+- `eviction=lru` - 缓存驱逐策略（lru/lfu/arc，默认 lru）
+- `checksum=true` - 启用文件校验和（默认 false）
+- `ttl_hours=24` - 缓存过期时间（小时，默认无限制）
+- `direct_io=true` - 使用直接I/O（默认 true）
+- `readahead_mb=8` - 预读取大小（MB，默认 4）
 
-## 运维管理
+**FUSE 标准参数**：
+- `ro` - 只读模式（强制）
+- `allow_other` - 允许其他用户访问挂载点
+- `_netdev` - 标记为网络文件系统，确保网络就绪后才挂载
 
-### 日常运维
+### 性能调优配置
+
+#### 大文件场景（深度学习模型）
+
+```fstab
+cachefs /mnt/cached cachefs nfs_backend=/mnt/nfs,cache_dir=/mnt/nvme/cache,cache_size_gb=200,block_size_mb=4,max_concurrent=4,direct_io=true,readahead_mb=16,ro,allow_other,_netdev 0 0
+```
+
+关键参数：
+- `block_size_mb=4` - 较大的块大小提高大文件传输效率
+- `readahead_mb=16` - 增大预读取以提高顺序读性能
+
+#### 小文件场景（代码仓库）
+
+```fstab
+cachefs /mnt/cached cachefs nfs_backend=/mnt/nfs,cache_dir=/mnt/nvme/cache,cache_size_gb=50,block_size_mb=1,max_concurrent=16,eviction=lfu,ro,allow_other,_netdev 0 0
+```
+
+关键参数：
+- `block_size_mb=1` - 较小的块大小减少浪费
+- `max_concurrent=16` - 增加并发数处理大量小文件
+- `eviction=lfu` - 使用 LFU 策略更适合小文件访问模式
+
+#### 混合负载场景
+
+```fstab
+cachefs /mnt/cached cachefs nfs_backend=/mnt/nfs,cache_dir=/mnt/nvme/cache,cache_size_gb=100,block_size_mb=2,max_concurrent=8,eviction=arc,checksum=true,ttl_hours=72,ro,allow_other,_netdev 0 0
+```
+
+关键参数：
+- `eviction=arc` - 自适应替换缓存，平衡 LRU 和 LFU
+- `checksum=true` - 确保数据完整性
+- `ttl_hours=72` - 3天后自动清理过期缓存
+
+### 命令行使用
 
 ```bash
-# 查看缓存状态
-nfs-cachefs-ctl status
+# 基本挂载
+nfs-cachefs /mnt/nfs /mnt/cached -o cache_dir=/mnt/nvme/cache,cache_size_gb=50
 
-# 清理过期缓存
-nfs-cachefs-ctl cache clean --older-than 7d
+# 带高级选项
+nfs-cachefs /mnt/nfs /mnt/cached -o cache_dir=/mnt/nvme/cache,cache_size_gb=100,max_concurrent=8,block_size_mb=64
 
-# 预热重要文件
-nfs-cachefs-ctl cache warm /path/to/models/
-
-# 导出性能指标
-nfs-cachefs-ctl metrics export
-```
-
-### 监控集成
-
-支持 Prometheus 指标导出：
-
-```yaml
-scrape_configs:
-  - job_name: 'nfs-cachefs'
-    static_configs:
-      - targets: ['localhost:9100']
-    metrics_path: '/metrics'
+# 前台运行（调试用）
+nfs-cachefs /mnt/nfs /mnt/cached -o cache_dir=/mnt/nvme/cache,cache_size_gb=50 -f -d
 ```
 
 ### 故障排查
 
+#### 查看挂载状态
+
 ```bash
-# 启用调试日志
-RUST_LOG=debug mount -t cachefs ...
+# 检查挂载点
+mount | grep cachefs
 
-# 分析缓存命中率
-journalctl -t cachefs | grep "CACHE_HIT\|CACHE_MISS"
-
-# 检查健康状态
-nfs-cachefs-ctl health check
+# 查看详细挂载选项
+findmnt /mnt/cached -o OPTIONS
 ```
 
-## 项目路线图
+#### 手动挂载测试
 
-### v1.0 - 基础功能（当前）
-- ✅ 基本 FUSE 文件系统
-- ✅ 异步缓存机制
-- ✅ LRU 驱逐策略
-- ✅ 基础监控指标
-- ✅ fstab 集成
+```bash
+# 使用 mount 命令手动测试配置
+sudo mount -t cachefs cachefs /mnt/cached -o nfs_backend=/mnt/nfs,cache_dir=/mnt/nvme/cache,cache_size_gb=50
+```
 
-### v2.0 - 高级特性
-- ⏳ 智能预取（基于访问模式）
-- ⏳ 压缩支持（透明压缩/解压）
-- ⏳ 分布式缓存协调
-- ⏳ 缓存预热工具
+#### 查看系统日志
 
-### v3.0 - 企业特性
-- ⏳ 多级缓存（RAM → NVMe → HDD）
-- ⏳ S3/对象存储支持
-- ⏳ Web 管理界面
-- ⏳ 缓存加密
+```bash
+# 查看挂载相关日志
+journalctl -u mnt-cached.mount
+
+# 查看 CacheFS 运行日志
+journalctl -t cachefs
+```
+
+### 卸载
+
+```bash
+# 正常卸载
+sudo umount /mnt/cached
+
+# 强制卸载（如果有进程占用）
+sudo umount -l /mnt/cached
+```
+
+### 重要注意事项
+
+1. **挂载顺序**：确保 NFS 和缓存目录在 CacheFS 之前挂载
+2. **只读模式**：必须使用 `ro` 参数，不支持写入操作
+3. **权限设置**：缓存目录需要适当的读写权限
+4. **空间预留**：缓存目录所在分区应预留一定空间避免写满
+5. **网络依赖**：使用 `_netdev` 标记确保网络就绪后才挂载
+6. **依赖管理**：可使用 `x-systemd.requires-mounts-for` 确保依赖挂载点就绪
+
+## 性能预期
+
+基于类似系统的实测数据和理论分析：
+
+| 指标 | 提升幅度 | 说明 |
+|------|----------|------|
+| 大文件顺序读取 | 10-20x | 取决于网络速度和存储性能 |
+| 随机访问 | 50-100x | 本地存储延迟远低于网络 |
+| 缓存命中后延迟 | 100-1000x | 微秒级 vs 毫秒级 |
+| 多进程并发读取 | 5-10x | 减少网络争用 |
+| 缓存命中率 | >90% | 稳定工作负载下 |
+
+## 运维管理
+
+### 监控指标
+- 缓存命中率和miss率
+- 读取延迟分布
+- 存储使用率
+- 并发任务数
+- 错误率统计
+
+### 日志管理
+- 结构化日志输出
+- 可配置的日志级别
+- 关键事件记录
+- 性能指标日志
+
+### 故障处理
+- 自动降级到直接 NFS 访问
+- 损坏文件自动清理
+- 缓存空间不足处理
+- 网络异常恢复
+
+## 限制与约束
+
+### 功能限制
+- **只读文件系统**：不支持任何写入操作
+- **不支持元数据修改**：chmod、chown、setxattr 等
+- **不支持符号链接创建**：只能读取现有符号链接
+- **不支持文件锁**：不处理文件锁定请求
+
+### 性能约束
+- **初始延迟**：首次访问文件时延迟与直接 NFS 访问相同
+- **存储依赖**：缓存性能受限于本地存储速度
+- **内存使用**：元数据缓存会占用一定内存
+- **并发限制**：受配置的最大并发任务数限制
+
+### 部署约束
+- **需要FUSE支持**：内核必须支持 FUSE
+- **权限要求**：需要挂载权限或 root 权限
+- **存储空间**：需要足够的本地存储空间用于缓存
+- **网络依赖**：NFS 网络连接必须稳定
 
 ## 项目价值
 
-1. **显著性能提升**：对于大文件密集型应用，可实现 10-100 倍性能提升
-2. **完全透明**：无需修改任何应用程序代码
-3. **易于部署**：通过标准的 fstab 配置即可使用，无需额外配置文件
-4. **高可靠性**：设计中考虑了各种故障场景
-5. **资源高效**：智能缓存管理，最大化利用有限的 SSD 空间
+1. **显著性能提升**：大文件读取性能提升 10-100 倍
+2. **完全透明**：无需修改应用程序，即插即用
+3. **简化部署**：通过 fstab 配置即可使用
+4. **高可靠性**：只读设计避免数据损坏风险
+5. **资源高效**：智能缓存管理最大化存储利用率
+6. **成本有效**：利用现有硬件提升性能，无需额外投资
 
-## 相关文档
+## 适用场景
 
-- [实施指南](implementation-guide.md) - 详细的开发实施步骤
-- [测试计划](testing-plan.md) - 全面的测试策略
-- [fstab配置指南](fstab-configuration.md) - 配置参数详解
+### 理想场景
+- 频繁读取大文件（GB级别）
+- 读取多于写入的工作负载
+- 网络带宽成为瓶颈
+- 具有局部性的访问模式
 
-## 参考资源
-
-- [FUSE Documentation](https://libfuse.github.io/doxygen/)
-- [Rust Async Book](https://rust-lang.github.io/async-book/)
-- [Linux Kernel Caching](https://www.kernel.org/doc/html/latest/filesystems/caching.html)
-- 类似项目：[CacheFS](https://github.com/kahing/catfs), [S3FS](https://github.com/s3fs-fuse/s3fs-fuse), [JuiceFS](https://github.com/juicedata/juicefs)
+### 不适用场景
+- 需要写入操作的应用
+- 文件很小（KB级别）
+- 完全随机的访问模式
+- 实时性要求极高的应用
 
 ---
 
-**注意**：本文档会随着项目进展持续更新。最新版本请查看项目仓库。 
+**注意**：NFS-CacheFS 是专门为读取优化的只读文件系统，不支持任何写入操作。如需写入，请直接操作原始 NFS 挂载点。 
