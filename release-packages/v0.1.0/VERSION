@@ -1,0 +1,29 @@
+NFS-CacheFS v0.1.0
+
+Build Information:
+- Version: 0.1.0
+- Build Date: 2024-07-09
+- Git Tag: v0.1.0
+- Target: x86_64-unknown-linux-gnu
+- Rust Version: 1.75+
+- FUSE Version: 3.0+
+
+System Requirements:
+- OS: Ubuntu 22.04 LTS / Ubuntu 24.04 LTS
+- Architecture: x86_64 (64-bit)
+- Kernel: Linux 5.4+
+- Dependencies: libfuse3-3, fuse3
+
+Binary Information:
+- File: nfs-cachefs
+- Size: ~2.2MB (stripped)
+- Type: ELF 64-bit LSB executable
+- Dependencies: libfuse3.so.3, libgcc_s.so.1, libm.so.6, libc.so.6
+
+Features:
+- High-performance async caching filesystem
+- Transparent NFS acceleration
+- Intelligent cache management with LRU eviction
+- Atomic operations for data integrity
+- Real-time performance monitoring
+- Read-only mode for data safety
