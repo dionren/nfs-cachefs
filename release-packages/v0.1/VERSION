@@ -1,0 +1,29 @@
+NFS-CacheFS v0.1 Release
+
+Build Information:
+- Version: 0.1
+- Build Date: $(date)
+- Target: x86_64-unknown-linux-gnu
+- Rust Version: $(rustc --version)
+
+Features:
+- High-performance asynchronous cache filesystem
+- Read-only mode optimized for NFS acceleration
+- Zero-latency first access with async cache population
+- Transparent acceleration for applications
+- Smart cache management with LRU eviction
+- Data integrity with atomic operations
+- Real-time monitoring and health checks
+
+System Requirements:
+- Ubuntu 22.04/24.04 LTS
+- Linux Kernel 5.4+
+- x86_64 architecture
+- FUSE 3.0+
+
+Installation:
+1. Extract the package: tar -xzf nfs-cachefs-v0.1-linux-x86_64.tar.gz
+2. Run install script: sudo ./install.sh
+3. Verify installation: nfs-cachefs --version
+
+For detailed installation instructions, see INSTALL.md
