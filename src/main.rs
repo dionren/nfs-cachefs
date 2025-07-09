@@ -15,7 +15,7 @@ fn parse_args() -> (Config, PathBuf, Vec<MountOption>) {
     let matches = Command::new("nfs-cachefs")
         .version("0.1.0")
         .author("NFS-CacheFS Team")
-        .about("High-performance asynchronous caching filesystem for NFS")
+        .about("High-performance read-only asynchronous caching filesystem for NFS")
         .arg(
             Arg::new("nfs_backend")
                 .help("NFS backend directory path")
@@ -87,6 +87,9 @@ fn parse_args() -> (Config, PathBuf, Vec<MountOption>) {
     let mut mount_options = Vec::new();
     let mut config_options = std::collections::HashMap::new();
     
+    // 强制只读模式
+    mount_options.push(MountOption::RO);
+    
     if let Some(options_str) = matches.get_one::<String>("options") {
         for option in options_str.split(',') {
             let option = option.trim();
@@ -100,8 +103,13 @@ fn parse_args() -> (Config, PathBuf, Vec<MountOption>) {
             } else {
                 // 处理标志选项
                 match option {
-                    "ro" => mount_options.push(MountOption::RO),
-                    "rw" => mount_options.push(MountOption::RW),
+                    "ro" => {
+                        // 已经默认设置为只读，忽略
+                    }
+                    "rw" => {
+                        warn!("Read-write mode is not supported, filesystem will be mounted read-only");
+                        // 不添加 RW 选项，保持只读
+                    }
                     "allow_other" => mount_options.push(MountOption::AllowOther),
                     "allow_root" => mount_options.push(MountOption::AllowRoot),
                     "auto_unmount" => mount_options.push(MountOption::AutoUnmount),
@@ -260,13 +268,14 @@ async fn main() {
     // 初始化日志系统
     init_logging("info");
     
-    info!("Starting NFS-CacheFS v0.1.0");
+    info!("Starting NFS-CacheFS v0.1.0 (READ-ONLY MODE)");
     info!("NFS Backend: {}", config.nfs_backend_path.display());
     info!("Cache Directory: {}", config.cache_dir.display());
     info!("Mount Point: {}", mountpoint.display());
     info!("Cache Size: {}GB", config.max_cache_size_bytes / (1024 * 1024 * 1024));
     info!("Block Size: {}MB", config.cache_block_size / (1024 * 1024));
     info!("Max Concurrent Tasks: {}", config.max_concurrent_caching);
+    info!("Filesystem Mode: READ-ONLY");
     
     // 验证配置
     if let Err(e) = validate_config(&config) {
@@ -289,7 +298,7 @@ async fn main() {
         }
     };
     
-    info!("Filesystem created successfully");
+    info!("Read-only filesystem created successfully");
     
     // 设置信号处理
     let (tx, mut rx) = tokio::sync::mpsc::channel(1);

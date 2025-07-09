@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{RwLock, Semaphore, mpsc};
+use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinHandle;
 use dashmap::DashMap;
 use parking_lot::Mutex;
@@ -15,6 +15,7 @@ use crate::core::config::Config;
 use crate::core::error::CacheFsError;
 use crate::Result;
 
+/// 缓存管理器
 pub struct CacheManager {
     config: Arc<Config>,
     
@@ -25,7 +26,6 @@ pub struct CacheManager {
     eviction_policy: Arc<Mutex<Box<dyn EvictionPolicy>>>,
     
     // 任务管理
-    task_queue: Arc<RwLock<std::collections::BinaryHeap<CacheTask>>>,
     active_tasks: Arc<DashMap<String, JoinHandle<Result<()>>>>,
     task_semaphore: Arc<Semaphore>,
     
@@ -61,7 +61,6 @@ impl CacheManager {
             config: Arc::clone(&config),
             cache_entries: Arc::new(DashMap::new()),
             eviction_policy: Arc::new(Mutex::new(eviction_policy)),
-            task_queue: Arc::new(RwLock::new(std::collections::BinaryHeap::new())),
             active_tasks: Arc::new(DashMap::new()),
             task_semaphore: Arc::new(Semaphore::new(config.max_concurrent_caching as usize)),
             metrics: Arc::clone(&metrics),
@@ -104,39 +103,11 @@ impl CacheManager {
     
     /// 记录文件访问
     pub fn record_access(&self, path: &PathBuf) {
-        if let Some(mut entry) = self.cache_entries.get_mut(path) {
-            entry.mark_accessed();
-            self.eviction_policy.lock().on_access(path, &entry);
+        if self.is_cached(path) {
             self.metrics.record_cache_hit();
         } else {
             self.metrics.record_cache_miss();
         }
-    }
-    
-    /// 原子性缓存失效操作
-    pub async fn invalidate_cache_entry(&self, cache_path: &PathBuf) -> Result<()> {
-        // 1. 从缓存条目中移除
-        if let Some((_, entry)) = self.cache_entries.remove(cache_path) {
-            // 2. 通知驱逐策略
-            self.eviction_policy.lock().on_remove(cache_path);
-            
-            // 3. 更新指标
-            self.metrics.record_cache_invalidation();
-            
-            tracing::debug!("Cache entry invalidated: {}", cache_path.display());
-            
-            // 如果文件正在缓存中，需要取消相关任务
-            if entry.status.is_caching() {
-                // 尝试取消相关的缓存任务
-                let task_id = cache_path.to_string_lossy().to_string();
-                if let Some((_, handle)) = self.active_tasks.remove(&task_id) {
-                    handle.abort();
-                    tracing::info!("Aborted caching task for invalidated file: {}", cache_path.display());
-                }
-            }
-        }
-        
-        Ok(())
     }
     
     /// 提交缓存任务 - 修复竞态条件

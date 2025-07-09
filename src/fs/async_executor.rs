@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::time::SystemTime;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
-use tracing::{debug, error, warn};
+use tracing::{debug, warn};
 
 use crate::cache::manager::CacheManager;
 use crate::cache::state::CachePriority;
@@ -23,12 +23,6 @@ pub enum AsyncRequest {
         offset: i64,
         size: u32,
         responder: oneshot::Sender<Result<Vec<u8>, i32>>,
-    },
-    Write {
-        ino: u64,
-        offset: i64,
-        data: Vec<u8>,
-        responder: oneshot::Sender<Result<u32, i32>>,
     },
     Open {
         ino: u64,
@@ -111,17 +105,6 @@ impl AsyncExecutor {
                     ).await;
                     let _ = responder.send(result);
                 }
-                AsyncRequest::Write { ino, offset, data, responder } => {
-                    let result = Self::handle_write(
-                        &config,
-                        &inode_manager,
-                        &cache_manager,
-                        ino,
-                        offset,
-                        &data,
-                    ).await;
-                    let _ = responder.send(result);
-                }
                 AsyncRequest::Open { ino, responder } => {
                     let result = Self::handle_open(
                         &config,
@@ -192,7 +175,7 @@ impl AsyncExecutor {
                     ctime: metadata.created().unwrap_or(SystemTime::now()),
                     crtime: metadata.created().unwrap_or(SystemTime::now()),
                     kind: file_type,
-                    perm: 0o644,
+                    perm: if metadata.is_dir() { 0o555 } else { 0o444 }, // 只读权限
                     nlink: 1,
                     uid: 1000,
                     gid: 1000,
@@ -232,12 +215,9 @@ impl AsyncExecutor {
                     cache_manager.record_access(&path);
                     return Ok(data);
                 }
-                Err(e) => {
-                    warn!("Failed to read from cache {}: {}", cache_path.display(), e);
-                    // 缓存文件损坏，删除它
-                    if let Err(invalidate_err) = Self::invalidate_cache(config, cache_manager, &path).await {
-                        warn!("Failed to invalidate corrupted cache: {}", invalidate_err);
-                    }
+                Err(_) => {
+                    warn!("Failed to read from cache, falling back to NFS");
+                    // 在只读模式下，缓存文件损坏时仅回退到NFS，不删除缓存
                 }
             }
         }
@@ -265,54 +245,7 @@ impl AsyncExecutor {
         }
     }
     
-    /// 处理 write 操作
-    async fn handle_write(
-        config: &Config,
-        inode_manager: &InodeManager,
-        cache_manager: &CacheManager,
-        ino: u64,
-        offset: i64,
-        data: &[u8],
-    ) -> Result<u32, i32> {
-        use libc::{ENOENT, EACCES, EINVAL, EIO};
-        use tokio::io::{AsyncWriteExt, AsyncSeekExt};
-        use std::io::SeekFrom;
-        
-        let path = match inode_manager.get_path(ino) {
-            Some(path) => path,
-            None => return Err(ENOENT),
-        };
-        
-        let nfs_path = Self::get_nfs_path(config, &path);
-        
-        let mut file = match tokio::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .open(&nfs_path)
-            .await
-        {
-            Ok(f) => f,
-            Err(_) => return Err(EACCES),
-        };
-        
-        if let Err(_) = file.seek(SeekFrom::Start(offset as u64)).await {
-            return Err(EINVAL);
-        }
-        
-        match file.write(data).await {
-            Ok(bytes_written) => {
-                // 写入后需要使缓存无效
-                if let Err(e) = Self::invalidate_cache(config, cache_manager, &path).await {
-                    warn!("Failed to invalidate cache after write: {}", e);
-                }
-                
-                Ok(bytes_written as u32)
-            }
-            Err(_) => Err(EIO),
-        }
-    }
-    
-    /// 处理 open 操作
+    /// 处理 open 操作 (只读模式)
     async fn handle_open(
         config: &Config,
         inode_manager: &InodeManager,
@@ -329,6 +262,7 @@ impl AsyncExecutor {
         
         let nfs_path = Self::get_nfs_path(config, &path);
         
+        // 只读模式，仅以只读方式打开文件
         match tokio::fs::File::open(&nfs_path).await {
             Ok(file) => {
                 let mut next = next_fh.write().await;
@@ -441,28 +375,5 @@ impl AsyncExecutor {
         } else {
             true
         }
-    }
-    
-    /// 辅助函数：使缓存无效
-    async fn invalidate_cache(
-        config: &Config,
-        cache_manager: &CacheManager,
-        path: &PathBuf,
-    ) -> Result<(), crate::core::error::CacheFsError> {
-        let cache_path = Self::get_cache_path(config, path);
-        
-        // 更新缓存管理器状态
-        cache_manager.invalidate_cache_entry(&cache_path).await?;
-        
-        // 删除物理文件
-        if tokio::fs::try_exists(&cache_path).await.unwrap_or(false) {
-            if let Err(e) = tokio::fs::remove_file(&cache_path).await {
-                error!("Failed to remove cache file {}: {}", cache_path.display(), e);
-                return Err(crate::core::error::CacheFsError::IoError(e));
-            }
-        }
-        
-        debug!("Invalidated cache for modified file: {}", path.display());
-        Ok(())
     }
 } 

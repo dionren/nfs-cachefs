@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use fuser::{
     FileAttr, FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry,
-    ReplyOpen, ReplyWrite, Request, FUSE_ROOT_ID,
+    ReplyOpen, Request, FUSE_ROOT_ID,
 };
 use libc::ENOENT;
 use tokio::sync::RwLock;
@@ -17,18 +17,10 @@ use crate::core::config::Config;
 use crate::fs::inode::InodeManager;
 use crate::fs::async_executor::{AsyncExecutor, AsyncRequest};
 
-/// NFS-CacheFS 文件系统实现
+/// NFS-CacheFS 只读文件系统实现
 pub struct CacheFs {
-    /// 配置信息
-    config: Config,
     /// inode 管理器
     inode_manager: Arc<InodeManager>,
-    /// 缓存管理器
-    cache_manager: Arc<CacheManager>,
-    /// 打开的文件句柄
-    open_files: Arc<RwLock<HashMap<u64, Arc<RwLock<tokio::fs::File>>>>>,
-    /// 下一个文件句柄
-    next_fh: Arc<RwLock<u64>>,
     /// 异步操作执行器
     async_executor: AsyncExecutor,
 }
@@ -53,11 +45,7 @@ impl CacheFs {
         );
         
         Ok(Self {
-            config,
             inode_manager,
-            cache_manager,
-            open_files,
-            next_fh,
             async_executor,
         })
     }
@@ -135,43 +123,6 @@ impl Filesystem for CacheFs {
         tokio::spawn(async move {
             match receiver.await {
                 Ok(Ok(data)) => reply.data(&data),
-                Ok(Err(err)) => reply.error(err),
-                Err(_) => reply.error(libc::EIO),
-            }
-        });
-    }
-    
-    fn write(
-        &mut self,
-        _req: &Request,
-        ino: u64,
-        _fh: u64,
-        offset: i64,
-        data: &[u8],
-        _write_flags: u32,
-        _flags: i32,
-        _lock_owner: Option<u64>,
-        reply: ReplyWrite,
-    ) {
-        let (sender, receiver) = oneshot::channel();
-        let data = data.to_vec();
-        
-        let request = AsyncRequest::Write {
-            ino,
-            offset,
-            data,
-            responder: sender,
-        };
-        
-        if let Err(e) = self.async_executor.submit(request) {
-            error!("Failed to submit write request: {}", e);
-            reply.error(libc::EIO);
-            return;
-        }
-        
-        tokio::spawn(async move {
-            match receiver.await {
-                Ok(Ok(bytes_written)) => reply.written(bytes_written),
                 Ok(Err(err)) => reply.error(err),
                 Err(_) => reply.error(libc::EIO),
             }
