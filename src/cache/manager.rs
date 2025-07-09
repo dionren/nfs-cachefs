@@ -139,14 +139,9 @@ impl CacheManager {
         Ok(())
     }
     
-    /// 提交缓存任务
+    /// 提交缓存任务 - 修复竞态条件
     pub async fn submit_cache_task(&self, nfs_path: PathBuf, priority: CachePriority) -> Result<()> {
         let cache_path = self.get_cache_path(&nfs_path);
-        
-        // 检查是否已经在缓存或已缓存
-        if self.is_cached(&cache_path) || self.is_caching(&cache_path) {
-            return Ok(());
-        }
         
         // 获取文件大小
         let file_size = match tokio::fs::metadata(&nfs_path).await {
@@ -157,21 +152,51 @@ impl CacheManager {
             }
         };
         
+        // 使用原子操作避免竞态条件
+        match self.cache_entries.entry(cache_path.clone()) {
+            dashmap::mapref::entry::Entry::Occupied(entry) => {
+                // 文件已存在，检查状态
+                match &entry.get().status {
+                    CacheStatus::Cached { .. } | CacheStatus::CachingInProgress { .. } => {
+                        // 已缓存或正在缓存，直接返回
+                        return Ok(());
+                    }
+                    CacheStatus::Failed { .. } | CacheStatus::NotCached => {
+                        // 失败状态或未缓存，可以重新缓存
+                        // 继续执行后续逻辑
+                    }
+                }
+            }
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                // 创建新的缓存条目
+                let mut new_entry = CacheEntry::new(file_size).with_priority(priority);
+                let _progress = new_entry.start_caching(file_size);
+                entry.insert(new_entry);
+            }
+        }
+        
         // 检查缓存空间
         if let Err(e) = self.ensure_cache_space(file_size).await {
             tracing::warn!("Failed to ensure cache space for {}: {}", nfs_path.display(), e);
+            // 如果空间不足，移除刚创建的条目
+            self.cache_entries.remove(&cache_path);
             return Err(e);
         }
         
-        // 创建缓存条目
-        let mut entry = CacheEntry::new(file_size).with_priority(priority);
-        let _progress = entry.start_caching(file_size);
-        
-        self.cache_entries.insert(cache_path.clone(), entry.clone());
-        self.eviction_policy.lock().on_insert(cache_path.clone(), &entry);
+        // 确保条目处于缓存中状态，并通知驱逐策略
+        if let Some(mut entry_ref) = self.cache_entries.get_mut(&cache_path) {
+            if !entry_ref.status.is_caching() {
+                let _progress = entry_ref.start_caching(file_size);
+            }
+            // 通知驱逐策略
+            self.eviction_policy.lock().on_insert(cache_path.clone(), &*entry_ref);
+        } else {
+            // 条目不存在，这不应该发生
+            return Err(CacheFsError::cache_error("Cache entry disappeared unexpectedly"));
+        }
         
         // 创建缓存任务
-        let task = CacheTask::new(nfs_path, cache_path)
+        let task = CacheTask::new(nfs_path, cache_path.clone())
             .with_priority(priority)
             .with_file_size(file_size)
             .with_checksum(self.config.enable_checksums);
@@ -179,6 +204,8 @@ impl CacheManager {
         // 提交任务
         if let Err(e) = self.task_sender.send(task) {
             tracing::error!("Failed to submit cache task: {}", e);
+            // 任务提交失败，清理状态
+            self.cache_entries.remove(&cache_path);
             return Err(CacheFsError::SendError(e.to_string()));
         }
         
@@ -202,35 +229,61 @@ impl CacheManager {
         Ok(())
     }
     
-    /// 驱逐文件以释放空间
+    /// 驱逐文件以释放空间 - 修复死锁风险
     async fn evict_files(&self, space_needed: u64) -> Result<()> {
+        // 1. 首先收集所有缓存条目的快照
         let entries: HashMap<PathBuf, CacheEntry> = self.cache_entries
             .iter()
             .map(|entry| (entry.key().clone(), entry.value().clone()))
             .collect();
         
+        // 2. 计算驱逐候选者，避免长时间持有锁
         let victims = {
             let policy = self.eviction_policy.lock();
             policy.select_victims(&entries, space_needed)
         };
         
+        // 3. 按顺序处理驱逐，避免死锁
         let mut freed_space = 0u64;
+        let mut evicted_paths = Vec::new();
+        
         for victim_path in victims {
+            // 原子性检查和移除
             if let Some((_, entry)) = self.cache_entries.remove(&victim_path) {
+                // 确保不驱逐正在缓存的文件
+                if entry.status.is_caching() {
+                    // 重新插入正在缓存的条目
+                    self.cache_entries.insert(victim_path.clone(), entry);
+                    continue;
+                }
+                
                 // 删除缓存文件
-                if let Err(e) = tokio::fs::remove_file(&victim_path).await {
-                    tracing::warn!("Failed to remove cache file {}: {}", victim_path.display(), e);
-                } else {
-                    freed_space += entry.size;
-                    self.eviction_policy.lock().on_remove(&victim_path);
-                    self.metrics.record_eviction();
-                    
-                    tracing::debug!("Evicted cache file: {}", victim_path.display());
+                match tokio::fs::remove_file(&victim_path).await {
+                    Ok(()) => {
+                        freed_space += entry.size;
+                        evicted_paths.push(victim_path.clone());
+                        self.metrics.record_eviction();
+                        
+                        tracing::debug!("Evicted cache file: {}", victim_path.display());
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to remove cache file {}: {}", victim_path.display(), e);
+                        // 如果文件删除失败，重新插入条目
+                        self.cache_entries.insert(victim_path, entry);
+                    }
                 }
             }
             
             if freed_space >= space_needed {
                 break;
+            }
+        }
+        
+        // 4. 批量通知驱逐策略，减少锁获取次数
+        if !evicted_paths.is_empty() {
+            let mut policy = self.eviction_policy.lock();
+            for path in evicted_paths {
+                policy.on_remove(&path);
             }
         }
         
@@ -305,7 +358,7 @@ impl CacheManager {
         });
     }
     
-    /// 执行缓存任务
+    /// 执行缓存任务 - 修复原子性问题
     async fn execute_cache_task(
         mut task: CacheTask,
         cache_entries: Arc<DashMap<PathBuf, CacheEntry>>,
@@ -314,40 +367,101 @@ impl CacheManager {
     ) -> Result<()> {
         let start_time = Instant::now();
         
+        // 确保在任何错误情况下都能清理临时文件
+        struct TempFileGuard {
+            temp_path: PathBuf,
+        }
+        
+        impl Drop for TempFileGuard {
+            fn drop(&mut self) {
+                if self.temp_path.exists() {
+                    if let Err(e) = std::fs::remove_file(&self.temp_path) {
+                        tracing::warn!("Failed to cleanup temp file {}: {}", self.temp_path.display(), e);
+                    }
+                }
+            }
+        }
+        
         loop {
+            let temp_path = task.get_temp_path();
+            let _temp_guard = TempFileGuard { temp_path: temp_path.clone() };
+            
             let result = Self::copy_file_to_cache(&task, &cache_entries, &metrics, &config).await;
             
             match result {
                 Ok(checksum) => {
-                    // 缓存成功
-                    if let Some(mut entry) = cache_entries.get_mut(&task.cache_path) {
-                        entry.complete_caching(task.file_size.unwrap_or(0), checksum);
-                        
-                        // 原子性操作：重命名临时文件
-                        let temp_path = task.get_temp_path();
-                        if let Err(e) = tokio::fs::rename(&temp_path, &task.cache_path).await {
-                            tracing::error!("Failed to rename cached file: {}", e);
-                            entry.mark_failed(e.to_string(), task.retry_count);
+                    // 原子性文件操作：先验证，再重命名
+                    let file_size = task.file_size.unwrap_or(0);
+                    
+                    // 1. 验证临时文件完整性
+                    match tokio::fs::metadata(&temp_path).await {
+                        Ok(metadata) => {
+                            if metadata.len() != file_size {
+                                tracing::error!("Temp file size mismatch: expected {}, got {}", 
+                                    file_size, metadata.len());
+                                
+                                if let Some(mut entry) = cache_entries.get_mut(&task.cache_path) {
+                                    entry.mark_failed("File size mismatch".to_string(), task.retry_count);
+                                }
+                                
+                                metrics.record_cache_error();
+                                return Err(CacheFsError::cache_error("File size mismatch"));
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to verify temp file: {}", e);
+                            
+                            if let Some(mut entry) = cache_entries.get_mut(&task.cache_path) {
+                                entry.mark_failed(e.to_string(), task.retry_count);
+                            }
+                            
                             metrics.record_cache_error();
                             return Err(CacheFsError::IoError(e));
                         }
-                        
-                        let latency = start_time.elapsed();
-                        metrics.record_cache_operation(latency);
-                        metrics.record_cache_task_complete();
-                        
-                        tracing::info!(
-                            "Successfully cached file: {} (size: {}, time: {:?})",
-                            task.source_path.display(),
-                            task.file_size.unwrap_or(0),
-                            latency
-                        );
-                        
-                        return Ok(());
+                    }
+                    
+                    // 2. 原子性重命名操作
+                    match tokio::fs::rename(&temp_path, &task.cache_path).await {
+                        Ok(()) => {
+                            // 3. 更新缓存条目状态（必须在重命名成功后）
+                            if let Some(mut entry) = cache_entries.get_mut(&task.cache_path) {
+                                entry.complete_caching(file_size, checksum);
+                                
+                                let latency = start_time.elapsed();
+                                metrics.record_cache_operation(latency);
+                                metrics.record_cache_task_complete();
+                                
+                                tracing::info!(
+                                    "Successfully cached file: {} (size: {}, time: {:?})",
+                                    task.source_path.display(),
+                                    file_size,
+                                    latency
+                                );
+                                
+                                // 防止 Drop 清理已重命名的文件
+                                std::mem::forget(_temp_guard);
+                                return Ok(());
+                            } else {
+                                // 如果缓存条目丢失，这是一个严重错误
+                                tracing::error!("Cache entry lost during atomic operation: {}", 
+                                    task.cache_path.display());
+                                return Err(CacheFsError::cache_error("Cache entry lost"));
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to rename cached file: {}", e);
+                            
+                            if let Some(mut entry) = cache_entries.get_mut(&task.cache_path) {
+                                entry.mark_failed(e.to_string(), task.retry_count);
+                            }
+                            
+                            metrics.record_cache_error();
+                            return Err(CacheFsError::IoError(e));
+                        }
                     }
                 }
                 Err(e) => {
-                    // 缓存失败
+                    // 缓存失败，临时文件会被自动清理
                     tracing::warn!("Cache task failed: {} (attempt {}/{}): {}", 
                         task.source_path.display(), task.retry_count + 1, task.max_retries, e);
                     

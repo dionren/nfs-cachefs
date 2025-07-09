@@ -4,6 +4,67 @@ use std::time::{Duration, Instant, SystemTime};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
+/// 循环缓冲区，用于存储有限数量的延迟数据，防止内存泄漏
+#[derive(Debug)]
+struct CircularBuffer<T> {
+    data: Vec<T>,
+    capacity: usize,
+    head: usize,
+    size: usize,
+}
+
+impl<T: Clone + Default> CircularBuffer<T> {
+    fn new(capacity: usize) -> Self {
+        Self {
+            data: vec![T::default(); capacity],
+            capacity,
+            head: 0,
+            size: 0,
+        }
+    }
+    
+    fn push(&mut self, item: T) {
+        self.data[self.head] = item;
+        self.head = (self.head + 1) % self.capacity;
+        if self.size < self.capacity {
+            self.size += 1;
+        }
+    }
+    
+    fn iter(&self) -> Box<dyn Iterator<Item = &T> + '_> {
+        if self.size == 0 {
+            return Box::new(std::iter::empty());
+        }
+        
+        if self.size < self.capacity {
+            // 没有环绕
+            Box::new(self.data[0..self.size].iter())
+        } else {
+            // 有环绕
+            let start = self.head;
+            Box::new(
+                self.data[start..].iter()
+                    .chain(self.data[..start].iter())
+            )
+        }
+    }
+    
+    fn len(&self) -> usize {
+        self.size
+    }
+    
+    fn clear(&mut self) {
+        self.head = 0;
+        self.size = 0;
+    }
+}
+
+impl<T: Clone + Default> Default for CircularBuffer<T> {
+    fn default() -> Self {
+        Self::new(10000) // 默认容量
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CacheMetrics {
     // 缓存命中统计
@@ -106,10 +167,10 @@ pub struct MetricsCollector {
     caching_files_count: AtomicU64,
     failed_files_count: AtomicU64,
     
-    // 延迟统计
-    read_latencies: Arc<RwLock<Vec<Duration>>>,
-    write_latencies: Arc<RwLock<Vec<Duration>>>,
-    cache_latencies: Arc<RwLock<Vec<Duration>>>,
+    // 延迟统计 - 使用循环缓冲区防止内存泄漏
+    read_latencies: Arc<RwLock<CircularBuffer<Duration>>>,
+    write_latencies: Arc<RwLock<CircularBuffer<Duration>>>,
+    cache_latencies: Arc<RwLock<CircularBuffer<Duration>>>,
     
     // 容量信息
     total_cache_size: AtomicU64,
@@ -140,9 +201,9 @@ impl MetricsCollector {
             cached_files_count: AtomicU64::new(0),
             caching_files_count: AtomicU64::new(0),
             failed_files_count: AtomicU64::new(0),
-            read_latencies: Arc::new(RwLock::new(Vec::new())),
-            write_latencies: Arc::new(RwLock::new(Vec::new())),
-            cache_latencies: Arc::new(RwLock::new(Vec::new())),
+            read_latencies: Arc::new(RwLock::new(CircularBuffer::new(1000))),
+            write_latencies: Arc::new(RwLock::new(CircularBuffer::new(1000))),
+            cache_latencies: Arc::new(RwLock::new(CircularBuffer::new(1000))),
             total_cache_size: AtomicU64::new(0),
             used_cache_size: AtomicU64::new(0),
             historical_metrics: Arc::new(RwLock::new(Vec::new())),
@@ -231,9 +292,9 @@ impl MetricsCollector {
         self.used_cache_size.store(used, Ordering::Relaxed);
     }
     
-    // 计算平均延迟
-    fn calculate_average_latency(latencies: &[Duration]) -> f64 {
-        if latencies.is_empty() {
+    // 计算平均延迟 - 修复内存泄漏
+    fn calculate_average_latency(latencies: &CircularBuffer<Duration>) -> f64 {
+        if latencies.len() == 0 {
             return 0.0;
         }
         
@@ -316,27 +377,11 @@ impl MetricsCollector {
         self.historical_metrics.read().clone()
     }
     
-    // 清理延迟统计（避免内存泄漏）
+    // 清理延迟统计（循环缓冲区自动管理内存，无需手动清理）
     pub fn cleanup_latency_stats(&self) {
-        const MAX_LATENCY_SAMPLES: usize = 10000;
-        
-        let mut read_latencies = self.read_latencies.write();
-        if read_latencies.len() > MAX_LATENCY_SAMPLES {
-            let excess = read_latencies.len() - MAX_LATENCY_SAMPLES;
-            read_latencies.drain(0..excess);
-        }
-        
-        let mut write_latencies = self.write_latencies.write();
-        if write_latencies.len() > MAX_LATENCY_SAMPLES {
-            let excess = write_latencies.len() - MAX_LATENCY_SAMPLES;
-            write_latencies.drain(0..excess);
-        }
-        
-        let mut cache_latencies = self.cache_latencies.write();
-        if cache_latencies.len() > MAX_LATENCY_SAMPLES {
-            let excess = cache_latencies.len() - MAX_LATENCY_SAMPLES;
-            cache_latencies.drain(0..excess);
-        }
+        // 循环缓冲区会自动限制内存使用，这里可以选择性地清理历史数据
+        // 保留此函数以保持API兼容性
+        tracing::debug!("Latency stats cleanup called (automatic with circular buffer)");
     }
     
     // 重置统计
@@ -384,7 +429,7 @@ impl PerformanceMonitor {
             // 保存快照
             self.metrics.save_snapshot();
             
-            // 清理延迟统计
+            // 延迟统计自动管理（循环缓冲区）
             self.metrics.cleanup_latency_stats();
             
             // 记录当前指标
@@ -425,6 +470,10 @@ mod tests {
         assert!((metrics.cache_hit_rate - 0.666666).abs() < 0.001);
         assert!(metrics.avg_read_latency_ms > 0.0);
         assert!(metrics.avg_write_latency_ms > 0.0);
+        
+        // 验证延迟数据正确收集
+        assert_eq!(collector.read_latencies.read().len(), 1);
+        assert_eq!(collector.write_latencies.read().len(), 1);
     }
     
     #[test]
@@ -476,5 +525,50 @@ mod tests {
         assert_eq!(metrics_after.cache_hits, 0);
         assert_eq!(metrics_after.cache_misses, 0);
         assert_eq!(metrics_after.total_reads, 0);
+    }
+    
+    #[test]
+    fn test_circular_buffer_memory_management() {
+        let collector = MetricsCollector::new();
+        
+        // 添加超过缓冲区容量的延迟数据
+        for _ in 0..1500 {  // 超过1000的容量
+            collector.record_read(Duration::from_millis(10));
+        }
+        
+        let read_latencies = collector.read_latencies.read();
+        
+        // 验证缓冲区大小被限制
+        assert_eq!(read_latencies.len(), 1000);
+        
+        // 验证可以正常计算平均值
+        let metrics = collector.get_metrics();
+        assert!(metrics.avg_read_latency_ms > 0.0);
+        assert_eq!(metrics.total_reads, 1500); // 计数器应该记录所有操作
+    }
+    
+    #[test]
+    fn test_circular_buffer_operations() {
+        let mut buffer = CircularBuffer::new(3);
+        
+        // 测试基本操作
+        assert_eq!(buffer.len(), 0);
+        
+        buffer.push(Duration::from_millis(10));
+        buffer.push(Duration::from_millis(20));
+        buffer.push(Duration::from_millis(30));
+        assert_eq!(buffer.len(), 3);
+        
+        // 测试环绕
+        buffer.push(Duration::from_millis(40));
+        assert_eq!(buffer.len(), 3);  // 大小保持不变
+        
+        // 验证迭代器
+        let values: Vec<Duration> = buffer.iter().cloned().collect();
+        assert_eq!(values.len(), 3);
+        
+        // 测试清理
+        buffer.clear();
+        assert_eq!(buffer.len(), 0);
     }
 } 
