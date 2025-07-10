@@ -26,10 +26,17 @@ Thumbs.db
 /test-data/
 /tmp/
 
-# Build artifacts
-/build/
 
 # Release packages - these should be uploaded to GitHub releases, not committed
 nfs-cachefs-v*.tar.gz
 nfs-cachefs-v*.tar.gz.sha256
 nfs-cachefs-v*-linux-*/
+
+# Temporary files
+*.tmp
+*.temp
+
+# Editor backup files
+*~
+.#*
+#*#

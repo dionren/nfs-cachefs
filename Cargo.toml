@@ -51,7 +51,3 @@ clap = { version = "4.4", features = ["derive"] }
 tempfile = "3.8"
 criterion = "0.5"
 tokio-test = "0.4"
-
-[[bench]]
-name = "cache_benchmark"
-harness = false

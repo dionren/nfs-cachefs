@@ -1,0 +1,42 @@
+# Rust 构建产物
+target/
+**/*.rs.bk
+
+# IDE 文件
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# Git 文件
+.git/
+.gitignore
+
+# 文档和说明
+docs/
+README.md
+CHANGELOG.md
+LICENSE
+
+# 构建脚本（除了 Dockerfile）
+build/
+Makefile
+
+# 测试文件
+tests/
+
+# 临时文件
+*.tmp
+*.log
+
+# 发布包
+*.tar.gz
+*.zip
+
+# GitHub 配置
+.github/ 

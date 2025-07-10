@@ -1,15 +1,15 @@
 # NFS-CacheFS
 
-[![Version](https://img.shields.io/badge/version-v0.3.0-blue)](https://github.com/yourusername/nfs-cachefs/releases/latest)
+[![Version](https://img.shields.io/badge/version-v0.4.0-blue)](https://github.com/yourusername/nfs-cachefs/releases/latest)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 一个高性能的异步只读缓存文件系统，专为加速NFS上大文件访问而设计。
 
-## 🎉 最新版本 v0.3.0
+## 🎉 最新版本 v0.4.0
 
-- **修复了挂载命令卡住的问题** - mount 命令现在会自动在后台运行
-- **新增 `foreground` 选项** - 用于调试时在前台运行
-- **改进的错误处理和日志记录**
+- **静态编译支持** - 无glibc版本依赖，可在任何Linux系统运行
+- **统一构建环境** - 使用标准化的构建流程
+- **改进的项目结构** - 构建相关文件移至`build/`目录
 - [查看完整更新日志](CHANGELOG.md)
 
 ## 特性
@@ -20,20 +20,19 @@
 - 🔒 **数据完整性** - 原子操作确保缓存文件始终完整
 - 📊 **实时监控** - 内置性能指标和健康检查
 - 🔐 **只读模式** - 专为只读工作负载优化，确保数据安全
+- 🚢 **静态编译** - 无依赖部署，兼容所有Linux发行版
 
 ## 快速开始
 
 ### 方法一：使用预编译二进制包（推荐）
 
-适用于 Ubuntu 22.04/24.04 x86_64 系统：
-
 ```bash
 # 下载发布包
-wget https://github.com/dionren/nfs-cachefs/releases/download/v0.3.0/nfs-cachefs-v0.3.0-linux-x86_64.tar.gz
+wget https://github.com/dionren/nfs-cachefs/releases/download/v0.4.0/nfs-cachefs-v0.4.0-linux-x86_64.tar.gz
 
 # 解压并安装
-tar -xzf nfs-cachefs-v0.3.0-linux-x86_64.tar.gz
-cd nfs-cachefs-v0.3.0-linux-x86_64
+tar -xzf nfs-cachefs-v0.4.0-linux-x86_64.tar.gz
+cd nfs-cachefs-v0.4.0-linux-x86_64
 sudo ./install.sh
 ```
 
@@ -42,25 +41,23 @@ sudo ./install.sh
 #### 依赖要求
 
 - Rust 1.75+
-- FUSE 3.0+
-- Linux Kernel 5.4+
+- musl工具链（用于静态编译）
 
 #### 编译步骤
 
 ```bash
-# 安装依赖
-sudo apt update
-sudo apt install -y libfuse3-dev libfuse-dev pkg-config
-
 # 克隆项目
 git clone https://github.com/your-org/nfs-cachefs.git
 cd nfs-cachefs
 
-# 编译发布版本
-cargo build --release
+# 使用Makefile构建
+make build
+
+# 或直接运行构建脚本
+./build/build-release.sh
 
 # 安装到系统
-sudo cp target/release/nfs-cachefs /usr/local/bin/
+sudo cp target/x86_64-unknown-linux-musl/release/nfs-cachefs /usr/local/bin/
 sudo ln -sf /usr/local/bin/nfs-cachefs /sbin/mount.cachefs
 ```
 
@@ -102,31 +99,11 @@ cachefs    /mnt/cached    cachefs    nfs_backend=/mnt/nfs,cache_dir=/mnt/nvme/ca
 cachefs    /mnt/cached    cachefs    nfs_backend=/mnt/nfs,cache_dir=/mnt/nvme/cache,cache_size_gb=100,block_size_mb=4,max_concurrent=8,direct_io=true,readahead_mb=16,eviction=lru,allow_other,_netdev    0 0
 ```
 
-## 重要说明
-
-### 只读模式
-
-NFS-CacheFS 现在专门设计为只读文件系统：
-
-- ✅ 支持所有读操作（read, readdir, lookup, getattr）
-- ❌ 不支持写操作（write, create, mkdir, unlink 等）
-- 🔒 文件权限自动设置为只读
-- 📁 目录权限设置为 0o555，文件权限设置为 0o444
-- ⚠️ 即使指定 `rw` 选项也会被忽略并警告
-
-### 适用场景
-
-- 深度学习模型文件访问
-- 大型数据集的只读访问
-- 代码仓库的只读访问
-- 静态资源分发
-- 备份数据的快速访问
-
 ## 项目结构
 
 ```
 nfs-cachefs/
-├── src/
+├── src/                  # 源代码
 │   ├── main.rs           # 程序入口
 │   ├── lib.rs            # 库入口
 │   ├── mount_helper.rs   # 挂载辅助工具
@@ -134,71 +111,46 @@ nfs-cachefs/
 │   ├── fs/               # 文件系统实现
 │   ├── cache/            # 缓存管理
 │   └── utils/            # 工具函数
-├── docs/                 # 项目文档
-│   ├── project.md        # 项目详细说明
-│   └── testing-plan.md   # 测试计划
+├── build/                # 构建系统
+│   ├── build-release.sh  # 主构建脚本
+│   ├── install.sh        # 安装脚本
+│   └── BUILD_GLIBC_COMPATIBILITY.md  # 构建文档
 ├── tests/                # 测试套件
-│   ├── integration/      # 集成测试
-│   └── unit/             # 单元测试
-├── benches/              # 性能基准测试
 ├── .github/              # GitHub Actions 工作流
-├── install.sh            # 安装脚本
-├── release.sh            # 发布脚本
+├── Makefile              # 构建快捷方式
 ├── Cargo.toml            # Rust 项目配置
 ├── Cargo.lock            # 依赖锁定文件
 ├── CHANGELOG.md          # 更新日志
 └── README.md             # 项目说明
 ```
 
-## 架构概览
+## 构建系统
 
-```mermaid
-graph TD
-    A[应用程序] --> B[CacheFS FUSE层]
-    B --> C{缓存状态?}
-    C -->|已缓存| D[NVMe缓存]
-    C -->|未缓存| E[NFS后端]
-    C -->|缓存中| E
-    B --> F[异步缓存管理器]
-    F --> G[后台复制任务]
-    G --> D
-```
-
-## 下载安装
-
-### 预编译二进制包
-
-| 系统 | 架构 | 下载链接 |
-|------|------|----------|
-| Ubuntu 22.04/24.04 | x86_64 | [nfs-cachefs-v0.3.0-linux-x86_64.tar.gz](https://github.com/yourusername/nfs-cachefs/releases/download/v0.3.0/nfs-cachefs-v0.3.0-linux-x86_64.tar.gz) |
-
-### 系统要求
-
-- **操作系统**: Ubuntu 22.04 LTS / Ubuntu 24.04 LTS
-- **架构**: x86_64 (64位)
-- **内核**: Linux 5.4+
-- **依赖**: libfuse3-3, fuse3
-
-### 安装验证
+### 使用Makefile（推荐）
 
 ```bash
-# 检查版本
-nfs-cachefs --version
+# 静态编译构建（生产环境）
+make build
+
+# 本地开发构建
+make local-build
+
+# 清理构建产物
+make clean
 
 # 查看帮助
-nfs-cachefs --help
-
-# 检查依赖
-ldd /usr/local/bin/nfs-cachefs
+make help
 ```
 
-## 性能对比
+### 直接使用构建脚本
 
-| 场景 | 直接NFS | NFS-CacheFS (首次) | NFS-CacheFS (缓存后) |
-|------|---------|-------------------|----------------------|
-| 10GB文件顺序读 | 100s | 100s | 10s |
-| 随机访问延迟 | 10ms | 10ms | 0.1ms |
-| 并发读取吞吐量 | 1GB/s | 1GB/s | 10GB/s |
+```bash
+# 静态编译（推荐）
+./build/build-release.sh
+
+# 查看构建文档
+cat ./build/BUILD_GLIBC_COMPATIBILITY.md
+```
 
 ## 开发
 
@@ -208,14 +160,8 @@ ldd /usr/local/bin/nfs-cachefs
 # 运行所有测试
 cargo test
 
-# 运行单元测试
-cargo test --lib
-
 # 运行集成测试 (需要先设置测试环境)
 cargo test --test integration
-
-# 运行性能基准测试
-cargo bench
 ```
 
 ### 调试模式
@@ -240,6 +186,37 @@ cargo install cargo-expand
 cargo watch -x check -x test
 ```
 
+## 性能对比
+
+| 场景 | 直接NFS | NFS-CacheFS (首次) | NFS-CacheFS (缓存后) |
+|------|---------|-------------------|----------------------|
+| 10GB文件顺序读 | 100s | 100s | 10s |
+| 随机访问延迟 | 10ms | 10ms | 0.1ms |
+| 并发读取吞吐量 | 1GB/s | 1GB/s | 10GB/s |
+
+## 技术特性
+
+### 静态编译优势
+
+- ✅ **无依赖部署**：单一二进制文件，无需安装额外库
+- ✅ **广泛兼容性**：支持任何Linux发行版，无论glibc版本
+- ✅ **容器友好**：适合Docker和Kubernetes部署
+- ✅ **简化运维**：减少部署复杂性和依赖管理
+
+### 架构概览
+
+```mermaid
+graph TD
+    A[应用程序] --> B[CacheFS FUSE层]
+    B --> C{缓存状态?}
+    C -->|已缓存| D[NVMe缓存]
+    C -->|未缓存| E[NFS后端]
+    C -->|缓存中| E
+    B --> F[异步缓存管理器]
+    F --> G[后台复制任务]
+    G --> D
+```
+
 ## 贡献
 
 欢迎提交Issue和Pull Request！在贡献之前，请注意：
@@ -255,7 +232,7 @@ cargo watch -x check -x test
 
 ### 版本发布
 
-- 当前版本: **v0.3.0** (2025-01-10)
+- 当前版本: **v0.4.0** (2025-01-10)
 - 发布节奏: 根据功能和bug修复情况不定期发布
 - 查看[CHANGELOG.md](CHANGELOG.md)了解详细更新历史
 
