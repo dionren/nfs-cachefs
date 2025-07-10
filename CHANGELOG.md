@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.0] - 2025-01-10
+
+### Added
+- Automated release process with binary compilation
+- GitHub Actions workflow for automated releases
+- Comprehensive build and packaging scripts
+
+### Improved
+- Enhanced release packaging with all necessary files
+- Better build optimization for production releases
+- Streamlined deployment process
+
 ## [0.3.0] - 2025-01-10
 
 ### Added
