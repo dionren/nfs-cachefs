@@ -67,23 +67,29 @@ sed -i "s/- 当前版本: \*\*v[0-9]\+\.[0-9]\+\.[0-9]\+\*\*/- 当前版本: **v
 
 # 3. 自动更新 CHANGELOG
 print_step "更新 CHANGELOG.md..."
-NEW_CHANGELOG_ENTRY="## [$NEW_VERSION] - $TODAY
+# 创建临时文件
+cat > /tmp/new_changelog_entry << EOF
+## [$NEW_VERSION] - $TODAY
 
 ### Added
-- 新功能说明（请手动编辑）
+- 重构构建系统为 Docker 方式
+- 添加完整的发布自动化流程
+- 新增 GitHub Actions 自动发布工作流
 
 ### Changed
-- 变更说明（请手动编辑）
+- 统一使用 Docker 构建，移除本地构建依赖
+- 重新组织 build 目录结构
+- 更新 Makefile 支持 Docker 构建
 
 ### Fixed
-- 修复说明（请手动编辑）
+- 修复构建环境依赖问题
+- 优化发布流程和文档
 
-"
+EOF
 
 # 在 CHANGELOG.md 中插入新版本条目
-sed -i "/^# Changelog/a\\
-\\
-$NEW_CHANGELOG_ENTRY" CHANGELOG.md
+sed -i '/^# Changelog/r /tmp/new_changelog_entry' CHANGELOG.md
+rm -f /tmp/new_changelog_entry
 
 print_warning "请手动编辑 CHANGELOG.md 添加版本 v$NEW_VERSION 的具体更新内容"
 print_warning "按 Enter 键继续..."
