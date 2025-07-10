@@ -7,10 +7,13 @@ set -e
 
 echo "Installing NFS-CacheFS..."
 
-# Check if running as root
+# Check if running as root and set sudo prefix accordingly
 if [[ $EUID -eq 0 ]]; then
-    echo "Error: Do not run this script as root. Use sudo when prompted."
-    exit 1
+    echo "Running as root user"
+    SUDO_PREFIX=""
+else
+    echo "Running as non-root user, will use sudo when needed"
+    SUDO_PREFIX="sudo"
 fi
 
 # Check system compatibility
@@ -29,24 +32,24 @@ fi
 # Install dependencies (FUSE is still needed for runtime)
 echo "Installing dependencies..."
 if command -v apt &> /dev/null; then
-    sudo apt update
-    sudo apt install -y fuse3 || sudo apt install -y fuse
+    $SUDO_PREFIX apt update
+    $SUDO_PREFIX apt install -y fuse3 || $SUDO_PREFIX apt install -y fuse
 elif command -v yum &> /dev/null; then
-    sudo yum install -y fuse3 || sudo yum install -y fuse
+    $SUDO_PREFIX yum install -y fuse3 || $SUDO_PREFIX yum install -y fuse
 elif command -v dnf &> /dev/null; then
-    sudo dnf install -y fuse3 || sudo dnf install -y fuse
+    $SUDO_PREFIX dnf install -y fuse3 || $SUDO_PREFIX dnf install -y fuse
 else
     echo "Warning: Could not detect package manager. Please ensure FUSE is installed."
 fi
 
 # Install binary
 echo "Installing nfs-cachefs binary..."
-sudo cp nfs-cachefs /usr/local/bin/
-sudo chmod +x /usr/local/bin/nfs-cachefs
+$SUDO_PREFIX cp nfs-cachefs /usr/local/bin/
+$SUDO_PREFIX chmod +x /usr/local/bin/nfs-cachefs
 
 # Create mount helper symlink
 echo "Creating mount helper symlink..."
-sudo ln -sf /usr/local/bin/nfs-cachefs /sbin/mount.cachefs
+$SUDO_PREFIX ln -sf /usr/local/bin/nfs-cachefs /sbin/mount.cachefs
 
 # Verify installation
 echo "Verifying installation..."
@@ -70,7 +73,11 @@ echo "Installation completed successfully!"
 echo ""
 echo "Usage examples:"
 echo "1. Manual mount:"
-echo "   sudo mount -t cachefs cachefs /mnt/cached \\"
+if [[ $EUID -eq 0 ]]; then
+    echo "   mount -t cachefs cachefs /mnt/cached \\"
+else
+    echo "   sudo mount -t cachefs cachefs /mnt/cached \\"
+fi
 echo "     -o nfs_backend=/mnt/nfs,cache_dir=/mnt/cache,cache_size_gb=50,allow_other"
 echo ""
 echo "2. Add to /etc/fstab for automatic mounting:"
