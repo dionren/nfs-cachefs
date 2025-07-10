@@ -1,4 +1,5 @@
 // use std::env;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process;
 use std::env;
@@ -11,41 +12,42 @@ use tracing_subscriber;
 use nfs_cachefs::core::config::Config;
 use nfs_cachefs::fs::cachefs::CacheFs;
 
-/// 检查是否以mount helper模式运行
+mod mount_helper;
+
+/// 检查是否以 mount helper 模式运行
 fn is_mount_helper_mode() -> bool {
     if let Some(program_name) = env::args().next() {
-        program_name.ends_with("mount.cachefs")
+        program_name.ends_with("mount.cachefs") || 
+        (env::args().count() >= 4 && env::args().any(|arg| arg == "-o"))
     } else {
         false
     }
 }
 
-/// 解析mount helper模式的参数
+/// 解析 mount helper 参数
 fn parse_mount_helper_args() -> Result<(Config, PathBuf, Vec<MountOption>), String> {
     let args: Vec<String> = env::args().collect();
     
-    if args.len() < 3 {
-        return Err("Usage: mount.cachefs <device> <mountpoint> [-o options]".to_string());
+    // mount.cachefs <source> <target> -o <options>
+    if args.len() < 4 {
+        return Err("Invalid mount helper arguments".to_string());
     }
     
-    // mount.cachefs 的参数格式：
-    // mount.cachefs cachefs /mnt/chenyu-nfs -o nfs_backend=/mnt/chenyu-nvme,cache_dir=/mnt/nvme/cachefs,cache_size_gb=1000,allow_other
-    let _device = &args[1]; // 通常是 "cachefs"
+    let _source = &args[1];  // 忽略source，我们使用选项中的nfs_backend
     let mountpoint = PathBuf::from(&args[2]);
     
-    // 解析 -o 选项
     let mut mount_options = Vec::new();
-    let mut config_options = std::collections::HashMap::new();
+    let mut config_options = HashMap::new();
+    let mut should_daemonize = true;  // 默认后台运行
     
     // 强制只读模式
     mount_options.push(MountOption::RO);
     
-    // 查找 -o 选项
+    // 解析 -o 选项
     let mut i = 3;
     while i < args.len() {
         if args[i] == "-o" && i + 1 < args.len() {
             let options_str = &args[i + 1];
-            
             for option in options_str.split(',') {
                 let option = option.trim();
                 if option.is_empty() {
@@ -74,6 +76,9 @@ fn parse_mount_helper_args() -> Result<(Config, PathBuf, Vec<MountOption>), Stri
                         "auto_unmount" => {
                             mount_options.push(MountOption::AutoUnmount);
                         }
+                        "foreground" | "fg" => {
+                            should_daemonize = false;
+                        }
                         _ => {
                             // 未知选项，作为自定义选项处理
                             mount_options.push(MountOption::CUSTOM(option.to_string()));
@@ -84,6 +89,11 @@ fn parse_mount_helper_args() -> Result<(Config, PathBuf, Vec<MountOption>), Stri
             break;
         }
         i += 1;
+    }
+    
+    // 如果需要后台运行，添加到配置中
+    if should_daemonize {
+        config_options.insert("_daemonize".to_string(), "true".to_string());
     }
     
     // 从配置选项创建Config
@@ -139,7 +149,7 @@ fn parse_args() -> (Config, PathBuf, Vec<MountOption>) {
     
     // 原有的命令行参数解析逻辑
     let matches = Command::new("nfs-cachefs")
-        .version("0.2.0")
+        .version("0.3.0")
         .author("NFS-CacheFS Team")
         .about("High-performance read-only asynchronous caching filesystem for NFS")
         .arg(
@@ -211,7 +221,7 @@ fn parse_args() -> (Config, PathBuf, Vec<MountOption>) {
     
     // 解析挂载选项
     let mut mount_options = Vec::new();
-    let mut config_options = std::collections::HashMap::new();
+    let mut config_options = HashMap::new();
     
     // 强制只读模式
     mount_options.push(MountOption::RO);
@@ -388,13 +398,23 @@ fn validate_mountpoint(mountpoint: &PathBuf) -> Result<(), String> {
 /// 主函数
 #[tokio::main]
 async fn main() {
+    // 检查是否需要后台运行（在解析参数之前）
+    let args: Vec<String> = std::env::args().collect();
+    if mount_helper::should_daemonize(&args) {
+        // 在日志初始化之前进行守护进程化
+        if let Err(e) = mount_helper::daemonize() {
+            eprintln!("Failed to daemonize: {}", e);
+            process::exit(1);
+        }
+    }
+    
     // 解析命令行参数
     let (config, mountpoint, mount_options) = parse_args();
     
     // 初始化日志系统
     init_logging("info");
     
-    info!("Starting NFS-CacheFS v0.2.0 (READ-ONLY MODE)");
+    info!("Starting NFS-CacheFS v0.3.0 (READ-ONLY MODE)");
     info!("NFS Backend: {}", config.nfs_backend_path.display());
     info!("Cache Directory: {}", config.cache_dir.display());
     info!("Mount Point: {}", mountpoint.display());
