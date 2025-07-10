@@ -232,7 +232,7 @@ impl AsyncExecutor {
                 
                 // 如果文件应该被缓存，触发异步缓存
                 if let Ok(metadata) = tokio::fs::metadata(&nfs_path).await {
-                    if Self::should_cache(&path, metadata.len(), config.max_cache_size_bytes) {
+                    if Self::should_cache(&path, metadata.len(), config) {
                         if let Err(e) = cache_manager.submit_cache_task(path, CachePriority::Normal).await {
                             warn!("Failed to trigger cache: {}", e);
                         }
@@ -361,19 +361,19 @@ impl AsyncExecutor {
     }
     
     /// 辅助函数：检查文件是否应该被缓存
-    fn should_cache(path: &PathBuf, size: u64, max_cache_size_bytes: u64) -> bool {
-        // 检查文件大小限制
-        let max_file_size = max_cache_size_bytes / 10; // 最大文件不超过缓存大小的10%
+    fn should_cache(_path: &PathBuf, size: u64, config: &Config) -> bool {
+        // 检查文件大小是否超过缓存阈值
+        if size < config.min_cache_file_size {
+            return false;
+        }
+        
+        // 检查文件是否太大，超过缓存总大小的10%
+        let max_file_size = config.max_cache_size_bytes / 10;
         if size > max_file_size {
             return false;
         }
         
-        // 检查文件扩展名
-        if let Some(ext) = path.extension() {
-            let ext_str = ext.to_string_lossy().to_lowercase();
-            matches!(ext_str.as_str(), "bin" | "model" | "weights" | "data" | "db" | "tar" | "zip" | "gz")
-        } else {
-            true
-        }
+        // 所有满足大小条件的文件都可以缓存
+        true
     }
 } 

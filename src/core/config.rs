@@ -18,6 +18,7 @@ pub struct Config {
     pub direct_io: bool,
     pub readahead_bytes: usize,
     pub eviction_policy: EvictionPolicy,
+    pub min_cache_file_size: u64,  // 最小缓存文件大小（字节）
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,6 +55,7 @@ impl Default for Config {
             direct_io: true,
             readahead_bytes: DEFAULT_READAHEAD_SIZE,
             eviction_policy: EvictionPolicy::Lru,
+            min_cache_file_size: 100 * 1024 * 1024, // 100MB
         }
     }
 }
@@ -100,6 +102,10 @@ impl Config {
                     }
                     "eviction" => {
                         config.eviction_policy = value.parse()?;
+                    }
+                    "min_cache_file_size_mb" => {
+                        let mb: u64 = value.parse()?;
+                        config.min_cache_file_size = mb * 1024 * 1024;
                     }
                     _ => {
                         // 忽略未知选项（如 allow_other 等 FUSE 标准选项）

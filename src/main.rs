@@ -117,6 +117,10 @@ fn parse_mount_helper_args() -> Result<(Config, PathBuf, Vec<MountOption>), Stri
         .and_then(|s| s.parse().ok())
         .unwrap_or(10);
     
+    let min_cache_file_size_mb = config_options.get("min_cache_file_size_mb")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(100);
+    
     let config = Config {
         nfs_backend_path,
         cache_dir,
@@ -129,6 +133,7 @@ fn parse_mount_helper_args() -> Result<(Config, PathBuf, Vec<MountOption>), Stri
         eviction_policy: nfs_cachefs::core::config::EvictionPolicy::Lru,
         direct_io: true,
         readahead_bytes: 1024 * 1024,
+        min_cache_file_size: min_cache_file_size_mb * 1024 * 1024,
     };
     
     Ok((config, mountpoint, mount_options))
@@ -214,6 +219,13 @@ fn parse_args() -> (Config, PathBuf, Vec<MountOption>) {
                 .help("Enable debug logging")
                 .action(clap::ArgAction::SetTrue),
         )
+        .arg(
+            Arg::new("min_cache_file_size")
+                .long("min-cache-file-size")
+                .help("Minimum file size to cache in MB (default: 100)")
+                .value_name("SIZE_MB")
+                .action(clap::ArgAction::Set),
+        )
         .get_matches();
 
     let nfs_backend = PathBuf::from(matches.get_one::<String>("nfs_backend").unwrap());
@@ -249,6 +261,10 @@ fn parse_args() -> (Config, PathBuf, Vec<MountOption>) {
                     "allow_other" => mount_options.push(MountOption::AllowOther),
                     "allow_root" => mount_options.push(MountOption::AllowRoot),
                     "auto_unmount" => mount_options.push(MountOption::AutoUnmount),
+                    "foreground" | "fg" => {
+                        // foreground 选项不应该传递给 FUSE，由程序自己处理
+                        // 这里不做任何操作，因为前台运行逻辑已经在 main 函数中处理了
+                    },
                     _ => {
                         // 未知选项，作为自定义选项处理
                         mount_options.push(MountOption::CUSTOM(option.to_string()));
@@ -279,6 +295,11 @@ fn parse_args() -> (Config, PathBuf, Vec<MountOption>) {
         .and_then(|s| s.parse().ok())
         .unwrap_or(10);
     
+    let min_cache_file_size_mb = matches
+        .get_one::<String>("min_cache_file_size")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(100);
+    
     let config = Config {
         nfs_backend_path: nfs_backend.clone(),
         cache_dir,
@@ -291,12 +312,13 @@ fn parse_args() -> (Config, PathBuf, Vec<MountOption>) {
         eviction_policy: nfs_cachefs::core::config::EvictionPolicy::Lru,
         direct_io: true,
         readahead_bytes: 1024 * 1024,
+        min_cache_file_size: min_cache_file_size_mb * 1024 * 1024,
     };
     
-    // 添加默认挂载选项
-    if matches.get_flag("foreground") {
-        mount_options.push(MountOption::CUSTOM("foreground".to_string()));
-    }
+    // 不要将 foreground 传递给 FUSE，程序会自己处理前台运行
+    // if matches.get_flag("foreground") {
+    //     mount_options.push(MountOption::CUSTOM("foreground".to_string()));
+    // }
     
     (config, mountpoint, mount_options)
 }
@@ -398,9 +420,13 @@ fn validate_mountpoint(mountpoint: &PathBuf) -> Result<(), String> {
 /// 主函数
 #[tokio::main]
 async fn main() {
-    // 检查是否需要后台运行（在解析参数之前）
+    // 先解析命令行参数以确定是否需要前台运行
     let args: Vec<String> = std::env::args().collect();
-    if mount_helper::should_daemonize(&args) {
+    let is_foreground = args.iter().any(|arg| arg == "--foreground" || arg == "-f") || 
+                       args.iter().any(|arg| arg.contains("foreground"));
+    
+    // 检查是否需要后台运行（在解析参数之前）
+    if mount_helper::should_daemonize(&args) && !is_foreground {
         // 在日志初始化之前进行守护进程化
         if let Err(e) = mount_helper::daemonize() {
             eprintln!("Failed to daemonize: {}", e);
@@ -469,19 +495,48 @@ async fn main() {
     // 挂载文件系统
     info!("Mounting filesystem...");
     
+    // 克隆mountpoint以避免所有权问题
+    let mountpoint_for_task = mountpoint.clone();
+    
+    // 启动挂载任务
     let mount_result = tokio::task::spawn_blocking(move || {
-        fuser::mount2(fs, &mountpoint, &mount_options)
+        // 一旦调用这个函数，挂载就会成功，并且函数会一直运行直到卸载
+        fuser::mount2(fs, &mountpoint_for_task, &mount_options)
     });
     
-    // 等待挂载完成或信号
+    // 等待一小段时间让挂载完成
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    
+    // 通过检查 /proc/mounts 来验证挂载是否成功
+    let mountpoint_str = mountpoint.to_string_lossy();
+    let mount_check = tokio::process::Command::new("grep")
+        .arg(&*mountpoint_str)
+        .arg("/proc/mounts")
+        .output()
+        .await;
+    
+    match mount_check {
+        Ok(output) if output.status.success() => {
+            info!("✅ Filesystem mounted successfully at {}", mountpoint_str);
+            info!("🚀 NFS-CacheFS is now running and ready to serve files");
+        }
+        _ => {
+            // 如果检查失败，可能还在挂载中，等待更长时间
+            tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+            info!("📁 Filesystem mounting initiated at {}", mountpoint_str);
+            info!("🔄 NFS-CacheFS is now running (mount verification may take a moment)");
+        }
+    }
+    
+    // 等待挂载任务完成或信号
     tokio::select! {
         result = mount_result => {
             match result {
                 Ok(Ok(())) => {
-                    info!("Filesystem mounted successfully");
+                    info!("Filesystem unmounted cleanly");
                 }
                 Ok(Err(e)) => {
-                    error!("Failed to mount filesystem: {}", e);
+                    error!("Filesystem error: {}", e);
                     process::exit(1);
                 }
                 Err(e) => {

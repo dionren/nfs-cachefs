@@ -1,0 +1,25 @@
+{
+    // SSH 远程开发必要配置
+    "remote.SSH.remotePlatform": {
+      "10.20.101.217": "linux",
+      "10.20.101.215": "linux",
+      "10.20.100.202": "linux"
+    },
+    "remote.SSH.connectTimeout": 60,
+    
+    // 解决SSH命令首字符丢失的关键设置
+    "terminal.integrated.localEchoEnabled": "off",
+    "terminal.integrated.sendKeybindingsToShell": true,
+    
+    // Linux 终端配置
+    "terminal.integrated.automationProfile.linux": {
+        "path": "/bin/bash",
+        "args": ["--noprofile", "--norc"]
+    },
+    
+    // Windows 默认终端（如果在Windows开发）
+    "terminal.integrated.defaultProfile.windows": "Git Bash",
+    
+    // 禁用可能干扰的功能
+    "terminal.integrated.enableShellIntegration": false
+} 
