@@ -582,6 +582,7 @@ mod tests {
             eviction_policy: nfs_cachefs::core::config::EvictionPolicy::Lru,
             direct_io: true,
             readahead_bytes: 1024 * 1024,
+            min_cache_file_size: 100 * 1024 * 1024,
         };
         
         // 验证应该成功
@@ -603,6 +604,7 @@ mod tests {
             eviction_policy: nfs_cachefs::core::config::EvictionPolicy::Lru,
             direct_io: true,
             readahead_bytes: 1024 * 1024,
+            min_cache_file_size: 100 * 1024 * 1024,
         };
         
         assert!(validate_config(&invalid_config).is_err());
