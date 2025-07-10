@@ -1,5 +1,3 @@
-use std::process::{Command, Stdio};
-use std::os::unix::process::CommandExt;
 use tracing::{info, error};
 
 /// 将进程转为守护进程
@@ -7,7 +5,6 @@ pub fn daemonize() -> Result<(), String> {
     use nix::unistd::{fork, ForkResult, setsid};
     use nix::sys::stat::{umask, Mode};
     use std::env;
-    use std::fs;
     
     // 第一次 fork
     match unsafe { fork() } {

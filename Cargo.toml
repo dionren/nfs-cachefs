@@ -29,7 +29,7 @@ dashmap = "5.5"
 parking_lot = "0.12"
 
 # 系统调用
-nix = { version = "0.27", features = ["fs", "mount"] }
+nix = { version = "0.27", features = ["fs", "mount", "process"] }
 libc = "0.2"
 
 # 工具
