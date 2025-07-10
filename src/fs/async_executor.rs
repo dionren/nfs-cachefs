@@ -233,7 +233,7 @@ impl AsyncExecutor {
                 // 如果文件应该被缓存，触发异步缓存
                 if let Ok(metadata) = tokio::fs::metadata(&nfs_path).await {
                     if Self::should_cache(&path, metadata.len(), config) {
-                        if let Err(e) = cache_manager.submit_cache_task(path, CachePriority::Normal).await {
+                        if let Err(e) = cache_manager.submit_cache_task(nfs_path, CachePriority::Normal).await {
                             warn!("Failed to trigger cache: {}", e);
                         }
                     }

@@ -29,7 +29,7 @@
 
 ```bash
 # 下载发布包
-wget https://github.com/yourusername/nfs-cachefs/releases/download/v0.3.0/nfs-cachefs-v0.3.0-linux-x86_64.tar.gz
+wget https://github.com/dionren/nfs-cachefs/releases/download/v0.3.0/nfs-cachefs-v0.3.0-linux-x86_64.tar.gz
 
 # 解压并安装
 tar -xzf nfs-cachefs-v0.3.0-linux-x86_64.tar.gz
@@ -129,21 +129,25 @@ nfs-cachefs/
 ├── src/
 │   ├── main.rs           # 程序入口
 │   ├── lib.rs            # 库入口
+│   ├── mount_helper.rs   # 挂载辅助工具
 │   ├── core/             # 核心模块
-│   │   ├── config.rs     # 配置管理
-│   │   └── error.rs      # 错误处理
 │   ├── fs/               # 文件系统实现
-│   │   ├── cachefs.rs    # FUSE文件系统
-│   │   ├── inode.rs      # inode管理
-│   │   └── async_executor.rs # 异步操作执行器
 │   ├── cache/            # 缓存管理
-│   │   ├── manager.rs    # 缓存管理器
-│   │   ├── state.rs      # 缓存状态
-│   │   └── metrics.rs    # 性能指标
 │   └── utils/            # 工具函数
-├── docs/                 # 文档
-├── tests/                # 测试
-└── benches/             # 性能测试
+├── docs/                 # 项目文档
+│   ├── project.md        # 项目详细说明
+│   └── testing-plan.md   # 测试计划
+├── tests/                # 测试套件
+│   ├── integration/      # 集成测试
+│   └── unit/             # 单元测试
+├── benches/              # 性能基准测试
+├── .github/              # GitHub Actions 工作流
+├── install.sh            # 安装脚本
+├── release.sh            # 发布脚本
+├── Cargo.toml            # Rust 项目配置
+├── Cargo.lock            # 依赖锁定文件
+├── CHANGELOG.md          # 更新日志
+└── README.md             # 项目说明
 ```
 
 ## 架构概览
@@ -201,25 +205,59 @@ ldd /usr/local/bin/nfs-cachefs
 ### 运行测试
 
 ```bash
-# 单元测试
+# 运行所有测试
 cargo test
 
-# 集成测试
+# 运行单元测试
+cargo test --lib
+
+# 运行集成测试 (需要先设置测试环境)
 cargo test --test integration
 
-# 性能测试
+# 运行性能基准测试
 cargo bench
 ```
 
 ### 调试模式
 
 ```bash
+# 启用调试日志
 RUST_LOG=debug nfs-cachefs --nfs-backend /mnt/nfs ...
+
+# 使用前台模式进行调试
+sudo mount -t cachefs cachefs /mnt/cached \
+    -o nfs_backend=/mnt/nfs,cache_dir=/mnt/cache,foreground,debug
+```
+
+### 开发环境设置
+
+```bash
+# 安装开发依赖
+cargo install cargo-watch
+cargo install cargo-expand
+
+# 实时编译和测试
+cargo watch -x check -x test
 ```
 
 ## 贡献
 
-欢迎提交Issue和Pull Request！请查看[贡献指南](CONTRIBUTING.md)。
+欢迎提交Issue和Pull Request！在贡献之前，请注意：
+
+1. **Bug报告**: 使用GitHub Issues提交bug报告，请包含详细的重现步骤
+2. **功能请求**: 描述您希望的功能和使用场景
+3. **代码贡献**: 
+   - Fork项目并创建功能分支
+   - 确保代码通过所有测试：`cargo test`
+   - 遵循Rust代码风格：`cargo fmt`
+   - 运行代码检查：`cargo clippy`
+   - 提交前请更新相关文档
+
+### 版本发布
+
+- 当前版本: **v0.3.0** (2025-01-10)
+- 发布节奏: 根据功能和bug修复情况不定期发布
+- 查看[CHANGELOG.md](CHANGELOG.md)了解详细更新历史
 
 ## 许可证
 
