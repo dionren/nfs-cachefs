@@ -149,7 +149,7 @@ fn parse_args() -> (Config, PathBuf, Vec<MountOption>) {
     
     // 原有的命令行参数解析逻辑
     let matches = Command::new("nfs-cachefs")
-        .version("0.2.0")
+        .version("0.3.0")
         .author("NFS-CacheFS Team")
         .about("High-performance read-only asynchronous caching filesystem for NFS")
         .arg(
@@ -414,7 +414,7 @@ async fn main() {
     // 初始化日志系统
     init_logging("info");
     
-    info!("Starting NFS-CacheFS v0.2.0 (READ-ONLY MODE)");
+    info!("Starting NFS-CacheFS v0.3.0 (READ-ONLY MODE)");
     info!("NFS Backend: {}", config.nfs_backend_path.display());
     info!("Cache Directory: {}", config.cache_dir.display());
     info!("Mount Point: {}", mountpoint.display());

@@ -1,0 +1,68 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Install Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: stable
+        override: true
+    
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libfuse3-dev pkg-config
+    
+    - name: Build release
+      run: |
+        chmod +x build-release.sh
+        ./build-release.sh
+    
+    - name: Get version
+      id: get_version
+      run: echo ::set-output name=VERSION::${GITHUB_REF#refs/tags/v}
+    
+    - name: Create Release
+      id: create_release
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ github.ref }}
+        release_name: NFS-CacheFS ${{ github.ref }}
+        body_path: RELEASE_NOTES_v${{ steps.get_version.outputs.VERSION }}.md
+        draft: false
+        prerelease: false
+    
+    - name: Upload Release Asset
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: ./nfs-cachefs-v${{ steps.get_version.outputs.VERSION }}-linux-x86_64.tar.gz
+        asset_name: nfs-cachefs-v${{ steps.get_version.outputs.VERSION }}-linux-x86_64.tar.gz
+        asset_content_type: application/gzip
+    
+    - name: Upload Checksum
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: ./nfs-cachefs-v${{ steps.get_version.outputs.VERSION }}-linux-x86_64.tar.gz.sha256
+        asset_name: nfs-cachefs-v${{ steps.get_version.outputs.VERSION }}-linux-x86_64.tar.gz.sha256
+        asset_content_type: text/plain

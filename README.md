@@ -1,6 +1,16 @@
 # NFS-CacheFS
 
+[![Version](https://img.shields.io/badge/version-v0.3.0-blue)](https://github.com/yourusername/nfs-cachefs/releases/latest)
+[![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+
 一个高性能的异步只读缓存文件系统，专为加速NFS上大文件访问而设计。
+
+## 🎉 最新版本 v0.3.0
+
+- **修复了挂载命令卡住的问题** - mount 命令现在会自动在后台运行
+- **新增 `foreground` 选项** - 用于调试时在前台运行
+- **改进的错误处理和日志记录**
+- [查看完整更新日志](CHANGELOG.md)
 
 ## 特性
 
@@ -19,11 +29,11 @@
 
 ```bash
 # 下载发布包
-wget https://raw.githubusercontent.com/dionren/nfs-cachefs/main/nfs-cachefs-v0.1-linux-x86_64.tar.gz
+wget https://github.com/yourusername/nfs-cachefs/releases/download/v0.3.0/nfs-cachefs-v0.3.0-linux-x86_64.tar.gz
 
 # 解压并安装
-tar -xzf nfs-cachefs-v0.1-linux-x86_64.tar.gz
-cd nfs-cachefs-v0.1-linux-x86_64
+tar -xzf nfs-cachefs-v0.3.0-linux-x86_64.tar.gz
+cd nfs-cachefs-v0.3.0-linux-x86_64
 sudo ./install.sh
 ```
 
@@ -156,7 +166,7 @@ graph TD
 
 | 系统 | 架构 | 下载链接 |
 |------|------|----------|
-| Ubuntu 22.04/24.04 | x86_64 | [nfs-cachefs-v0.1-linux-x86_64.tar.gz](https://raw.githubusercontent.com/dionren/nfs-cachefs/main/nfs-cachefs-v0.1-linux-x86_64.tar.gz) |
+| Ubuntu 22.04/24.04 | x86_64 | [nfs-cachefs-v0.3.0-linux-x86_64.tar.gz](https://github.com/yourusername/nfs-cachefs/releases/download/v0.3.0/nfs-cachefs-v0.3.0-linux-x86_64.tar.gz) |
 
 ### 系统要求
 

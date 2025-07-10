@@ -2,38 +2,45 @@
 
 All notable changes to this project will be documented in this file.
 
-## [0.2.0] - 2025-01-09
-
-### Fixed
-- **Critical**: Fixed mount helper mode parameter parsing issue
-  - Mount commands now correctly parse `-o` options when using `mount -t cachefs`
-  - Fixed `nfs_backend` parameter not being read from mount options
-  - Improved argument parsing logic for mount.cachefs helper mode
-
-### Changed
-- Enhanced mount helper detection and parameter processing
-- Better error messages for mount parameter validation
-- Improved support for standard mount command usage
-
-### Technical Details
-- Fixed loop logic in `parse_mount_helper_args()` function
-- Corrected parameter extraction from `-o` option string
-- Added proper support for comma-separated mount options
-- Enhanced key-value pair parsing for mount parameters
-
-### Usage
-Mount commands now work correctly:
-```bash
-sudo mount -t cachefs cachefs /mnt/cached \
-    -o nfs_backend=/mnt/nfs-share,cache_dir=/mnt/cache,cache_size_gb=50,allow_other
-```
-
-## [0.1.0] - 2024-12-XX
+## [0.3.0] - 2025-01-10
 
 ### Added
-- Initial release of NFS-CacheFS
-- Read-only asynchronous caching filesystem for NFS
-- FUSE-based implementation
-- LRU cache eviction policy
-- Configurable cache size and block size
-- Support for concurrent caching operations
+- Automatic daemonization support for mount helper mode
+- Background running by default when invoked via mount command
+- `foreground` mount option to disable automatic daemonization
+- Comprehensive mount troubleshooting documentation
+
+### Fixed
+- Mount command hanging issue - now properly forks to background
+- FUSE mount options handling for better compatibility
+- Signal handling for graceful shutdown
+
+### Changed
+- Mount helper now runs in background by default
+- Improved logging with thread IDs for better debugging
+- Enhanced error messages for mount failures
+
+### Documentation
+- Added `MOUNT_SOLUTION.md` with detailed mounting instructions
+- Added `NFS_CACHEFS_TROUBLESHOOTING.md` for common issues
+- Updated README with clearer mount examples
+
+## [0.2.0] - 2024-12-10
+
+### Added
+- Read-only filesystem mode (removed write support)
+- Improved cache management with LRU eviction
+- Better error handling and recovery
+
+### Changed
+- Filesystem is now read-only by default
+- File permissions set to 0o444 (read-only)
+- Directory permissions set to 0o555
+
+## [0.1.0] - 2024-11-15
+
+### Added
+- Initial release
+- Basic NFS caching functionality
+- Asynchronous cache filling
+- FUSE filesystem implementation
