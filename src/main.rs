@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process;
 use std::env;
+use std::sync::Arc;
 
 use clap::{Arg, Command};
 use fuser::MountOption;
@@ -474,6 +475,8 @@ async fn main() {
     
     // 设置信号处理
     let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    let fs_for_signal = Arc::new(fs);
+    let fs_for_mount = Arc::clone(&fs_for_signal);
     
     // 处理 SIGINT 和 SIGTERM
     tokio::spawn(async move {
@@ -483,10 +486,14 @@ async fn main() {
         tokio::select! {
             _ = sigint.recv() => {
                 info!("Received SIGINT, shutting down...");
+                // 优雅关闭文件系统组件
+                let _ = fs_for_signal.shutdown().await;
                 let _ = tx.send(()).await;
             }
             _ = sigterm.recv() => {
                 info!("Received SIGTERM, shutting down...");
+                // 优雅关闭文件系统组件
+                let _ = fs_for_signal.shutdown().await;
                 let _ = tx.send(()).await;
             }
         }
@@ -499,9 +506,11 @@ async fn main() {
     let mountpoint_for_task = mountpoint.clone();
     
     // 启动挂载任务
-    let mount_result = tokio::task::spawn_blocking(move || {
+    let mut mount_result = tokio::task::spawn_blocking(move || {
         // 一旦调用这个函数，挂载就会成功，并且函数会一直运行直到卸载
-        fuser::mount2(fs, &mountpoint_for_task, &mount_options)
+        // 注意：这里需要解引用Arc来获取CacheFs实例
+        let fs_ref = Arc::try_unwrap(fs_for_mount).unwrap_or_else(|arc| (*arc).clone());
+        fuser::mount2(fs_ref, &mountpoint_for_task, &mount_options)
     });
     
     // 等待一小段时间让挂载完成
@@ -530,7 +539,7 @@ async fn main() {
     
     // 等待挂载任务完成或信号
     tokio::select! {
-        result = mount_result => {
+        result = &mut mount_result => {
             match result {
                 Ok(Ok(())) => {
                     info!("Filesystem unmounted cleanly");
@@ -547,12 +556,72 @@ async fn main() {
         }
         _ = rx.recv() => {
             info!("Received shutdown signal, unmounting...");
-            // 在实际实现中，这里应该优雅地卸载文件系统
-            // 由于 fuser::mount2 是阻塞的，我们需要其他方式来处理卸载
+            // 主动卸载文件系统
+            let _ = unmount_filesystem(&mountpoint).await;
+            // 等待挂载任务完成
+            match mount_result.await {
+                Ok(Ok(())) => {
+                    info!("Filesystem unmounted cleanly");
+                }
+                Ok(Err(e)) => {
+                    warn!("Filesystem unmount error: {}", e);
+                }
+                Err(e) => {
+                    warn!("Mount task error during shutdown: {}", e);
+                }
+            }
         }
     }
     
     info!("NFS-CacheFS shutdown complete");
+}
+
+/// 异步卸载文件系统
+async fn unmount_filesystem(mountpoint: &std::path::PathBuf) -> Result<(), String> {
+    let mountpoint_str = mountpoint.to_string_lossy();
+    
+    // 首先尝试正常卸载
+    let result = tokio::process::Command::new("fusermount")
+        .arg("-u")
+        .arg(&*mountpoint_str)
+        .output()
+        .await;
+    
+    match result {
+        Ok(output) if output.status.success() => {
+            info!("Successfully unmounted filesystem at {}", mountpoint_str);
+            return Ok(());
+        }
+        Ok(output) => {
+            warn!("fusermount failed: {}", String::from_utf8_lossy(&output.stderr));
+        }
+        Err(e) => {
+            warn!("Failed to run fusermount: {}", e);
+        }
+    }
+    
+    // 如果fusermount失败，尝试使用umount
+    let result = tokio::process::Command::new("umount")
+        .arg(&*mountpoint_str)
+        .output()
+        .await;
+    
+    match result {
+        Ok(output) if output.status.success() => {
+            info!("Successfully unmounted filesystem at {} using umount", mountpoint_str);
+            Ok(())
+        }
+        Ok(output) => {
+            let error_msg = format!("umount failed: {}", String::from_utf8_lossy(&output.stderr));
+            warn!("{}", error_msg);
+            Err(error_msg)
+        }
+        Err(e) => {
+            let error_msg = format!("Failed to run umount: {}", e);
+            warn!("{}", error_msg);
+            Err(error_msg)
+        }
+    }
 }
 
 #[cfg(test)]

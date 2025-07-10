@@ -18,11 +18,14 @@ use crate::fs::inode::InodeManager;
 use crate::fs::async_executor::{AsyncExecutor, AsyncRequest};
 
 /// NFS-CacheFS 只读文件系统实现
+#[derive(Clone)]
 pub struct CacheFs {
     /// inode 管理器
     inode_manager: Arc<InodeManager>,
     /// 异步操作执行器
     async_executor: AsyncExecutor,
+    /// 缓存管理器
+    cache_manager: Arc<CacheManager>,
 }
 
 impl CacheFs {
@@ -47,10 +50,22 @@ impl CacheFs {
         Ok(Self {
             inode_manager,
             async_executor,
+            cache_manager: Arc::clone(&cache_manager),
         })
     }
     
-
+    /// 优雅关闭文件系统
+    pub async fn shutdown(&self) -> Result<(), Box<dyn std::error::Error>> {
+        tracing::info!("Shutting down CacheFS...");
+        
+        // 关闭缓存管理器
+        if let Err(e) = self.cache_manager.shutdown().await {
+            tracing::warn!("Error shutting down cache manager: {}", e);
+        }
+        
+        tracing::info!("CacheFS shutdown completed");
+        Ok(())
+    }
 }
 
 impl Filesystem for CacheFs {

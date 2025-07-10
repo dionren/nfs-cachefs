@@ -39,9 +39,10 @@ pub enum AsyncRequest {
 }
 
 /// 异步操作执行器
+#[derive(Clone)]
 pub struct AsyncExecutor {
     request_sender: mpsc::UnboundedSender<AsyncRequest>,
-    _executor_handle: JoinHandle<()>,
+    _executor_handle: Arc<JoinHandle<()>>,
 }
 
 impl AsyncExecutor {
@@ -65,7 +66,7 @@ impl AsyncExecutor {
         
         Self {
             request_sender,
-            _executor_handle: executor_handle,
+            _executor_handle: Arc::new(executor_handle),
         }
     }
     
