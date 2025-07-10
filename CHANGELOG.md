@@ -1,4 +1,20 @@
 # Changelog
+## [0.4.1] - 2025-07-10
+
+### Added
+- 重构构建系统为 Docker 方式
+- 添加完整的发布自动化流程
+- 新增 GitHub Actions 自动发布工作流
+
+### Changed
+- 统一使用 Docker 构建，移除本地构建依赖
+- 重新组织 build 目录结构
+- 更新 Makefile 支持 Docker 构建
+
+### Fixed
+- 修复构建环境依赖问题
+- 优化发布流程和文档
+
 
 All notable changes to this project will be documented in this file.
 
