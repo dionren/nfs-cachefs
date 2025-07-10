@@ -64,6 +64,9 @@ sed -i "s/download\/v[0-9]\+\.[0-9]\+\.[0-9]\+/download\/v$NEW_VERSION/g" README
 sed -i "s/nfs-cachefs-v[0-9]\+\.[0-9]\+\.[0-9]\+/nfs-cachefs-v$NEW_VERSION/g" README.md
 sed -i "s/## 🎉 最新版本 v[0-9]\+\.[0-9]\+\.[0-9]\+/## 🎉 最新版本 v$NEW_VERSION/" README.md
 sed -i "s/- 当前版本: \*\*v[0-9]\+\.[0-9]\+\.[0-9]\+\*\*/- 当前版本: **v$NEW_VERSION**/" README.md
+# 更新main.rs中的版本号
+sed -i "s/\.version(\"[0-9]\+\.[0-9]\+\.[0-9]\+\")/\.version(\"$NEW_VERSION\")/g" src/main.rs
+sed -i "s/Starting NFS-CacheFS v[0-9]\+\.[0-9]\+\.[0-9]\+/Starting NFS-CacheFS v$NEW_VERSION/g" src/main.rs
 
 # 3. 自动更新 CHANGELOG
 print_step "更新 CHANGELOG.md..."
@@ -117,7 +120,7 @@ make docker-test
 
 # 6. 创建版本标签
 print_step "创建版本标签..."
-git add Cargo.toml README.md CHANGELOG.md
+git add Cargo.toml README.md CHANGELOG.md src/main.rs
 git commit -m "chore: bump version to v$NEW_VERSION"
 git tag -a "v$NEW_VERSION" -m "Release v$NEW_VERSION"
 
@@ -187,7 +190,7 @@ if [ "$CURRENT_BRANCH" != "main" ]; then
         --body "🚀 发布新版本 v$NEW_VERSION
 
 ## 📋 发布清单
-- [x] 更新版本号 (Cargo.toml, README.md)
+- [x] 更新版本号 (Cargo.toml, README.md, main.rs)
 - [x] 更新 CHANGELOG.md
 - [x] Docker 构建成功
 - [x] 二进制文件测试通过

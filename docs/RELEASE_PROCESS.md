@@ -47,6 +47,17 @@ sed -i "s/^version = \".*\"/version = \"$NEW_VERSION\"/" Cargo.toml
 grep "^version = " Cargo.toml
 ```
 
+### 1.1. 更新 main.rs 中的版本号
+```bash
+# 更新 main.rs 中的版本号
+sed -i "s/\.version(\"[0-9]\+\.[0-9]\+\.[0-9]\+\")/\.version(\"$NEW_VERSION\")/g" src/main.rs
+sed -i "s/Starting NFS-CacheFS v[0-9]\+\.[0-9]\+\.[0-9]\+/Starting NFS-CacheFS v$NEW_VERSION/g" src/main.rs
+
+# 验证更新
+grep "\.version(" src/main.rs
+grep "Starting NFS-CacheFS" src/main.rs
+```
+
 ### 2. 更新 README.md
 ```bash
 # 更新 README.md 中的版本徽章和下载链接
