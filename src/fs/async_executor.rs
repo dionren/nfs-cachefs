@@ -6,7 +6,6 @@ use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
 use crate::cache::manager::CacheManager;
-use crate::cache::state::CachePriority;
 use crate::core::config::Config;
 use crate::fs::inode::{InodeManager, FileAttr as InternalFileAttr, FileType as InternalFileType};
 

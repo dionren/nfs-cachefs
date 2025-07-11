@@ -1,15 +1,15 @@
 # NFS-CacheFS
 
-[![Version](https://img.shields.io/badge/version-v0.5.0-blue)](https://github.com/yourusername/nfs-cachefs/releases/latest)
+[![Version](https://img.shields.io/badge/version-v0.5.1-blue)](https://github.com/yourusername/nfs-cachefs/releases/latest)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 一个高性能的异步只读缓存文件系统，专为加速NFS上大文件访问而设计。
 
-## 🎉 最新版本 v0.5.0
+## 🎉 最新版本 v0.5.1
 
-- **静态编译支持** - 无glibc版本依赖，可在任何Linux系统运行
-- **统一构建环境** - 使用标准化的构建流程
-- **改进的项目结构** - 构建相关文件移至`build/`目录
+- **🚀 重大性能修复** - 解决缓存未命中时NFS读取极慢的问题
+- **⚡ 优化读取逻辑** - 缓存命中走异步，缓存未命中走同步
+- **🔧 架构改进** - 移除异步队列瓶颈，保持NFS客户端优化
 - [查看完整更新日志](CHANGELOG.md)
 
 ## 特性
@@ -28,11 +28,11 @@
 
 ```bash
 # 下载发布包
-wget https://github.com/dionren/nfs-cachefs/releases/download/v0.5.0/nfs-cachefs-v0.5.0-linux-x86_64.tar.gz
+wget https://github.com/dionren/nfs-cachefs/releases/download/v0.5.1/nfs-cachefs-v0.5.1-linux-x86_64.tar.gz
 
 # 解压并安装
-tar -xzf nfs-cachefs-v0.5.0-linux-x86_64.tar.gz
-cd nfs-cachefs-v0.5.0-linux-x86_64
+tar -xzf nfs-cachefs-v0.5.1-linux-x86_64.tar.gz
+cd nfs-cachefs-v0.5.1-linux-x86_64
 sudo ./install.sh
 ```
 
@@ -232,7 +232,7 @@ graph TD
 
 ### 版本发布
 
-- 当前版本: **v0.5.0** (2025-01-10)
+- 当前版本: **v0.5.1** (2025-01-10)
 - 发布节奏: 根据功能和bug修复情况不定期发布
 - 查看[CHANGELOG.md](CHANGELOG.md)了解详细更新历史
 

@@ -441,7 +441,7 @@ async fn main() {
     // 初始化日志系统
     init_logging("info");
     
-    info!("Starting NFS-CacheFS v0.5.0 (READ-ONLY MODE)");
+    info!("Starting NFS-CacheFS v0.5.1 (READ-ONLY MODE)");
     info!("NFS Backend: {}", config.nfs_backend_path.display());
     info!("Cache Directory: {}", config.cache_dir.display());
     info!("Mount Point: {}", mountpoint.display());

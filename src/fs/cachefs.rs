@@ -69,6 +69,40 @@ impl CacheFs {
         tracing::info!("CacheFS shutdown completed");
         Ok(())
     }
+    
+    /// 获取缓存路径的辅助函数
+    fn get_cache_path(&self, path: &std::path::PathBuf) -> std::path::PathBuf {
+        self.config.cache_dir.join(path.strip_prefix("/").unwrap_or(path))
+    }
+    
+    /// 获取NFS路径
+    fn get_nfs_path(&self, path: &std::path::PathBuf) -> std::path::PathBuf {
+        self.config.nfs_backend_path.join(path.strip_prefix("/").unwrap_or(path))
+    }
+    
+    /// 直接同步读取NFS文件
+    fn read_nfs_direct(file_path: &std::path::PathBuf, offset: i64, size: u32) -> Result<Vec<u8>, i32> {
+        use std::io::{Read, Seek, SeekFrom};
+        use std::fs::File;
+        
+        let mut file = match File::open(file_path) {
+            Ok(f) => f,
+            Err(_) => return Err(libc::ENOENT),
+        };
+        
+        if let Err(_) = file.seek(SeekFrom::Start(offset as u64)) {
+            return Err(libc::EINVAL);
+        }
+        
+        let mut buffer = vec![0; size as usize];
+        match file.read(&mut buffer) {
+            Ok(bytes_read) => {
+                buffer.truncate(bytes_read);
+                Ok(buffer)
+            }
+            Err(_) => Err(libc::EIO),
+        }
+    }
 }
 
 impl Filesystem for CacheFs {
@@ -185,35 +219,6 @@ impl Filesystem for CacheFs {
         
         // 无法获取路径，返回错误
         reply.error(libc::ENOENT);
-    }
-    
-    /// 直接同步读取NFS文件
-    fn read_nfs_direct(file_path: &std::path::PathBuf, offset: i64, size: u32) -> Result<Vec<u8>, i32> {
-        use std::io::{Read, Seek, SeekFrom};
-        use std::fs::File;
-        
-        let mut file = match File::open(file_path) {
-            Ok(f) => f,
-            Err(_) => return Err(libc::ENOENT),
-        };
-        
-        if let Err(_) = file.seek(SeekFrom::Start(offset as u64)) {
-            return Err(libc::EINVAL);
-        }
-        
-        let mut buffer = vec![0; size as usize];
-        match file.read(&mut buffer) {
-            Ok(bytes_read) => {
-                buffer.truncate(bytes_read);
-                Ok(buffer)
-            }
-            Err(_) => Err(libc::EIO),
-        }
-    }
-    
-    /// 获取NFS路径
-    fn get_nfs_path(&self, path: &std::path::PathBuf) -> std::path::PathBuf {
-        self.config.nfs_backend_path.join(path.strip_prefix("/").unwrap_or(path))
     }
     
     fn open(&mut self, _req: &Request, ino: u64, _flags: i32, reply: ReplyOpen) {
@@ -333,10 +338,5 @@ impl Filesystem for CacheFs {
             let _ = receiver.await;
             reply.ok();
         });
-    }
-
-    /// 获取缓存路径的辅助函数
-    fn get_cache_path(&self, path: &std::path::PathBuf) -> std::path::PathBuf {
-        self.config.cache_dir.join(path.strip_prefix("/").unwrap_or(path))
     }
 } 
