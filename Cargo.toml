@@ -1,6 +1,6 @@
 [package]
 name = "nfs-cachefs"
-version = "0.5.2"
+version = "0.6.0"
 edition = "2021"
 authors = ["NFS-CacheFS Team"]
 description = "High-performance asynchronous cache filesystem for NFS"
