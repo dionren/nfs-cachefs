@@ -26,6 +26,8 @@ pub struct CacheFs {
     async_executor: AsyncExecutor,
     /// 缓存管理器
     cache_manager: Arc<CacheManager>,
+    /// 配置信息
+    config: Arc<Config>,
 }
 
 impl CacheFs {
@@ -51,6 +53,7 @@ impl CacheFs {
             inode_manager,
             async_executor,
             cache_manager: Arc::clone(&cache_manager),
+            config: Arc::new(config),
         })
     }
     
@@ -120,28 +123,97 @@ impl Filesystem for CacheFs {
         _lock: Option<u64>,
         reply: ReplyData,
     ) {
-        let (sender, receiver) = oneshot::channel();
-        
-        let request = AsyncRequest::Read {
-            ino,
-            offset,
-            size,
-            responder: sender,
-        };
-        
-        if let Err(e) = self.async_executor.submit(request) {
-            error!("Failed to submit read request: {}", e);
-            reply.error(libc::EIO);
-            return;
+        // 快速检查缓存是否存在
+        if let Some(path) = self.inode_manager.get_path(ino) {
+            let cache_path = self.get_cache_path(&path);
+            
+            // 如果缓存存在，使用异步读取缓存
+            if std::fs::metadata(&cache_path).is_ok() {
+                let (sender, receiver) = oneshot::channel();
+                
+                let request = AsyncRequest::Read {
+                    ino,
+                    offset,
+                    size,
+                    responder: sender,
+                };
+                
+                if let Err(e) = self.async_executor.submit(request) {
+                    error!("Failed to submit read request: {}", e);
+                    reply.error(libc::EIO);
+                    return;
+                }
+                
+                tokio::spawn(async move {
+                    match receiver.await {
+                        Ok(Ok(data)) => reply.data(&data),
+                        Ok(Err(err)) => reply.error(err),
+                        Err(_) => reply.error(libc::EIO),
+                    }
+                });
+                return;
+            }
+            
+            // 缓存不存在，直接同步读取NFS（避免异步复杂性）
+            let nfs_path = self.get_nfs_path(&path);
+            match Self::read_nfs_direct(&nfs_path, offset, size) {
+                Ok(data) => {
+                    reply.data(&data);
+                    
+                    // 异步触发缓存任务
+                    let cache_manager = Arc::clone(&self.cache_manager);
+                    let nfs_path_clone = nfs_path.clone();
+                    tokio::spawn(async move {
+                        if let Ok(metadata) = tokio::fs::metadata(&nfs_path_clone).await {
+                            // 简化的缓存判断：大于1MB的文件才缓存
+                            if metadata.len() > 1024 * 1024 {
+                                if let Err(e) = cache_manager.submit_cache_task(nfs_path_clone, crate::cache::state::CachePriority::Normal).await {
+                                    tracing::warn!("Failed to trigger cache: {}", e);
+                                }
+                            }
+                        }
+                    });
+                    
+                    return;
+                }
+                Err(err) => {
+                    reply.error(err);
+                    return;
+                }
+            }
         }
         
-        tokio::spawn(async move {
-            match receiver.await {
-                Ok(Ok(data)) => reply.data(&data),
-                Ok(Err(err)) => reply.error(err),
-                Err(_) => reply.error(libc::EIO),
+        // 无法获取路径，返回错误
+        reply.error(libc::ENOENT);
+    }
+    
+    /// 直接同步读取NFS文件
+    fn read_nfs_direct(file_path: &std::path::PathBuf, offset: i64, size: u32) -> Result<Vec<u8>, i32> {
+        use std::io::{Read, Seek, SeekFrom};
+        use std::fs::File;
+        
+        let mut file = match File::open(file_path) {
+            Ok(f) => f,
+            Err(_) => return Err(libc::ENOENT),
+        };
+        
+        if let Err(_) = file.seek(SeekFrom::Start(offset as u64)) {
+            return Err(libc::EINVAL);
+        }
+        
+        let mut buffer = vec![0; size as usize];
+        match file.read(&mut buffer) {
+            Ok(bytes_read) => {
+                buffer.truncate(bytes_read);
+                Ok(buffer)
             }
-        });
+            Err(_) => Err(libc::EIO),
+        }
+    }
+    
+    /// 获取NFS路径
+    fn get_nfs_path(&self, path: &std::path::PathBuf) -> std::path::PathBuf {
+        self.config.nfs_backend_path.join(path.strip_prefix("/").unwrap_or(path))
     }
     
     fn open(&mut self, _req: &Request, ino: u64, _flags: i32, reply: ReplyOpen) {
@@ -261,5 +333,10 @@ impl Filesystem for CacheFs {
             let _ = receiver.await;
             reply.ok();
         });
+    }
+
+    /// 获取缓存路径的辅助函数
+    fn get_cache_path(&self, path: &std::path::PathBuf) -> std::path::PathBuf {
+        self.config.cache_dir.join(path.strip_prefix("/").unwrap_or(path))
     }
 } 

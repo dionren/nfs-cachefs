@@ -191,7 +191,7 @@ impl AsyncExecutor {
         }
     }
     
-    /// 处理 read 操作
+    /// 处理 read 操作 - 仅处理缓存文件读取
     async fn handle_read(
         config: &Config,
         inode_manager: &InodeManager,
@@ -207,42 +207,19 @@ impl AsyncExecutor {
             None => return Err(ENOENT),
         };
         
-        // 尝试从缓存读取
+        // 只处理缓存文件读取
         let cache_path = Self::get_cache_path(config, &path);
-        if tokio::fs::try_exists(&cache_path).await.unwrap_or(false) {
-            debug!("Reading from cache: {}", cache_path.display());
-            match Self::read_from_file(&cache_path, offset, size).await {
-                Ok(data) => {
-                    cache_manager.record_access(&path);
-                    return Ok(data);
-                }
-                Err(_) => {
-                    warn!("Failed to read from cache, falling back to NFS");
-                    // 在只读模式下，缓存文件损坏时仅回退到NFS，不删除缓存
-                }
-            }
-        }
+        debug!("Reading from cache: {}", cache_path.display());
         
-        // 从 NFS 后端读取
-        let nfs_path = Self::get_nfs_path(config, &path);
-        debug!("Reading from NFS: {}", nfs_path.display());
-        
-        match Self::read_from_file(&nfs_path, offset, size).await {
+        match Self::read_from_file(&cache_path, offset, size).await {
             Ok(data) => {
                 cache_manager.record_access(&path);
-                
-                // 如果文件应该被缓存，触发异步缓存
-                if let Ok(metadata) = tokio::fs::metadata(&nfs_path).await {
-                    if Self::should_cache(&path, metadata.len(), config) {
-                        if let Err(e) = cache_manager.submit_cache_task(nfs_path, CachePriority::Normal).await {
-                            warn!("Failed to trigger cache: {}", e);
-                        }
-                    }
-                }
-                
                 Ok(data)
             }
-            Err(e) => Err(e),
+            Err(e) => {
+                warn!("Failed to read from cache: {}", cache_path.display());
+                Err(e)
+            }
         }
     }
     
