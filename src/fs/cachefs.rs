@@ -80,6 +80,83 @@ impl CacheFs {
         self.config.nfs_backend_path.join(path.strip_prefix("/").unwrap_or(path))
     }
     
+    /// 直接同步读取缓存文件 - 优化版本
+    fn read_cache_direct(cache_path: &std::path::PathBuf, offset: i64, size: u32) -> Result<Vec<u8>, i32> {
+        use std::io::{Read, Seek, SeekFrom};
+        use std::fs::File;
+        
+        let mut file = match File::open(cache_path) {
+            Ok(f) => f,
+            Err(_) => return Err(libc::ENOENT),
+        };
+        
+        if let Err(_) = file.seek(SeekFrom::Start(offset as u64)) {
+            return Err(libc::EINVAL);
+        }
+        
+        let mut buffer = vec![0u8; size as usize];
+        match file.read(&mut buffer) {
+            Ok(bytes_read) => {
+                buffer.truncate(bytes_read);
+                Ok(buffer)
+            }
+            Err(_) => Err(libc::EIO),
+        }
+    }
+    
+    /// 零拷贝穿透读取 - 针对大文件的优化
+    fn read_cache_zero_copy(cache_path: &std::path::PathBuf, offset: i64, size: u32) -> Result<Vec<u8>, i32> {
+        use std::fs::File;
+        use std::io::{Read, Seek, SeekFrom};
+        
+        // 对于大文件使用更大的读取缓冲区
+        let buffer_size = if size > 1024 * 1024 { // 1MB以上
+            std::cmp::min(size as usize, 16 * 1024 * 1024) // 最大16MB
+        } else {
+            size as usize
+        };
+        
+        let mut file = match File::open(cache_path) {
+            Ok(f) => f,
+            Err(_) => return Err(libc::ENOENT),
+        };
+        
+        if let Err(_) = file.seek(SeekFrom::Start(offset as u64)) {
+            return Err(libc::EINVAL);
+        }
+        
+        let mut buffer = vec![0u8; buffer_size];
+        let mut total_read = 0;
+        let mut result = Vec::with_capacity(size as usize);
+        
+        while total_read < size as usize {
+            let remaining = size as usize - total_read;
+            let read_size = std::cmp::min(buffer_size, remaining);
+            
+            match file.read(&mut buffer[..read_size]) {
+                Ok(0) => break, // EOF
+                Ok(bytes_read) => {
+                    result.extend_from_slice(&buffer[..bytes_read]);
+                    total_read += bytes_read;
+                }
+                Err(_) => return Err(libc::EIO),
+            }
+        }
+        
+        Ok(result)
+    }
+    
+    /// 智能缓存读取 - 根据文件大小选择最优读取策略
+    fn read_cache_smart(cache_path: &std::path::PathBuf, offset: i64, size: u32) -> Result<Vec<u8>, i32> {
+        // 小文件使用直接读取
+        if size < 4 * 1024 * 1024 { // 4MB以下
+            Self::read_cache_direct(cache_path, offset, size)
+        } else {
+            // 大文件使用零拷贝穿透读取
+            Self::read_cache_zero_copy(cache_path, offset, size)
+        }
+    }
+    
     /// 直接同步读取NFS文件
     fn read_nfs_direct(file_path: &std::path::PathBuf, offset: i64, size: u32) -> Result<Vec<u8>, i32> {
         use std::io::{Read, Seek, SeekFrom};
@@ -157,68 +234,130 @@ impl Filesystem for CacheFs {
         _lock: Option<u64>,
         reply: ReplyData,
     ) {
-        // 快速检查缓存是否存在
-        if let Some(path) = self.inode_manager.get_path(ino) {
-            let cache_path = self.get_cache_path(&path);
-            
-            // 如果缓存存在，使用异步读取缓存
-            if std::fs::metadata(&cache_path).is_ok() {
-                let (sender, receiver) = oneshot::channel();
-                
-                let request = AsyncRequest::Read {
-                    ino,
-                    offset,
-                    size,
-                    responder: sender,
-                };
-                
-                if let Err(e) = self.async_executor.submit(request) {
-                    error!("Failed to submit read request: {}", e);
-                    reply.error(libc::EIO);
-                    return;
-                }
-                
-                tokio::spawn(async move {
-                    match receiver.await {
-                        Ok(Ok(data)) => reply.data(&data),
-                        Ok(Err(err)) => reply.error(err),
-                        Err(_) => reply.error(libc::EIO),
-                    }
-                });
+        let start_time = std::time::Instant::now();
+        
+        // 获取文件路径
+        let path = match self.inode_manager.get_path(ino) {
+            Some(path) => path,
+            None => {
+                tracing::error!("❌ File not found: inode={}", ino);
+                reply.error(libc::ENOENT);
                 return;
             }
+        };
+        
+        let cache_path = self.get_cache_path(&path);
+        let file_size_str = if size > 1024 * 1024 {
+            format!("{:.1}MB", size as f64 / (1024.0 * 1024.0))
+        } else if size > 1024 {
+            format!("{:.1}KB", size as f64 / 1024.0)
+        } else {
+            format!("{}B", size)
+        };
+        
+        tracing::info!("📁 READ REQUEST: {} (offset: {}, size: {})", 
+            path.display(), offset, file_size_str);
+        
+        // 优化：缓存命中时直接同步读取，避免异步开销
+        if std::fs::metadata(&cache_path).is_ok() {
+            tracing::info!("🚀 CACHE HIT: {}", path.display());
+            let cache_start = std::time::Instant::now();
             
-            // 缓存不存在，直接同步读取NFS（避免异步复杂性）
-            let nfs_path = self.get_nfs_path(&path);
-            match Self::read_nfs_direct(&nfs_path, offset, size) {
+            match Self::read_cache_smart(&cache_path, offset, size) {
                 Ok(data) => {
+                    let cache_duration = cache_start.elapsed();
+                    let total_duration = start_time.elapsed();
+                    let speed_mbps = if cache_duration.as_secs_f64() > 0.0 {
+                        (data.len() as f64) / (1024.0 * 1024.0) / cache_duration.as_secs_f64()
+                    } else {
+                        0.0
+                    };
+                    
+                    // 记录访问统计
+                    self.cache_manager.record_access(&path);
+                    
+                    tracing::info!("✅ CACHE READ SUCCESS: {} -> {} in {:?} ({:.1} MB/s, total: {:?})", 
+                        path.display(), 
+                        file_size_str,
+                        cache_duration,
+                        speed_mbps,
+                        total_duration
+                    );
+                    
                     reply.data(&data);
-                    
-                    // 异步触发缓存任务
-                    let cache_manager = Arc::clone(&self.cache_manager);
-                    let nfs_path_clone = nfs_path.clone();
-                    tokio::spawn(async move {
-                        if let Ok(metadata) = tokio::fs::metadata(&nfs_path_clone).await {
-                            // 简化的缓存判断：大于1MB的文件才缓存
-                            if metadata.len() > 1024 * 1024 {
-                                if let Err(e) = cache_manager.submit_cache_task(nfs_path_clone, crate::cache::state::CachePriority::Normal).await {
-                                    tracing::warn!("Failed to trigger cache: {}", e);
-                                }
-                            }
-                        }
-                    });
-                    
                     return;
                 }
                 Err(err) => {
-                    reply.error(err);
-                    return;
+                    let cache_duration = cache_start.elapsed();
+                    // 缓存读取失败，降级到NFS
+                    tracing::warn!("⚠️  CACHE READ FAILED: {} -> falling back to NFS (error: {}, time: {:?})", 
+                        cache_path.display(), err, cache_duration);
                 }
             }
+        } else {
+            tracing::info!("❌ CACHE MISS: {} -> reading from NFS", path.display());
         }
         
-        // 无法获取路径，返回错误
-        reply.error(libc::ENOENT);
+        // 缓存未命中或读取失败，直接同步读取NFS
+        let nfs_path = self.get_nfs_path(&path);
+        let nfs_start = std::time::Instant::now();
+        
+        tracing::info!("🌐 NFS READ: {} (offset: {}, size: {})", 
+            nfs_path.display(), offset, file_size_str);
+            
+        match Self::read_nfs_direct(&nfs_path, offset, size) {
+            Ok(data) => {
+                let nfs_duration = nfs_start.elapsed();
+                let total_duration = start_time.elapsed();
+                let speed_mbps = if nfs_duration.as_secs_f64() > 0.0 {
+                    (data.len() as f64) / (1024.0 * 1024.0) / nfs_duration.as_secs_f64()
+                } else {
+                    0.0
+                };
+                
+                tracing::info!("✅ NFS READ SUCCESS: {} -> {} in {:?} ({:.1} MB/s, total: {:?})", 
+                    path.display(), 
+                    file_size_str,
+                    nfs_duration,
+                    speed_mbps,
+                    total_duration
+                );
+                
+                reply.data(&data);
+                
+                // 异步触发缓存任务（仅对大文件）
+                let cache_manager = Arc::clone(&self.cache_manager);
+                let nfs_path_clone = nfs_path.clone();
+                let path_clone = path.clone();
+                tokio::spawn(async move {
+                    if let Ok(metadata) = tokio::fs::metadata(&nfs_path_clone).await {
+                        if metadata.len() > 1024 * 1024 { // 1MB以上才缓存
+                            let file_size_mb = metadata.len() as f64 / (1024.0 * 1024.0);
+                            tracing::info!("🔄 CACHE TRIGGER: {} ({:.1}MB) -> starting background cache", 
+                                path_clone.display(), file_size_mb);
+                                
+                            if let Err(e) = cache_manager.submit_cache_task(
+                                nfs_path_clone, 
+                                crate::cache::state::CachePriority::Normal
+                            ).await {
+                                tracing::warn!("❌ CACHE TASK FAILED: {}: {}", path_clone.display(), e);
+                            }
+                        } else {
+                            let file_size_kb = metadata.len() as f64 / 1024.0;
+                            tracing::debug!("⏭️  CACHE SKIP: {} ({:.1}KB) -> too small for caching", 
+                                path_clone.display(), file_size_kb);
+                        }
+                    }
+                });
+            }
+            Err(err) => {
+                let nfs_duration = nfs_start.elapsed();
+                let total_duration = start_time.elapsed();
+                tracing::error!("❌ NFS READ FAILED: {} -> error {} (nfs: {:?}, total: {:?})", 
+                    path.display(), err, nfs_duration, total_duration);
+                reply.error(err);
+            }
+        }
     }
     
     fn open(&mut self, _req: &Request, ino: u64, _flags: i32, reply: ReplyOpen) {

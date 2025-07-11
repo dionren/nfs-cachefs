@@ -83,7 +83,7 @@ impl From<FileAttr> for fuser::FileAttr {
             gid: attr.gid,
             rdev: attr.rdev,
             flags: attr.flags,
-            blksize: 4096, // 默认块大小
+            blksize: 4 * 1024 * 1024, // 🚀 使用4MB块大小提升性能
         }
     }
 }

@@ -116,9 +116,15 @@ impl CacheManager {
         
         // 获取文件大小
         let file_size = match tokio::fs::metadata(&nfs_path).await {
-            Ok(metadata) => metadata.len(),
+            Ok(metadata) => {
+                let size = metadata.len();
+                let size_mb = size as f64 / (1024.0 * 1024.0);
+                tracing::info!("📊 CACHE TASK SUBMIT: {} ({:.1}MB) -> preparing to cache", 
+                    nfs_path.display(), size_mb);
+                size
+            },
             Err(e) => {
-                tracing::warn!("Failed to get file size for {}: {}", nfs_path.display(), e);
+                tracing::warn!("❌ CACHE TASK FAILED: Failed to get file size for {}: {}", nfs_path.display(), e);
                 return Err(CacheFsError::IoError(e));
             }
         };
@@ -128,11 +134,16 @@ impl CacheManager {
             dashmap::mapref::entry::Entry::Occupied(entry) => {
                 // 文件已存在，检查状态
                 match &entry.get().status {
-                    CacheStatus::Cached { .. } | CacheStatus::CachingInProgress { .. } => {
-                        // 已缓存或正在缓存，直接返回
+                    CacheStatus::Cached { .. } => {
+                        tracing::debug!("⏭️  CACHE SKIP: {} -> already cached", nfs_path.display());
+                        return Ok(());
+                    }
+                    CacheStatus::CachingInProgress { .. } => {
+                        tracing::debug!("⏭️  CACHE SKIP: {} -> already caching", nfs_path.display());
                         return Ok(());
                     }
                     CacheStatus::Failed { .. } | CacheStatus::NotCached => {
+                        tracing::info!("🔄 CACHE RETRY: {} -> retrying failed cache", nfs_path.display());
                         // 失败状态或未缓存，可以重新缓存
                         // 继续执行后续逻辑
                     }
@@ -143,12 +154,13 @@ impl CacheManager {
                 let mut new_entry = CacheEntry::new(file_size).with_priority(priority);
                 let _progress = new_entry.start_caching(file_size);
                 entry.insert(new_entry);
+                tracing::info!("📝 CACHE ENTRY CREATED: {} -> new cache entry", nfs_path.display());
             }
         }
         
         // 检查缓存空间
         if let Err(e) = self.ensure_cache_space(file_size).await {
-            tracing::warn!("Failed to ensure cache space for {}: {}", nfs_path.display(), e);
+            tracing::warn!("💾 CACHE SPACE INSUFFICIENT: {} -> {}", nfs_path.display(), e);
             // 如果空间不足，移除刚创建的条目
             self.cache_entries.remove(&cache_path);
             return Err(e);
@@ -167,20 +179,25 @@ impl CacheManager {
         }
         
         // 创建缓存任务
-        let task = CacheTask::new(nfs_path, cache_path.clone())
+        let task = CacheTask::new(nfs_path.clone(), cache_path.clone())
             .with_priority(priority)
+            .with_checksum(self.config.enable_checksums)
             .with_file_size(file_size)
-            .with_checksum(self.config.enable_checksums);
+            .with_max_retries(3);
         
-        // 提交任务
+        tracing::info!("🚀 CACHE TASK STARTED: {} -> queued for background processing", nfs_path.display());
+        
+        // 提交任务到队列
         if let Err(e) = self.task_sender.send(task) {
-            tracing::error!("Failed to submit cache task: {}", e);
-            // 任务提交失败，清理状态
+            tracing::error!("❌ CACHE TASK QUEUE FAILED: {} -> {}", nfs_path.display(), e);
+            // 清理缓存条目
             self.cache_entries.remove(&cache_path);
-            return Err(CacheFsError::SendError(e.to_string()));
+            return Err(CacheFsError::cache_error(format!("Failed to queue cache task: {}", e)));
         }
         
+        // 记录缓存任务开始
         self.metrics.record_cache_task_start();
+        
         Ok(())
     }
     
@@ -337,6 +354,10 @@ impl CacheManager {
         config: Arc<Config>,
     ) -> Result<()> {
         let start_time = Instant::now();
+        let file_size_mb = task.file_size.unwrap_or(0) as f64 / (1024.0 * 1024.0);
+        
+        tracing::info!("⚙️  CACHE TASK EXECUTE: {} ({:.1}MB) -> starting file copy", 
+            task.source_path.display(), file_size_mb);
         
         // 确保在任何错误情况下都能清理临时文件
         struct TempFileGuard {
@@ -347,7 +368,9 @@ impl CacheManager {
             fn drop(&mut self) {
                 if self.temp_path.exists() {
                     if let Err(e) = std::fs::remove_file(&self.temp_path) {
-                        tracing::warn!("Failed to cleanup temp file {}: {}", self.temp_path.display(), e);
+                        tracing::warn!("⚠️  TEMP FILE CLEANUP FAILED: {}: {}", self.temp_path.display(), e);
+                    } else {
+                        tracing::debug!("🧹 TEMP FILE CLEANED: {}", self.temp_path.display());
                     }
                 }
             }
@@ -357,10 +380,24 @@ impl CacheManager {
             let temp_path = task.get_temp_path();
             let _temp_guard = TempFileGuard { temp_path: temp_path.clone() };
             
+            tracing::debug!("📝 CACHE COPY START: {} -> {}", 
+                task.source_path.display(), temp_path.display());
+            
+            let copy_start = Instant::now();
             let result = Self::copy_file_to_cache(&task, &cache_entries, &metrics, &config).await;
+            let copy_duration = copy_start.elapsed();
             
             match result {
                 Ok(checksum) => {
+                    let copy_speed = if copy_duration.as_secs_f64() > 0.0 {
+                        file_size_mb / copy_duration.as_secs_f64()
+                    } else {
+                        0.0
+                    };
+                    
+                    tracing::info!("📋 CACHE COPY COMPLETE: {} -> copied in {:?} ({:.1} MB/s)", 
+                        task.source_path.display(), copy_duration, copy_speed);
+                    
                     // 原子性文件操作：先验证，再重命名
                     let file_size = task.file_size.unwrap_or(0);
                     
@@ -368,8 +405,8 @@ impl CacheManager {
                     match tokio::fs::metadata(&temp_path).await {
                         Ok(metadata) => {
                             if metadata.len() != file_size {
-                                tracing::error!("Temp file size mismatch: expected {}, got {}", 
-                                    file_size, metadata.len());
+                                tracing::error!("❌ CACHE VERIFY FAILED: {} -> size mismatch (expected: {}, got: {})", 
+                                    task.source_path.display(), file_size, metadata.len());
                                 
                                 if let Some(mut entry) = cache_entries.get_mut(&task.cache_path) {
                                     entry.mark_failed("File size mismatch".to_string(), task.retry_count);
@@ -377,10 +414,12 @@ impl CacheManager {
                                 
                                 metrics.record_cache_error();
                                 return Err(CacheFsError::cache_error("File size mismatch"));
+                            } else {
+                                tracing::debug!("✅ CACHE VERIFY OK: {} -> size check passed", task.source_path.display());
                             }
                         }
                         Err(e) => {
-                            tracing::error!("Failed to verify temp file: {}", e);
+                            tracing::error!("❌ CACHE VERIFY FAILED: {} -> metadata error: {}", task.source_path.display(), e);
                             
                             if let Some(mut entry) = cache_entries.get_mut(&task.cache_path) {
                                 entry.mark_failed(e.to_string(), task.retry_count);
@@ -392,21 +431,33 @@ impl CacheManager {
                     }
                     
                     // 2. 原子性重命名操作
+                    tracing::debug!("🔄 CACHE RENAME: {} -> {}", temp_path.display(), task.cache_path.display());
+                    let rename_start = Instant::now();
+                    
                     match tokio::fs::rename(&temp_path, &task.cache_path).await {
                         Ok(()) => {
+                            let rename_duration = rename_start.elapsed();
                             // 3. 更新缓存条目状态（必须在重命名成功后）
                             if let Some(mut entry) = cache_entries.get_mut(&task.cache_path) {
                                 entry.complete_caching(file_size, checksum);
                                 
-                                let latency = start_time.elapsed();
-                                metrics.record_cache_operation(latency);
+                                let total_duration = start_time.elapsed();
+                                let overall_speed = if total_duration.as_secs_f64() > 0.0 {
+                                    file_size_mb / total_duration.as_secs_f64()
+                                } else {
+                                    0.0
+                                };
+                                
+                                metrics.record_cache_operation(total_duration);
                                 metrics.record_cache_task_complete();
                                 
-                                tracing::info!(
-                                    "Successfully cached file: {} (size: {}, time: {:?})",
+                                tracing::info!("🎉 CACHE TASK COMPLETE: {} ({:.1}MB) -> cached successfully! (copy: {:?}, rename: {:?}, total: {:?}, avg: {:.1} MB/s)",
                                     task.source_path.display(),
-                                    file_size,
-                                    latency
+                                    file_size_mb,
+                                    copy_duration,
+                                    rename_duration,
+                                    total_duration,
+                                    overall_speed
                                 );
                                 
                                 // 防止 Drop 清理已重命名的文件
@@ -414,13 +465,15 @@ impl CacheManager {
                                 return Ok(());
                             } else {
                                 // 如果缓存条目丢失，这是一个严重错误
-                                tracing::error!("Cache entry lost during atomic operation: {}", 
+                                tracing::error!("❌ CACHE ENTRY LOST: {} -> cache entry disappeared during atomic operation", 
                                     task.cache_path.display());
                                 return Err(CacheFsError::cache_error("Cache entry lost"));
                             }
                         }
                         Err(e) => {
-                            tracing::error!("Failed to rename cached file: {}", e);
+                            let rename_duration = rename_start.elapsed();
+                            tracing::error!("❌ CACHE RENAME FAILED: {} -> {} (after {:?}): {}", 
+                                temp_path.display(), task.cache_path.display(), rename_duration, e);
                             
                             if let Some(mut entry) = cache_entries.get_mut(&task.cache_path) {
                                 entry.mark_failed(e.to_string(), task.retry_count);
@@ -433,14 +486,16 @@ impl CacheManager {
                 }
                 Err(e) => {
                     // 缓存失败，临时文件会被自动清理
-                    tracing::warn!("Cache task failed: {} (attempt {}/{}): {}", 
-                        task.source_path.display(), task.retry_count + 1, task.max_retries, e);
+                    tracing::warn!("⚠️  CACHE COPY FAILED: {} (attempt {}/{}, after {:?}): {}", 
+                        task.source_path.display(), task.retry_count + 1, task.max_retries, copy_duration, e);
                     
                     if task.can_retry() {
                         task.increment_retry();
                         
                         // 指数退避
                         let delay = Duration::from_millis(1000 * (1 << task.retry_count.min(5)));
+                        tracing::info!("⏳ CACHE RETRY DELAY: {} -> retrying in {:?}", 
+                            task.source_path.display(), delay);
                         tokio::time::sleep(delay).await;
                         
                         continue;
@@ -453,6 +508,9 @@ impl CacheManager {
                         metrics.record_cache_error();
                         metrics.record_cache_task_complete();
                         
+                        tracing::error!("❌ CACHE TASK FAILED: {} -> gave up after {} attempts", 
+                            task.source_path.display(), task.max_retries + 1);
+                        
                         return Err(e);
                     }
                 }
@@ -460,17 +518,19 @@ impl CacheManager {
         }
     }
     
-    /// 复制文件到缓存
+    /// 复制文件到缓存 - 优化版本
     async fn copy_file_to_cache(
         task: &CacheTask,
         cache_entries: &Arc<DashMap<PathBuf, CacheEntry>>,
         metrics: &Arc<MetricsCollector>,
         config: &Arc<Config>,
     ) -> Result<Option<String>> {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt, AsyncSeekExt};
         use sha2::{Sha256, Digest};
         
         let temp_path = task.get_temp_path();
+        let file_size = task.file_size.unwrap_or(0);
+        let file_size_mb = file_size as f64 / (1024.0 * 1024.0);
         
         // 确保父目录存在
         if let Some(parent) = temp_path.parent() {
@@ -485,10 +545,22 @@ impl CacheManager {
         let mut dest_file = tokio::fs::File::create(&temp_path).await
             .map_err(CacheFsError::IoError)?;
         
-        let mut buffer = vec![0u8; config.cache_block_size];
+        // 智能选择缓冲区大小
+        let buffer_size = if file_size < 1024 * 1024 { // 1MB以下
+            // 小文件直接一次性读取，避免分块
+            std::cmp::min(file_size as usize, 1024 * 1024)
+        } else if file_size < 16 * 1024 * 1024 { // 16MB以下
+            // 中等文件使用2MB块
+            2 * 1024 * 1024
+        } else {
+            // 大文件使用配置的块大小
+            config.cache_block_size
+        };
+        
+        let mut buffer = vec![0u8; buffer_size];
         let mut total_copied = 0u64;
         let mut hasher = if task.enable_checksum {
-            Some(Sha256::new())
+            Some(sha2::Sha256::new())
         } else {
             None
         };
@@ -504,7 +576,108 @@ impl CacheManager {
             None
         };
         
-        // 复制文件
+        let copy_start = std::time::Instant::now();
+        let mut last_progress_log = copy_start;
+        let progress_log_interval = std::time::Duration::from_secs(2);
+        
+        // 针对小文件的优化：批量复制
+        if file_size < 1024 * 1024 { // 1MB以下的小文件
+            tracing::info!("🚀 CACHE SMALL FILE: {} ({:.1}KB) -> single-pass copy", 
+                task.source_path.display(), file_size as f64 / 1024.0);
+            
+            match source_file.read_exact(&mut buffer[..file_size as usize]).await {
+                Ok(_) => {
+                    let data = &buffer[..file_size as usize];
+                    
+                    // 计算校验和
+                    if let Some(ref mut hasher) = hasher {
+                        hasher.update(data);
+                    }
+                    
+                    // 一次性写入
+                    dest_file.write_all(data).await.map_err(CacheFsError::IoError)?;
+                    total_copied = file_size;
+                    
+                    // 更新进度
+                    if let Some(ref progress) = progress {
+                        progress.store(file_size, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    
+                    metrics.record_nfs_read(file_size);
+                }
+                Err(e) => {
+                    // 如果精确读取失败，回退到常规方法
+                    tracing::debug!("🔄 CACHE FALLBACK: {} -> using chunked copy due to: {}", 
+                        task.source_path.display(), e);
+                    
+                                                             // 重新定位到文件开头
+                    use tokio::io::AsyncSeekExt;
+                    source_file.seek(tokio::io::SeekFrom::Start(0)).await.map_err(CacheFsError::IoError)?;
+                    
+                    // 使用常规分块复制
+                    return Self::copy_file_chunked(task, cache_entries, metrics, config, 
+                        source_file, dest_file, buffer, hasher, progress).await;
+                }
+            }
+        } else {
+            // 大文件使用分块复制
+            return Self::copy_file_chunked(task, cache_entries, metrics, config, 
+                source_file, dest_file, buffer, hasher, progress).await;
+        }
+        
+        // 确保数据写入磁盘
+        tracing::debug!("💾 CACHE SYNC: {} -> flushing to disk", task.source_path.display());
+        dest_file.sync_all().await.map_err(CacheFsError::IoError)?;
+        
+        // 计算校验和
+        let checksum = if let Some(hasher) = hasher {
+            let checksum_str = format!("{:x}", hasher.finalize());
+            tracing::debug!("🔐 CACHE CHECKSUM: {} -> {}", task.source_path.display(), &checksum_str[..16]);
+            Some(checksum_str)
+        } else {
+            None
+        };
+        
+        let total_time = copy_start.elapsed();
+        let final_speed = if total_time.as_secs_f64() > 0.0 {
+            file_size_mb / total_time.as_secs_f64()
+        } else {
+            0.0
+        };
+        
+        tracing::info!("📊 CACHE COPY COMPLETE: {} -> {:.1}MB in {:?} ({:.1} MB/s)", 
+            task.source_path.display(), file_size_mb, total_time, final_speed);
+        
+        Ok(checksum)
+    }
+    
+    /// 分块复制文件 - 独立函数
+    async fn copy_file_chunked(
+        task: &CacheTask,
+        cache_entries: &Arc<DashMap<PathBuf, CacheEntry>>,
+        metrics: &Arc<MetricsCollector>,
+        config: &Arc<Config>,
+        mut source_file: tokio::fs::File,
+        mut dest_file: tokio::fs::File,
+        mut buffer: Vec<u8>,
+        mut hasher: Option<sha2::Sha256>,
+        progress: Option<Arc<std::sync::atomic::AtomicU64>>,
+    ) -> Result<Option<String>> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use sha2::Digest;
+        
+        let file_size = task.file_size.unwrap_or(0);
+        let file_size_mb = file_size as f64 / (1024.0 * 1024.0);
+        let mut total_copied = 0u64;
+        
+        let copy_start = std::time::Instant::now();
+        let mut last_progress_log = copy_start;
+        let progress_log_interval = std::time::Duration::from_secs(2);
+        
+        tracing::info!("🔄 CACHE CHUNKED COPY: {} ({:.1}MB) -> chunked copy with {:.1}MB blocks", 
+            task.source_path.display(), file_size_mb, buffer.len() as f64 / (1024.0 * 1024.0));
+        
+        // 分块复制
         loop {
             let bytes_read = source_file.read(&mut buffer).await
                 .map_err(CacheFsError::IoError)?;
@@ -516,8 +689,7 @@ impl CacheManager {
             let data = &buffer[..bytes_read];
             
             // 写入目标文件
-            dest_file.write_all(data).await
-                .map_err(CacheFsError::IoError)?;
+            dest_file.write_all(data).await.map_err(CacheFsError::IoError)?;
             
             // 更新校验和
             if let Some(ref mut hasher) = hasher {
@@ -533,18 +705,52 @@ impl CacheManager {
             
             // 记录NFS读取
             metrics.record_nfs_read(bytes_read as u64);
+            
+            // 定期打印进度日志（仅对大文件）
+            let now = std::time::Instant::now();
+            if file_size_mb > 10.0 && now.duration_since(last_progress_log) >= progress_log_interval {
+                let progress_percent = if file_size > 0 {
+                    (total_copied as f64 / file_size as f64) * 100.0
+                } else {
+                    0.0
+                };
+                let elapsed = now.duration_since(copy_start);
+                let speed_mbps = if elapsed.as_secs_f64() > 0.0 {
+                    (total_copied as f64) / (1024.0 * 1024.0) / elapsed.as_secs_f64()
+                } else {
+                    0.0
+                };
+                let copied_mb = total_copied as f64 / (1024.0 * 1024.0);
+                
+                tracing::info!("📈 CACHE PROGRESS: {} -> {:.1}% ({:.1}/{:.1}MB, {:.1} MB/s)", 
+                    task.source_path.display(), progress_percent, copied_mb, file_size_mb, speed_mbps);
+                
+                last_progress_log = now;
+            }
         }
         
         // 确保数据写入磁盘
-        dest_file.sync_all().await
-            .map_err(CacheFsError::IoError)?;
+        tracing::debug!("💾 CACHE SYNC: {} -> flushing to disk", task.source_path.display());
+        dest_file.sync_all().await.map_err(CacheFsError::IoError)?;
         
         // 计算校验和
         let checksum = if let Some(hasher) = hasher {
-            Some(format!("{:x}", hasher.finalize()))
+            let checksum_str = format!("{:x}", hasher.finalize());
+            tracing::debug!("🔐 CACHE CHECKSUM: {} -> {}", task.source_path.display(), &checksum_str[..16]);
+            Some(checksum_str)
         } else {
             None
         };
+        
+        let total_time = copy_start.elapsed();
+        let final_speed = if total_time.as_secs_f64() > 0.0 {
+            file_size_mb / total_time.as_secs_f64()
+        } else {
+            0.0
+        };
+        
+        tracing::debug!("📊 CACHE COPY STATS: {} -> {:.1}MB in {:?} ({:.1} MB/s)", 
+            task.source_path.display(), file_size_mb, total_time, final_speed);
         
         Ok(checksum)
     }
@@ -658,6 +864,7 @@ mod tests {
         config.max_cache_size_bytes = 1024 * 1024; // 1MB
         config.cache_block_size = 1024;
         config.max_concurrent_caching = 2;
+        config.allow_async_read = false;
         config
     }
     
