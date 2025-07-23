@@ -1,6 +1,6 @@
 # NFS-CacheFS Makefile - 本地 Rust 编译方式
 
-.PHONY: build release clean help test debug install check-deps docker-build auto-release
+.PHONY: build release clean help test debug install check-deps auto-release
 
 # Default target
 help:
@@ -16,13 +16,11 @@ help:
 	@echo "  install       - 安装到系统"
 	@echo "  clean         - 清理构建产物"
 	@echo "  check-deps    - 检查依赖"
-	@echo "  docker-build  - 使用 Docker 构建（备用）"
 	@echo "  auto-release  - 自动发布新版本（需要版本号参数）"
 	@echo "  help          - 显示此帮助信息"
 	@echo ""
 	@echo "构建文件位置:"
 	@echo "  本地构建脚本:       ./build/local-build.sh"
-	@echo "  Docker 构建脚本:    ./build/docker-build.sh（备用）"
 	@echo "  安装脚本:           ./build/install.sh"
 	@echo "  升级计划:           ./UPGRADE_PLAN.md"
 
@@ -73,10 +71,6 @@ install: build
 	sudo ln -sf /usr/local/bin/nfs-cachefs /sbin/mount.cachefs
 	@echo "✅ 安装完成"
 
-# Docker 构建（备用方案）
-docker-build:
-	@echo "使用 Docker 构建（备用方案）..."
-	./build/docker-build.sh
 
 # 清理构建产物
 clean:

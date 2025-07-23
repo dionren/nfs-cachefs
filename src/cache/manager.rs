@@ -411,7 +411,7 @@ impl CacheManager {
     
     #[cfg(not(feature = "io_uring"))]
     async fn execute_cache_task(
-        mut task: CacheTask,
+        task: CacheTask,
         cache_entries: Arc<DashMap<PathBuf, CacheEntry>>,
         metrics: Arc<MetricsCollector>,
         config: Arc<Config>,
@@ -706,7 +706,7 @@ impl CacheManager {
                 tracing::error!("❌ CACHE IO_URING FAILED: {} -> {}", task.source_path.display(), e);
                 // Fall back to regular async I/O
                 tracing::info!("🔄 CACHE FALLBACK: {} -> using regular async I/O", task.source_path.display());
-                Self::copy_file_with_async_io(task, cache_entries, metrics, config, &Some(Arc::clone(io_uring_exec))).await
+                Self::copy_file_with_async_io(task, cache_entries, metrics, config, &Some(Arc::clone(io_uring_executor))).await
             }
         }
     }
@@ -739,10 +739,10 @@ impl CacheManager {
         metrics: &Arc<MetricsCollector>,
         config: &Arc<Config>,
         #[cfg(feature = "io_uring")]
-        _io_uring_executor: &Option<Arc<IoUringExecutor>>,
+        io_uring_executor: &Option<Arc<IoUringExecutor>>,
     ) -> Result<Option<String>> {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt, AsyncSeekExt};
-        use sha2::{Sha256, Digest};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use sha2::Digest;
         
         let temp_path = task.get_temp_path();
         let file_size = task.file_size.unwrap_or(0);
@@ -878,15 +878,15 @@ impl CacheManager {
     /// 分块复制文件 - 独立函数
     async fn copy_file_chunked(
         task: &CacheTask,
-        cache_entries: &Arc<DashMap<PathBuf, CacheEntry>>,
+        _cache_entries: &Arc<DashMap<PathBuf, CacheEntry>>,
         metrics: &Arc<MetricsCollector>,
-        config: &Arc<Config>,
+        _config: &Arc<Config>,
         mut source_file: tokio::fs::File,
         mut dest_file: tokio::fs::File,
         mut buffer: Vec<u8>,
         mut hasher: Option<sha2::Sha256>,
         progress: Option<Arc<std::sync::atomic::AtomicU64>>,
-        #[cfg(feature = "io_uring")] _io_uring_executor: &Option<Arc<IoUringExecutor>>,
+        #[cfg(feature = "io_uring")] io_uring_executor: &Option<Arc<IoUringExecutor>>,
     ) -> Result<Option<String>> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use sha2::Digest;

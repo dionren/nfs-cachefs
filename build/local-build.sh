@@ -7,6 +7,7 @@ set -e
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 # 进入项目根目录
@@ -19,14 +20,24 @@ echo -e "${GREEN}构建 NFS-CacheFS 版本 ${VERSION}...${NC}"
 # 检查 Rust 环境
 echo -e "${YELLOW}检查 Rust 编译环境...${NC}"
 if ! command -v cargo &> /dev/null; then
-    echo -e "${RED}错误: 未找到 cargo，请先安装 Rust${NC}"
-    echo "安装方法: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
-    exit 1
+    echo -e "${RED}错误: 未找到 cargo，正在自动安装 Rust...${NC}"
+    echo -e "${BLUE}开始安装 Rust 工具链...${NC}"
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+    source "$HOME/.cargo/env"
+    if ! command -v cargo &> /dev/null; then
+        echo -e "${RED}错误: Rust 安装失败${NC}"
+        exit 1
+    fi
+    echo -e "${GREEN}✓ Rust 安装成功${NC}"
 fi
 
 if ! command -v rustc &> /dev/null; then
-    echo -e "${RED}错误: 未找到 rustc，请先安装 Rust${NC}"
-    exit 1
+    echo -e "${RED}错误: 未找到 rustc${NC}"
+    source "$HOME/.cargo/env" || true
+    if ! command -v rustc &> /dev/null; then
+        echo -e "${RED}错误: 未找到 rustc，请检查 Rust 安装${NC}"
+        exit 1
+    fi
 fi
 
 # 显示 Rust 版本信息
@@ -107,8 +118,19 @@ done
 echo -e "${YELLOW}清理之前的构建产物...${NC}"
 cargo clean
 
+# 检查是否需要安装 musl 目标
+if [[ ! -d "$HOME/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/x86_64-unknown-linux-musl" ]]; then
+    echo -e "${YELLOW}安装 musl 目标以支持静态编译...${NC}"
+    rustup target add x86_64-unknown-linux-musl
+fi
+
 # 开始编译
 echo -e "${GREEN}开始编译 (${BUILD_MODE} 模式)...${NC}"
+if [[ "$CARGO_FLAGS" == *"--features io_uring"* ]]; then
+    echo -e "${BLUE}启用 io_uring 特性编译...${NC}"
+fi
+
+# 使用动态链接编译（本地环境）
 RUSTFLAGS="-C target-cpu=native" cargo build $CARGO_FLAGS
 
 # 检查编译结果
@@ -127,10 +149,16 @@ else
 fi
 
 # 验证二进制文件
-if ! ldd "${RELEASE_DIR}/nfs-cachefs" 2>/dev/null | grep -q "not a dynamic executable"; then
-    echo -e "${YELLOW}注意: 生成的是动态链接的二进制文件${NC}"
+echo -e "${YELLOW}检查二进制文件类型...${NC}"
+file_info=$(file "${RELEASE_DIR}/nfs-cachefs")
+echo "$file_info"
+
+if echo "$file_info" | grep -q "dynamically linked"; then
+    echo -e "${BLUE}二进制文件为动态链接（适合本地使用）${NC}"
     echo "依赖库:"
-    ldd "${RELEASE_DIR}/nfs-cachefs" | grep -v "linux-vdso"
+    ldd "${RELEASE_DIR}/nfs-cachefs" | grep -v "linux-vdso" || true
+else
+    echo -e "${GREEN}二进制文件为静态链接${NC}"
 fi
 
 # 复制文档和配置文件

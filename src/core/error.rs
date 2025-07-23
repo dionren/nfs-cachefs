@@ -41,6 +41,12 @@ pub enum CacheFsError {
     
     #[error("Send error: {0}")]
     SendError(String),
+    
+    #[error("Memory error: {0}")]
+    MemoryError(String),
+    
+    #[error("Resource error: {0}")]
+    ResourceError(String),
 }
 
 impl CacheFsError {
@@ -68,6 +74,21 @@ impl CacheFsError {
         Self::PathError {
             path: path.into(),
         }
+    }
+    
+    pub fn io_error(message: impl Into<String>) -> Self {
+        Self::IoError(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            message.into(),
+        ))
+    }
+    
+    pub fn memory_error(message: impl Into<String>) -> Self {
+        Self::MemoryError(message.into())
+    }
+    
+    pub fn resource_error(message: impl Into<String>) -> Self {
+        Self::ResourceError(message.into())
     }
 }
 

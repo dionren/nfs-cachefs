@@ -110,7 +110,6 @@ impl IoUringExecutor {
         
         // Create the io_uring instance
         let ring = builder
-            .dsize(config.queue_depth)
             .build(config.queue_depth)
             .map_err(|e| CacheFsError::io_error(format!("Failed to create io_uring: {}", e)))?;
             
