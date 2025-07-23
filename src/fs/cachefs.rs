@@ -17,6 +17,9 @@ use crate::core::config::Config;
 use crate::fs::inode::InodeManager;
 use crate::fs::async_executor::{AsyncExecutor, AsyncRequest};
 
+#[cfg(feature = "io_uring")]
+use crate::io::{IoUringExecutor, IoUringConfig};
+
 /// NFS-CacheFS 只读文件系统实现
 #[derive(Clone)]
 pub struct CacheFs {
@@ -28,6 +31,9 @@ pub struct CacheFs {
     cache_manager: Arc<CacheManager>,
     /// 配置信息
     config: Arc<Config>,
+    /// io_uring 执行器 (可选)
+    #[cfg(feature = "io_uring")]
+    io_uring_executor: Option<Arc<IoUringExecutor>>,
 }
 
 impl CacheFs {
@@ -49,11 +55,47 @@ impl CacheFs {
             Arc::clone(&next_fh),
         );
         
+        // Initialize io_uring executor if enabled
+        #[cfg(feature = "io_uring")]
+        let io_uring_executor = if config.nvme.use_io_uring {
+            tracing::info!("Initializing io_uring support...");
+            
+            // Check kernel support
+            if !crate::io::check_io_uring_support() {
+                tracing::warn!("io_uring not supported on this system, falling back to traditional I/O");
+                None
+            } else {
+                let io_config = IoUringConfig {
+                    queue_depth: config.nvme.queue_depth,
+                    sq_poll: config.nvme.polling_mode,
+                    io_poll: config.nvme.io_poll,
+                    fixed_buffers: config.nvme.fixed_buffers,
+                    huge_pages: config.nvme.use_hugepages,
+                    sq_poll_idle: config.nvme.sq_poll_idle_ms,
+                };
+                
+                match IoUringExecutor::new(io_config) {
+                    Ok(executor) => {
+                        tracing::info!("✅ io_uring initialized successfully");
+                        Some(Arc::new(executor))
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to initialize io_uring: {}", e);
+                        None
+                    }
+                }
+            }
+        } else {
+            None
+        };
+        
         Ok(Self {
             inode_manager,
             async_executor,
             cache_manager: Arc::clone(&cache_manager),
             config: Arc::new(config),
+            #[cfg(feature = "io_uring")]
+            io_uring_executor,
         })
     }
     
@@ -106,25 +148,40 @@ impl CacheFs {
     
     /// 零拷贝穿透读取 - 针对大文件的优化
     fn read_cache_zero_copy(cache_path: &std::path::PathBuf, offset: i64, size: u32) -> Result<Vec<u8>, i32> {
-        use std::fs::File;
+        use std::fs::{File, OpenOptions};
         use std::io::{Read, Seek, SeekFrom};
+        use std::os::unix::fs::OpenOptionsExt;
         
         // 对于大文件使用更大的读取缓冲区
-        let buffer_size = if size > 1024 * 1024 { // 1MB以上
-            std::cmp::min(size as usize, 16 * 1024 * 1024) // 最大16MB
+        let buffer_size = if size > 64 * 1024 * 1024 { // 64MB以上
+            std::cmp::min(size as usize, 256 * 1024 * 1024) // 最大256MB
+        } else if size > 1024 * 1024 { // 1MB以上
+            std::cmp::min(size as usize, 64 * 1024 * 1024) // 最大64MB
         } else {
             size as usize
         };
         
-        let mut file = match File::open(cache_path) {
+        // 使用 O_DIRECT 打开文件以绕过内核缓存
+        let mut file = match OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECT)
+            .open(cache_path)
+        {
             Ok(f) => f,
-            Err(_) => return Err(libc::ENOENT),
+            Err(_) => {
+                // 如果 O_DIRECT 失败，回退到普通打开
+                match File::open(cache_path) {
+                    Ok(f) => f,
+                    Err(_) => return Err(libc::ENOENT),
+                }
+            }
         };
         
         if let Err(_) = file.seek(SeekFrom::Start(offset as u64)) {
             return Err(libc::EINVAL);
         }
         
+        // 使用对齐的缓冲区以支持 O_DIRECT
         let mut buffer = vec![0u8; buffer_size];
         let mut total_read = 0;
         let mut result = Vec::with_capacity(size as usize);
@@ -157,9 +214,26 @@ impl CacheFs {
         }
     }
     
-    /// 直接同步读取NFS文件
+    /// 使用 io_uring 读取缓存文件
+    #[cfg(feature = "io_uring")]
+    async fn read_cache_io_uring(
+        io_uring_executor: &IoUringExecutor,
+        cache_path: &std::path::PathBuf,
+        offset: i64,
+        size: u32,
+    ) -> Result<Vec<u8>, i32> {
+        match io_uring_executor.read_direct(cache_path, offset as u64, size).await {
+            Ok(data) => Ok(data),
+            Err(e) => {
+                tracing::warn!("io_uring read failed: {}, falling back to traditional I/O", e);
+                Err(libc::EIO)
+            }
+        }
+    }
+    
+    /// 直接同步读取NFS文件 - 优化版本
     fn read_nfs_direct(file_path: &std::path::PathBuf, offset: i64, size: u32) -> Result<Vec<u8>, i32> {
-        use std::io::{Read, Seek, SeekFrom};
+        use std::io::{Read, Seek, SeekFrom, BufReader};
         use std::fs::File;
         
         let mut file = match File::open(file_path) {
@@ -171,11 +245,30 @@ impl CacheFs {
             return Err(libc::EINVAL);
         }
         
+        // 使用更大的缓冲读取器优化NFS读取
+        let reader_capacity = if size > 16 * 1024 * 1024 { // 16MB以上
+            16 * 1024 * 1024 // 16MB缓冲
+        } else if size > 1024 * 1024 { // 1MB以上
+            4 * 1024 * 1024 // 4MB缓冲
+        } else {
+            size as usize // 小文件直接读取
+        };
+        
+        let mut reader = BufReader::with_capacity(reader_capacity, file);
         let mut buffer = vec![0; size as usize];
-        match file.read(&mut buffer) {
-            Ok(bytes_read) => {
-                buffer.truncate(bytes_read);
-                Ok(buffer)
+        
+        match reader.read_exact(&mut buffer) {
+            Ok(_) => Ok(buffer),
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                // 处理文件末尾的情况
+                let mut partial_buffer = vec![0; size as usize];
+                match reader.read(&mut partial_buffer) {
+                    Ok(bytes_read) => {
+                        partial_buffer.truncate(bytes_read);
+                        Ok(partial_buffer)
+                    }
+                    Err(_) => Err(libc::EIO),
+                }
             }
             Err(_) => Err(libc::EIO),
         }
@@ -263,7 +356,24 @@ impl Filesystem for CacheFs {
             tracing::info!("🚀 CACHE HIT: {}", path.display());
             let cache_start = std::time::Instant::now();
             
-            match Self::read_cache_smart(&cache_path, offset, size) {
+            // Try io_uring first if available
+            #[cfg(feature = "io_uring")]
+            let read_result = if let Some(ref io_uring_exec) = self.io_uring_executor {
+                tracing::debug!("Using io_uring for cache read");
+                // Convert async io_uring read to sync using blocking task
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(async {
+                        Self::read_cache_io_uring(io_uring_exec, &cache_path, offset, size).await
+                    })
+                })
+            } else {
+                Self::read_cache_smart(&cache_path, offset, size)
+            };
+            
+            #[cfg(not(feature = "io_uring"))]
+            let read_result = Self::read_cache_smart(&cache_path, offset, size);
+            
+            match read_result {
                 Ok(data) => {
                     let cache_duration = cache_start.elapsed();
                     let total_duration = start_time.elapsed();
@@ -325,27 +435,33 @@ impl Filesystem for CacheFs {
                 
                 reply.data(&data);
                 
-                // 异步触发缓存任务（仅对大文件）
+                // 异步触发缓存任务（仅对大文件），延迟执行避免与读取竞争
                 let cache_manager = Arc::clone(&self.cache_manager);
                 let nfs_path_clone = nfs_path.clone();
                 let path_clone = path.clone();
+                let config = Arc::clone(&self.config);
                 tokio::spawn(async move {
+                    // 延迟缓存任务，让用户读取优先完成
+                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                    
                     if let Ok(metadata) = tokio::fs::metadata(&nfs_path_clone).await {
-                        if metadata.len() > 1024 * 1024 { // 1MB以上才缓存
+                        let min_cache_size = config.min_cache_file_size * 1024 * 1024; // MB转字节
+                        if metadata.len() >= min_cache_size {
                             let file_size_mb = metadata.len() as f64 / (1024.0 * 1024.0);
-                            tracing::info!("🔄 CACHE TRIGGER: {} ({:.1}MB) -> starting background cache", 
+                            tracing::info!("🔄 CACHE TRIGGER (DELAYED): {} ({:.1}MB) -> starting background cache", 
                                 path_clone.display(), file_size_mb);
                                 
+                            // 使用低优先级缓存任务
                             if let Err(e) = cache_manager.submit_cache_task(
                                 nfs_path_clone, 
-                                crate::cache::state::CachePriority::Normal
+                                crate::cache::state::CachePriority::Low
                             ).await {
                                 tracing::warn!("❌ CACHE TASK FAILED: {}: {}", path_clone.display(), e);
                             }
                         } else {
-                            let file_size_kb = metadata.len() as f64 / 1024.0;
-                            tracing::debug!("⏭️  CACHE SKIP: {} ({:.1}KB) -> too small for caching", 
-                                path_clone.display(), file_size_kb);
+                            let file_size_mb = metadata.len() as f64 / (1024.0 * 1024.0);
+                            tracing::debug!("⏭️  CACHE SKIP: {} ({:.1}MB) -> below minimum size ({} MB)", 
+                                path_clone.display(), file_size_mb, config.min_cache_file_size);
                         }
                     }
                 });

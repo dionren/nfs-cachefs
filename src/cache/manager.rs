@@ -15,6 +15,9 @@ use crate::core::config::Config;
 use crate::core::error::CacheFsError;
 use crate::Result;
 
+#[cfg(feature = "io_uring")]
+use crate::io::{IoUringExecutor, IoUringConfig};
+
 /// 缓存管理器
 pub struct CacheManager {
     config: Arc<Config>,
@@ -38,6 +41,10 @@ pub struct CacheManager {
     // 停止信号
     shutdown_sender: tokio::sync::watch::Sender<bool>,
     shutdown_receiver: tokio::sync::watch::Receiver<bool>,
+    
+    // io_uring 执行器 (可选)
+    #[cfg(feature = "io_uring")]
+    io_uring_executor: Option<Arc<IoUringExecutor>>,
 }
 
 impl CacheManager {
@@ -57,6 +64,39 @@ impl CacheManager {
         let (task_sender, task_receiver) = mpsc::unbounded_channel();
         let (shutdown_sender, shutdown_receiver) = tokio::sync::watch::channel(false);
         
+        // Initialize io_uring executor if enabled
+        #[cfg(feature = "io_uring")]
+        let io_uring_executor = if config.nvme.use_io_uring {
+            tracing::info!("CacheManager: Initializing io_uring support...");
+            
+            if !crate::io::check_io_uring_support() {
+                tracing::warn!("io_uring not supported, cache writes will use traditional I/O");
+                None
+            } else {
+                let io_config = IoUringConfig {
+                    queue_depth: config.nvme.queue_depth,
+                    sq_poll: config.nvme.polling_mode,
+                    io_poll: config.nvme.io_poll,
+                    fixed_buffers: config.nvme.fixed_buffers,
+                    huge_pages: config.nvme.use_hugepages,
+                    sq_poll_idle: config.nvme.sq_poll_idle_ms,
+                };
+                
+                match IoUringExecutor::new(io_config) {
+                    Ok(executor) => {
+                        tracing::info!("✅ CacheManager: io_uring initialized for cache writes");
+                        Some(Arc::new(executor))
+                    }
+                    Err(e) => {
+                        tracing::error!("CacheManager: Failed to initialize io_uring: {}", e);
+                        None
+                    }
+                }
+            }
+        } else {
+            None
+        };
+        
         let manager = Self {
             config: Arc::clone(&config),
             cache_entries: Arc::new(DashMap::new()),
@@ -67,6 +107,8 @@ impl CacheManager {
             task_sender,
             shutdown_sender,
             shutdown_receiver,
+            #[cfg(feature = "io_uring")]
+            io_uring_executor,
         };
         
         // 启动任务处理器
@@ -303,6 +345,9 @@ impl CacheManager {
         let config = Arc::clone(&self.config);
         let mut shutdown_receiver = self.shutdown_receiver.clone();
         
+        #[cfg(feature = "io_uring")]
+        let io_uring_executor = self.io_uring_executor.clone();
+        
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -325,7 +370,13 @@ impl CacheManager {
                                 let metrics = Arc::clone(&metrics);
                                 let config = Arc::clone(&config);
                                 
+                                #[cfg(feature = "io_uring")]
+                                let io_uring_exec = io_uring_executor.clone();
+                                
                                 let handle = tokio::spawn(async move {
+                                    #[cfg(feature = "io_uring")]
+                                    let result = Self::execute_cache_task(task, cache_entries, metrics, config, io_uring_exec).await;
+                                    #[cfg(not(feature = "io_uring"))]
                                     let result = Self::execute_cache_task(task, cache_entries, metrics, config).await;
                                     drop(permit); // 释放信号量
                                     result
@@ -347,11 +398,34 @@ impl CacheManager {
     }
     
     /// 执行缓存任务 - 修复原子性问题
+    #[cfg(feature = "io_uring")]
     async fn execute_cache_task(
         mut task: CacheTask,
         cache_entries: Arc<DashMap<PathBuf, CacheEntry>>,
         metrics: Arc<MetricsCollector>,
         config: Arc<Config>,
+        io_uring_executor: Option<Arc<IoUringExecutor>>,
+    ) -> Result<()> {
+        Self::execute_cache_task_impl(task, cache_entries, metrics, config, io_uring_executor).await
+    }
+    
+    #[cfg(not(feature = "io_uring"))]
+    async fn execute_cache_task(
+        mut task: CacheTask,
+        cache_entries: Arc<DashMap<PathBuf, CacheEntry>>,
+        metrics: Arc<MetricsCollector>,
+        config: Arc<Config>,
+    ) -> Result<()> {
+        Self::execute_cache_task_impl(task, cache_entries, metrics, config).await
+    }
+    
+    /// 执行缓存任务实现
+    async fn execute_cache_task_impl(
+        mut task: CacheTask,
+        cache_entries: Arc<DashMap<PathBuf, CacheEntry>>,
+        metrics: Arc<MetricsCollector>,
+        config: Arc<Config>,
+        #[cfg(feature = "io_uring")] io_uring_executor: Option<Arc<IoUringExecutor>>,
     ) -> Result<()> {
         let start_time = Instant::now();
         let file_size_mb = task.file_size.unwrap_or(0) as f64 / (1024.0 * 1024.0);
@@ -384,6 +458,9 @@ impl CacheManager {
                 task.source_path.display(), temp_path.display());
             
             let copy_start = Instant::now();
+            #[cfg(feature = "io_uring")]
+            let result = Self::copy_file_to_cache(&task, &cache_entries, &metrics, &config, &io_uring_executor).await;
+            #[cfg(not(feature = "io_uring"))]
             let result = Self::copy_file_to_cache(&task, &cache_entries, &metrics, &config).await;
             let copy_duration = copy_start.elapsed();
             
@@ -519,11 +596,150 @@ impl CacheManager {
     }
     
     /// 复制文件到缓存 - 优化版本
+    #[cfg(feature = "io_uring")]
     async fn copy_file_to_cache(
         task: &CacheTask,
         cache_entries: &Arc<DashMap<PathBuf, CacheEntry>>,
         metrics: &Arc<MetricsCollector>,
         config: &Arc<Config>,
+        io_uring_executor: &Option<Arc<IoUringExecutor>>,
+    ) -> Result<Option<String>> {
+        // Check if io_uring is available and use it for large files
+        if let Some(ref io_uring_exec) = io_uring_executor {
+            // Use io_uring for files larger than 10MB for better performance
+            let file_size = task.file_size.unwrap_or(0);
+            if file_size > 10 * 1024 * 1024 && io_uring_exec.is_ready() {
+                return Self::copy_file_with_io_uring(
+                    task,
+                    cache_entries,
+                    metrics,
+                    config,
+                    io_uring_exec,
+                ).await;
+            }
+        }
+        
+        // Fallback to regular async I/O
+        Self::copy_file_with_async_io(task, cache_entries, metrics, config, io_uring_executor).await
+    }
+    
+    #[cfg(not(feature = "io_uring"))]
+    async fn copy_file_to_cache(
+        task: &CacheTask,
+        cache_entries: &Arc<DashMap<PathBuf, CacheEntry>>,
+        metrics: &Arc<MetricsCollector>,
+        config: &Arc<Config>,
+    ) -> Result<Option<String>> {
+        Self::copy_file_with_async_io(task, cache_entries, metrics, config).await
+    }
+    
+    /// 使用 io_uring 复制文件 - 零拷贝实现
+    #[cfg(feature = "io_uring")]
+    async fn copy_file_with_io_uring(
+        task: &CacheTask,
+        cache_entries: &Arc<DashMap<PathBuf, CacheEntry>>,
+        metrics: &Arc<MetricsCollector>,
+        config: &Arc<Config>,
+        io_uring_executor: &Arc<IoUringExecutor>,
+    ) -> Result<Option<String>> {
+        let temp_path = task.get_temp_path();
+        let file_size = task.file_size.unwrap_or(0);
+        let file_size_mb = file_size as f64 / (1024.0 * 1024.0);
+        
+        tracing::info!("🚀 CACHE IO_URING: {} ({:.1}MB) -> using zero-copy splice", 
+            task.source_path.display(), file_size_mb);
+        
+        // 确保父目录存在
+        if let Some(parent) = temp_path.parent() {
+            if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                return Err(CacheFsError::IoError(e));
+            }
+        }
+        
+        let copy_start = std::time::Instant::now();
+        
+        // 获取进度跟踪器
+        let progress = if let Some(entry) = cache_entries.get(&task.cache_path) {
+            if let CacheStatus::CachingInProgress { progress, .. } = &entry.status {
+                Some(Arc::clone(progress))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        
+        // Use io_uring splice for zero-copy transfer
+        match io_uring_executor.splice_file(&task.source_path, &temp_path, file_size).await {
+            Ok(()) => {
+                let copy_duration = copy_start.elapsed();
+                let copy_speed = if copy_duration.as_secs_f64() > 0.0 {
+                    file_size_mb / copy_duration.as_secs_f64()
+                } else {
+                    0.0
+                };
+                
+                tracing::info!("✨ CACHE IO_URING COMPLETE: {} -> spliced in {:?} ({:.1} MB/s)", 
+                    task.source_path.display(), copy_duration, copy_speed);
+                
+                // Update progress to 100%
+                if let Some(ref progress) = progress {
+                    progress.store(file_size, std::sync::atomic::Ordering::Relaxed);
+                }
+                
+                // Record metrics
+                metrics.record_nfs_read(file_size);
+                
+                // Calculate checksum if needed (requires reading the file)
+                let checksum = if task.enable_checksum {
+                    // For checksums, we need to read the file
+                    // This is a tradeoff - we lose zero-copy benefit but gain integrity checking
+                    tracing::debug!("🔐 CACHE CHECKSUM: calculating for {}", task.source_path.display());
+                    Self::calculate_file_checksum(&temp_path).await?
+                } else {
+                    None
+                };
+                
+                Ok(checksum)
+            }
+            Err(e) => {
+                tracing::error!("❌ CACHE IO_URING FAILED: {} -> {}", task.source_path.display(), e);
+                // Fall back to regular async I/O
+                tracing::info!("🔄 CACHE FALLBACK: {} -> using regular async I/O", task.source_path.display());
+                Self::copy_file_with_async_io(task, cache_entries, metrics, config, &Some(Arc::clone(io_uring_exec))).await
+            }
+        }
+    }
+    
+    /// 计算文件校验和
+    async fn calculate_file_checksum(path: &std::path::Path) -> Result<Option<String>> {
+        use tokio::io::AsyncReadExt;
+        use sha2::{Sha256, Digest};
+        
+        let mut file = tokio::fs::File::open(path).await.map_err(CacheFsError::IoError)?;
+        let mut hasher = Sha256::new();
+        let mut buffer = vec![0u8; 1024 * 1024]; // 1MB buffer
+        
+        loop {
+            let bytes_read = file.read(&mut buffer).await.map_err(CacheFsError::IoError)?;
+            if bytes_read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..bytes_read]);
+        }
+        
+        let checksum = format!("{:x}", hasher.finalize());
+        Ok(Some(checksum))
+    }
+    
+    /// 使用常规异步 I/O 复制文件 - 原始实现
+    async fn copy_file_with_async_io(
+        task: &CacheTask,
+        cache_entries: &Arc<DashMap<PathBuf, CacheEntry>>,
+        metrics: &Arc<MetricsCollector>,
+        config: &Arc<Config>,
+        #[cfg(feature = "io_uring")]
+        _io_uring_executor: &Option<Arc<IoUringExecutor>>,
     ) -> Result<Option<String>> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt, AsyncSeekExt};
         use sha2::{Sha256, Digest};
@@ -545,11 +761,11 @@ impl CacheManager {
         let mut dest_file = tokio::fs::File::create(&temp_path).await
             .map_err(CacheFsError::IoError)?;
         
-        // 智能选择缓冲区大小
+        // 智能选择缓冲区大小 - 优化版本
         let buffer_size = if file_size < 1024 * 1024 { // 1MB以下
             // 小文件直接一次性读取，避免分块
             std::cmp::min(file_size as usize, 1024 * 1024)
-        } else if file_size < 16 * 1024 * 1024 { // 16MB以下
+        } else if file_size < 64 * 1024 * 1024 { // 64MB以下
             // 中等文件使用2MB块
             2 * 1024 * 1024
         } else {
@@ -615,12 +831,20 @@ impl CacheManager {
                     source_file.seek(tokio::io::SeekFrom::Start(0)).await.map_err(CacheFsError::IoError)?;
                     
                     // 使用常规分块复制
+                    #[cfg(feature = "io_uring")]
+                    return Self::copy_file_chunked(task, cache_entries, metrics, config, 
+                        source_file, dest_file, buffer, hasher, progress, io_uring_executor).await;
+                    #[cfg(not(feature = "io_uring"))]
                     return Self::copy_file_chunked(task, cache_entries, metrics, config, 
                         source_file, dest_file, buffer, hasher, progress).await;
                 }
             }
         } else {
             // 大文件使用分块复制
+            #[cfg(feature = "io_uring")]
+            return Self::copy_file_chunked(task, cache_entries, metrics, config, 
+                source_file, dest_file, buffer, hasher, progress, io_uring_executor).await;
+            #[cfg(not(feature = "io_uring"))]
             return Self::copy_file_chunked(task, cache_entries, metrics, config, 
                 source_file, dest_file, buffer, hasher, progress).await;
         }
@@ -662,6 +886,7 @@ impl CacheManager {
         mut buffer: Vec<u8>,
         mut hasher: Option<sha2::Sha256>,
         progress: Option<Arc<std::sync::atomic::AtomicU64>>,
+        #[cfg(feature = "io_uring")] _io_uring_executor: &Option<Arc<IoUringExecutor>>,
     ) -> Result<Option<String>> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use sha2::Digest;

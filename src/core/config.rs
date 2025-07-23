@@ -64,6 +64,9 @@ pub struct NvmeConfig {
     pub direct_io: bool,
     pub polling_mode: bool,
     pub numa_aware: bool,
+    pub sq_poll_idle_ms: u32,  // SQ polling idle time
+    pub fixed_buffers: bool,    // Use registered/fixed buffers
+    pub io_poll: bool,          // Enable IO polling
 }
 
 impl Default for NvmeConfig {
@@ -76,6 +79,9 @@ impl Default for NvmeConfig {
             direct_io: true,
             polling_mode: false,      // 轮询模式，减少中断开销
             numa_aware: false,        // NUMA感知内存分配
+            sq_poll_idle_ms: 1000,    // 1秒空闲时间
+            fixed_buffers: true,      // 使用固定缓冲区
+            io_poll: false,           // IO轮询模式
         }
     }
 }

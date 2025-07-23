@@ -47,7 +47,19 @@ sha2 = "0.10"
 # 命令行参数解析
 clap = { version = "4.4", features = ["derive"] }
 
+# io_uring 支持
+io-uring = { version = "0.6", optional = true }
+tokio-uring = { version = "0.5", optional = true }
+
+# 内存对齐和缓冲区管理
+aligned = "0.4"
+memmap2 = "0.9"
+
 [dev-dependencies]
 tempfile = "3.8"
 criterion = "0.5"
 tokio-test = "0.4"
+
+[features]
+default = []
+io_uring = ["dep:io-uring", "dep:tokio-uring"]
