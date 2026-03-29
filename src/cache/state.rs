@@ -16,6 +16,7 @@ pub enum CacheStatus {
         cached_at: SystemTime,
         last_accessed: SystemTime,
         file_size: u64,
+        source_mtime: Option<SystemTime>,
     },
     Failed {
         failed_at: SystemTime,
@@ -113,12 +114,13 @@ impl CacheEntry {
         progress
     }
     
-    pub fn complete_caching(&mut self, file_size: u64, checksum: Option<String>) {
+    pub fn complete_caching(&mut self, file_size: u64, checksum: Option<String>, source_mtime: Option<SystemTime>) {
         let now = SystemTime::now();
         self.status = CacheStatus::Cached {
             cached_at: now,
             last_accessed: now,
             file_size,
+            source_mtime,
         };
         self.checksum = checksum;
         self.last_modified = now;
@@ -223,18 +225,18 @@ mod tests {
         assert_eq!(entry.status.get_progress_percentage(), Some(50.0));
         
         // 完成缓存
-        entry.complete_caching(1024, Some("checksum".to_string()));
+        entry.complete_caching(1024, Some("checksum".to_string()), None);
         assert!(entry.status.is_cached());
         assert_eq!(entry.status.get_progress_percentage(), Some(100.0));
     }
-    
+
     #[test]
     fn test_checksum_verification() {
         let data = b"test data";
         let checksum = CacheEntry::calculate_checksum(data);
-        
+
         let mut entry = CacheEntry::new(data.len() as u64);
-        entry.complete_caching(data.len() as u64, Some(checksum));
+        entry.complete_caching(data.len() as u64, Some(checksum), None);
         
         assert!(entry.verify_checksum(data));
         assert!(!entry.verify_checksum(b"different data"));
@@ -243,8 +245,8 @@ mod tests {
     #[test]
     fn test_lru_score_calculation() {
         let mut entry = CacheEntry::new(1024);
-        entry.complete_caching(1024, None);
-        
+        entry.complete_caching(1024, None, None);
+
         let initial_score = entry.calculate_lru_score();
         
         // 模拟访问

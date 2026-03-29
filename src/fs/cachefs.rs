@@ -1,504 +1,394 @@
-use std::collections::HashMap;
 use std::ffi::OsStr;
+use std::os::unix::fs::{MetadataExt, FileExt};
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime};
 
+use dashmap::DashMap;
 use fuser::{
     FileAttr, FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry,
-    ReplyOpen, Request, FUSE_ROOT_ID,
+    ReplyOpen, ReplyStatfs, Request, FUSE_ROOT_ID,
 };
-use libc::ENOENT;
-use tokio::sync::RwLock;
-use tokio::sync::oneshot;
-use tracing::error;
+use tracing::{error, info, warn, debug};
 
 use crate::cache::manager::CacheManager;
+use crate::cache::state::CacheStatus;
 use crate::core::config::Config;
-use crate::fs::inode::InodeManager;
-use crate::fs::async_executor::{AsyncExecutor, AsyncRequest};
+use crate::fs::inode::{InodeManager, FileAttr as InternalFileAttr, FileType as InternalFileType};
 
-#[cfg(feature = "io_uring")]
-use crate::io::{IoUringExecutor, IoUringConfig};
+/// FUSE 属性缓存超时
+const TTL: Duration = Duration::from_secs(10);
+
+/// FOPEN_KEEP_CACHE: 告诉内核在 close/open 之间保持文件的页面缓存。
+/// 对于已缓存且 mtime 未变的文件，后续读取可直接由内核页面缓存服务，
+/// 完全绕过 FUSE read 回调，达到接近直接读取本地文件的速度。
+const FOPEN_KEEP_CACHE: u32 = 1 << 1;
+
+/// 打开文件的读取来源
+enum OpenFileSource {
+    /// 从本地缓存读取（快速路径）
+    Cache(std::fs::File),
+    /// 从 NFS 后端读取
+    Nfs(std::fs::File),
+}
+
+/// 已打开文件的上下文信息
+struct OpenFileHandle {
+    /// 预打开的文件描述符（在 open 时决定来源，read 时直接使用）
+    source: OpenFileSource,
+    /// 本地缓存路径（用于 record_access）
+    cache_path: PathBuf,
+}
 
 /// NFS-CacheFS 只读文件系统实现
+///
+/// 性能关键设计：
+/// - open() 时做一次 NFS metadata 调用验证缓存有效性，预打开文件 fd
+/// - read() 时通过预打开的 fd 使用 pread 读取，零 NFS 元数据开销
+/// - FOPEN_KEEP_CACHE 使内核缓存页面数据，重复读取不经过 FUSE
+/// - release() 清理 fd
 #[derive(Clone)]
 pub struct CacheFs {
     /// inode 管理器
     inode_manager: Arc<InodeManager>,
-    /// 异步操作执行器
-    async_executor: AsyncExecutor,
     /// 缓存管理器
     cache_manager: Arc<CacheManager>,
     /// 配置信息
     config: Arc<Config>,
-    /// io_uring 执行器 (可选)
-    #[cfg(feature = "io_uring")]
-    io_uring_executor: Option<Arc<IoUringExecutor>>,
+    /// Tokio 运行时句柄（仅用于后台缓存任务和异步 record_access）
+    runtime_handle: tokio::runtime::Handle,
+    /// 下一个可用文件句柄
+    next_fh: Arc<AtomicU64>,
+    /// 已打开文件的 fd 缓存（按 fh 索引）
+    /// open() 预打开文件，read() 通过 pread 直接使用，release() 清理
+    open_files: Arc<DashMap<u64, OpenFileHandle>>,
 }
 
 impl CacheFs {
     /// 创建新的 CacheFS 实例
-    pub fn new(config: Config) -> tokio::io::Result<Self> {
+    pub fn new(config: Config, runtime_handle: tokio::runtime::Handle) -> std::io::Result<Self> {
         let inode_manager = Arc::new(InodeManager::new());
         let metrics = Arc::new(crate::cache::metrics::MetricsCollector::new());
         let cache_manager = Arc::new(CacheManager::new(Arc::new(config.clone()), metrics)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?);
-        
-        let open_files = Arc::new(RwLock::new(HashMap::new()));
-        let next_fh = Arc::new(RwLock::new(1));
-        
-        let async_executor = AsyncExecutor::new(
-            Arc::new(config.clone()),
-            Arc::clone(&inode_manager),
-            Arc::clone(&cache_manager),
-            Arc::clone(&open_files),
-            Arc::clone(&next_fh),
-        );
-        
-        // Initialize io_uring executor if enabled
-        #[cfg(feature = "io_uring")]
-        let io_uring_executor = if config.nvme.use_io_uring {
-            tracing::info!("Initializing io_uring support...");
-            
-            // Check kernel support
-            if !crate::io::check_io_uring_support() {
-                tracing::warn!("io_uring not supported on this system, falling back to traditional I/O");
-                None
-            } else {
-                let io_config = IoUringConfig {
-                    queue_depth: config.nvme.queue_depth,
-                    sq_poll: config.nvme.polling_mode,
-                    io_poll: config.nvme.io_poll,
-                    fixed_buffers: config.nvme.fixed_buffers,
-                    huge_pages: config.nvme.use_hugepages,
-                    sq_poll_idle: config.nvme.sq_poll_idle_ms,
-                };
-                
-                match IoUringExecutor::new(io_config) {
-                    Ok(executor) => {
-                        tracing::info!("✅ io_uring initialized successfully");
-                        Some(Arc::new(executor))
-                    }
-                    Err(e) => {
-                        tracing::error!("Failed to initialize io_uring: {}", e);
-                        None
-                    }
-                }
-            }
-        } else {
-            None
-        };
-        
+
+        // 用 NFS 后端根目录的真实属性更新根 inode
+        if let Ok(metadata) = std::fs::symlink_metadata(&config.nfs_backend_path) {
+            let root_attr = Self::build_attr(FUSE_ROOT_ID, &metadata);
+            inode_manager.update_attr(FUSE_ROOT_ID, root_attr);
+        }
+
         Ok(Self {
             inode_manager,
-            async_executor,
-            cache_manager: Arc::clone(&cache_manager),
+            cache_manager,
             config: Arc::new(config),
-            #[cfg(feature = "io_uring")]
-            io_uring_executor,
+            runtime_handle,
+            next_fh: Arc::new(AtomicU64::new(1)),
+            open_files: Arc::new(DashMap::new()),
         })
     }
-    
+
     /// 优雅关闭文件系统
     pub async fn shutdown(&self) -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!("Shutting down CacheFS...");
-        
-        // 关闭缓存管理器
         if let Err(e) = self.cache_manager.shutdown().await {
             tracing::warn!("Error shutting down cache manager: {}", e);
         }
-        
         tracing::info!("CacheFS shutdown completed");
         Ok(())
     }
-    
-    /// 获取缓存路径的辅助函数
-    fn get_cache_path(&self, path: &std::path::PathBuf) -> std::path::PathBuf {
+
+    /// 获取缓存路径
+    fn get_cache_path(&self, path: &PathBuf) -> PathBuf {
         self.config.cache_dir.join(path.strip_prefix("/").unwrap_or(path))
     }
-    
-    /// 获取NFS路径
-    fn get_nfs_path(&self, path: &std::path::PathBuf) -> std::path::PathBuf {
+
+    /// 获取 NFS 路径
+    fn get_nfs_path(&self, path: &PathBuf) -> PathBuf {
         self.config.nfs_backend_path.join(path.strip_prefix("/").unwrap_or(path))
     }
-    
-    /// 直接同步读取缓存文件 - 优化版本
-    fn read_cache_direct(cache_path: &std::path::PathBuf, offset: i64, size: u32) -> Result<Vec<u8>, i32> {
-        use std::io::{Read, Seek, SeekFrom};
-        use std::fs::File;
-        
-        let mut file = match File::open(cache_path) {
-            Ok(f) => f,
-            Err(_) => return Err(libc::ENOENT),
+
+    /// 从 std::fs::Metadata 构建 InternalFileAttr
+    fn build_attr(inode: u64, metadata: &std::fs::Metadata) -> InternalFileAttr {
+        let file_type = if metadata.is_dir() {
+            InternalFileType::Directory
+        } else if metadata.file_type().is_symlink() {
+            InternalFileType::Symlink
+        } else {
+            InternalFileType::RegularFile
         };
-        
-        if let Err(_) = file.seek(SeekFrom::Start(offset as u64)) {
-            return Err(libc::EINVAL);
-        }
-        
-        let mut buffer = vec![0u8; size as usize];
-        match file.read(&mut buffer) {
-            Ok(bytes_read) => {
-                buffer.truncate(bytes_read);
-                Ok(buffer)
-            }
-            Err(_) => Err(libc::EIO),
+
+        InternalFileAttr {
+            inode,
+            size: metadata.len(),
+            blocks: metadata.blocks(),
+            atime: metadata.accessed().unwrap_or(SystemTime::now()),
+            mtime: metadata.modified().unwrap_or(SystemTime::now()),
+            ctime: metadata.modified().unwrap_or(SystemTime::now()),
+            crtime: metadata.created().unwrap_or(SystemTime::now()),
+            kind: file_type,
+            perm: (metadata.mode() & 0o7777) as u16,
+            nlink: metadata.nlink() as u32,
+            uid: metadata.uid(),
+            gid: metadata.gid(),
+            rdev: metadata.rdev() as u32,
+            flags: 0,
         }
     }
-    
-    /// 零拷贝穿透读取 - 针对大文件的优化
-    fn read_cache_zero_copy(cache_path: &std::path::PathBuf, offset: i64, size: u32) -> Result<Vec<u8>, i32> {
-        use std::fs::{File, OpenOptions};
-        use std::io::{Read, Seek, SeekFrom};
-        use std::os::unix::fs::OpenOptionsExt;
-        
-        // 对于大文件使用更大的读取缓冲区
-        let buffer_size = if size > 64 * 1024 * 1024 { // 64MB以上
-            std::cmp::min(size as usize, 256 * 1024 * 1024) // 最大256MB
-        } else if size > 1024 * 1024 { // 1MB以上
-            std::cmp::min(size as usize, 64 * 1024 * 1024) // 最大64MB
-        } else {
-            size as usize
-        };
-        
-        // 使用 O_DIRECT 打开文件以绕过内核缓存
-        let mut file = match OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECT)
-            .open(cache_path)
-        {
-            Ok(f) => f,
-            Err(_) => {
-                // 如果 O_DIRECT 失败，回退到普通打开
-                match File::open(cache_path) {
-                    Ok(f) => f,
-                    Err(_) => return Err(libc::ENOENT),
-                }
-            }
-        };
-        
-        if let Err(_) = file.seek(SeekFrom::Start(offset as u64)) {
-            return Err(libc::EINVAL);
-        }
-        
-        // 使用对齐的缓冲区以支持 O_DIRECT
-        let mut buffer = vec![0u8; buffer_size];
+
+    /// 使用 pread 从已打开的文件读取（线程安全，无需 seek，多线程可并发调用）
+    fn pread_file(file: &std::fs::File, offset: i64, size: u32) -> Result<Vec<u8>, i32> {
+        let mut buffer = vec![0u8; size as usize];
         let mut total_read = 0;
-        let mut result = Vec::with_capacity(size as usize);
-        
+
         while total_read < size as usize {
-            let remaining = size as usize - total_read;
-            let read_size = std::cmp::min(buffer_size, remaining);
-            
-            match file.read(&mut buffer[..read_size]) {
+            match file.read_at(&mut buffer[total_read..], offset as u64 + total_read as u64) {
                 Ok(0) => break, // EOF
-                Ok(bytes_read) => {
-                    result.extend_from_slice(&buffer[..bytes_read]);
-                    total_read += bytes_read;
-                }
+                Ok(n) => total_read += n,
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(_) => return Err(libc::EIO),
             }
         }
-        
-        Ok(result)
+
+        buffer.truncate(total_read);
+        Ok(buffer)
     }
-    
-    /// 智能缓存读取 - 根据文件大小选择最优读取策略
-    fn read_cache_smart(cache_path: &std::path::PathBuf, offset: i64, size: u32) -> Result<Vec<u8>, i32> {
-        // 小文件使用直接读取
-        if size < 4 * 1024 * 1024 { // 4MB以下
-            Self::read_cache_direct(cache_path, offset, size)
-        } else {
-            // 大文件使用零拷贝穿透读取
-            Self::read_cache_zero_copy(cache_path, offset, size)
-        }
-    }
-    
-    /// 使用 io_uring 读取缓存文件
-    #[cfg(feature = "io_uring")]
-    async fn read_cache_io_uring(
-        io_uring_executor: &IoUringExecutor,
-        cache_path: &std::path::PathBuf,
-        offset: i64,
-        size: u32,
-    ) -> Result<Vec<u8>, i32> {
-        match io_uring_executor.read_direct(cache_path, offset as u64, size).await {
-            Ok(data) => Ok(data),
-            Err(e) => {
-                tracing::warn!("io_uring read failed: {}, falling back to traditional I/O", e);
-                Err(libc::EIO)
-            }
-        }
-    }
-    
-    /// 直接同步读取NFS文件 - 优化版本
-    fn read_nfs_direct(file_path: &std::path::PathBuf, offset: i64, size: u32) -> Result<Vec<u8>, i32> {
-        use std::io::{Read, Seek, SeekFrom, BufReader};
+
+    /// 回退用：从路径打开文件并读取（每次 open+seek+read+close）
+    fn read_file(file_path: &PathBuf, offset: i64, size: u32) -> Result<Vec<u8>, i32> {
+        use std::io::{Read, Seek, SeekFrom};
         use std::fs::File;
-        
+
         let mut file = match File::open(file_path) {
             Ok(f) => f,
-            Err(_) => return Err(libc::ENOENT),
+            Err(e) => {
+                debug!("Failed to open {}: {}", file_path.display(), e);
+                return Err(libc::ENOENT);
+            }
         };
-        
+
         if let Err(_) = file.seek(SeekFrom::Start(offset as u64)) {
             return Err(libc::EINVAL);
         }
-        
-        // 使用更大的缓冲读取器优化NFS读取
-        let reader_capacity = if size > 16 * 1024 * 1024 { // 16MB以上
-            16 * 1024 * 1024 // 16MB缓冲
-        } else if size > 1024 * 1024 { // 1MB以上
-            4 * 1024 * 1024 // 4MB缓冲
-        } else {
-            size as usize // 小文件直接读取
-        };
-        
-        let mut reader = BufReader::with_capacity(reader_capacity, file);
-        let mut buffer = vec![0; size as usize];
-        
-        match reader.read_exact(&mut buffer) {
-            Ok(_) => Ok(buffer),
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                // 处理文件末尾的情况
-                let mut partial_buffer = vec![0; size as usize];
-                match reader.read(&mut partial_buffer) {
-                    Ok(bytes_read) => {
-                        partial_buffer.truncate(bytes_read);
-                        Ok(partial_buffer)
-                    }
-                    Err(_) => Err(libc::EIO),
+
+        let mut buffer = vec![0u8; size as usize];
+        let mut total_read = 0;
+
+        while total_read < size as usize {
+            match file.read(&mut buffer[total_read..]) {
+                Ok(0) => break,
+                Ok(n) => total_read += n,
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => return Err(libc::EIO),
+            }
+        }
+
+        buffer.truncate(total_read);
+        Ok(buffer)
+    }
+
+    /// 验证缓存 mtime 是否与 NFS 源文件一致
+    /// 使用已获取的 NFS metadata，不产生额外的 NFS 网络调用
+    fn validate_cache_mtime(&self, cache_path: &PathBuf, nfs_metadata: &std::fs::Metadata) -> bool {
+        if let Some(entry) = self.cache_manager.get_entry(cache_path) {
+            if let CacheStatus::Cached { source_mtime: Some(cached_mtime), .. } = &entry.status {
+                if let Ok(current_mtime) = nfs_metadata.modified() {
+                    return *cached_mtime == current_mtime;
                 }
             }
-            Err(_) => Err(libc::EIO),
         }
+        // 无 mtime 信息时假定有效
+        true
+    }
+
+    /// 触发后台缓存任务（非阻塞）
+    fn trigger_background_cache(&self, nfs_path: &PathBuf, file_size: u64) {
+        if file_size < self.config.min_cache_file_size {
+            return;
+        }
+
+        let cache_manager = Arc::clone(&self.cache_manager);
+        let nfs_path = nfs_path.clone();
+
+        self.runtime_handle.spawn(async move {
+            // 延迟执行，让前台读取优先
+            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+            if let Err(e) = cache_manager.submit_cache_task(
+                nfs_path,
+                crate::cache::state::CachePriority::Low,
+            ).await {
+                debug!("Background cache task failed: {}", e);
+            }
+        });
     }
 }
 
 impl Filesystem for CacheFs {
     fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
-        let (sender, receiver) = oneshot::channel();
-        let name = name.to_string_lossy().to_string();
-        
-        let request = AsyncRequest::Lookup {
-            parent,
-            name,
-            responder: sender,
+        let parent_path = if parent == FUSE_ROOT_ID {
+            PathBuf::from("/")
+        } else {
+            match self.inode_manager.get_path(parent) {
+                Some(path) => path,
+                None => { reply.error(libc::ENOENT); return; }
+            }
         };
-        
-        if let Err(e) = self.async_executor.submit(request) {
-            error!("Failed to submit lookup request: {}", e);
-            reply.error(libc::EIO);
+
+        let child_path = parent_path.join(name.to_string_lossy().as_ref());
+        let nfs_path = self.get_nfs_path(&child_path);
+
+        // 使用 symlink_metadata 正确处理符号链接
+        match std::fs::symlink_metadata(&nfs_path) {
+            Ok(metadata) => {
+                let inode = self.inode_manager.get_or_allocate_inode(&child_path);
+                let attr = Self::build_attr(inode, &metadata);
+                self.inode_manager.insert_mapping(child_path, inode, attr.clone());
+                let fuse_attr: FileAttr = attr.into();
+                reply.entry(&TTL, &fuse_attr, 0);
+            }
+            Err(_) => reply.error(libc::ENOENT),
+        }
+    }
+
+    fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
+        // 优先使用缓存的属性
+        if let Some(attr) = self.inode_manager.get_attr(ino) {
+            let fuse_attr: FileAttr = attr.into();
+            reply.attr(&TTL, &fuse_attr);
             return;
         }
-        
-        // 等待异步操作完成
-        tokio::spawn(async move {
-            match receiver.await {
-                Ok(Ok(attr)) => {
+
+        // 回退：从 NFS 后端重新获取属性
+        if let Some(path) = self.inode_manager.get_path(ino) {
+            let nfs_path = self.get_nfs_path(&path);
+            match std::fs::symlink_metadata(&nfs_path) {
+                Ok(metadata) => {
+                    let attr = Self::build_attr(ino, &metadata);
+                    self.inode_manager.update_attr(ino, attr.clone());
                     let fuse_attr: FileAttr = attr.into();
-                    reply.entry(&Duration::from_secs(1), &fuse_attr, 0);
+                    reply.attr(&TTL, &fuse_attr);
                 }
-                Ok(Err(err)) => reply.error(err),
-                Err(_) => reply.error(libc::EIO),
+                Err(_) => reply.error(libc::ENOENT),
             }
-        });
-    }
-    
-    fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
-        let inode_manager = Arc::clone(&self.inode_manager);
-        
-        if let Some(attr) = inode_manager.get_attr(ino) {
-            let fuse_attr: FileAttr = attr.into();
-            reply.attr(&Duration::from_secs(1), &fuse_attr);
         } else {
-            reply.error(ENOENT);
+            reply.error(libc::ENOENT);
         }
     }
-    
+
     fn read(
         &mut self,
         _req: &Request,
         ino: u64,
-        _fh: u64,
+        fh: u64,
         offset: i64,
         size: u32,
         _flags: i32,
         _lock: Option<u64>,
         reply: ReplyData,
     ) {
-        let start_time = std::time::Instant::now();
-        
-        // 获取文件路径
-        let path = match self.inode_manager.get_path(ino) {
-            Some(path) => path,
-            None => {
-                tracing::error!("❌ File not found: inode={}", ino);
-                reply.error(libc::ENOENT);
-                return;
-            }
-        };
-        
-        let cache_path = self.get_cache_path(&path);
-        let file_size_str = if size > 1024 * 1024 {
-            format!("{:.1}MB", size as f64 / (1024.0 * 1024.0))
-        } else if size > 1024 {
-            format!("{:.1}KB", size as f64 / 1024.0)
-        } else {
-            format!("{}B", size)
-        };
-        
-        tracing::info!("📁 READ REQUEST: {} (offset: {}, size: {})", 
-            path.display(), offset, file_size_str);
-        
-        // 优化：缓存命中时直接同步读取，避免异步开销
-        if std::fs::metadata(&cache_path).is_ok() {
-            tracing::info!("🚀 CACHE HIT: {}", path.display());
-            let cache_start = std::time::Instant::now();
-            
-            // Try io_uring first if available
-            #[cfg(feature = "io_uring")]
-            let read_result = if let Some(ref io_uring_exec) = self.io_uring_executor {
-                tracing::debug!("Using io_uring for cache read");
-                // Convert async io_uring read to sync using blocking task
-                tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current().block_on(async {
-                        Self::read_cache_io_uring(io_uring_exec, &cache_path, offset, size).await
-                    })
-                })
-            } else {
-                Self::read_cache_smart(&cache_path, offset, size)
+        // 快速路径：通过 open() 预打开的 fd + pread 读取
+        // 无 NFS 元数据调用，无文件 open/close 开销
+        if let Some(handle) = self.open_files.get(&fh) {
+            let (file, is_cache) = match &handle.source {
+                OpenFileSource::Cache(f) => (f, true),
+                OpenFileSource::Nfs(f) => (f, false),
             };
-            
-            #[cfg(not(feature = "io_uring"))]
-            let read_result = Self::read_cache_smart(&cache_path, offset, size);
-            
-            match read_result {
+
+            match Self::pread_file(file, offset, size) {
                 Ok(data) => {
-                    let cache_duration = cache_start.elapsed();
-                    let total_duration = start_time.elapsed();
-                    let speed_mbps = if cache_duration.as_secs_f64() > 0.0 {
-                        (data.len() as f64) / (1024.0 * 1024.0) / cache_duration.as_secs_f64()
-                    } else {
-                        0.0
-                    };
-                    
-                    // 记录访问统计
-                    self.cache_manager.record_access(&path);
-                    
-                    tracing::info!("✅ CACHE READ SUCCESS: {} -> {} in {:?} ({:.1} MB/s, total: {:?})", 
-                        path.display(), 
-                        file_size_str,
-                        cache_duration,
-                        speed_mbps,
-                        total_duration
-                    );
-                    
+                    if is_cache {
+                        // 异步记录访问，避免在读取热路径上的 eviction mutex 竞争
+                        let cache_manager = Arc::clone(&self.cache_manager);
+                        let cache_path = handle.cache_path.clone();
+                        self.runtime_handle.spawn(async move {
+                            cache_manager.record_access(&cache_path);
+                        });
+                    }
                     reply.data(&data);
                     return;
                 }
-                Err(err) => {
-                    let cache_duration = cache_start.elapsed();
-                    // 缓存读取失败，降级到NFS
-                    tracing::warn!("⚠️  CACHE READ FAILED: {} -> falling back to NFS (error: {}, time: {:?})", 
-                        cache_path.display(), err, cache_duration);
+                Err(e) => {
+                    warn!("pread failed for fh={}: errno {}", fh, e);
                 }
             }
-        } else {
-            tracing::info!("❌ CACHE MISS: {} -> reading from NFS", path.display());
         }
-        
-        // 缓存未命中或读取失败，直接同步读取NFS
+
+        // 回退路径：无 fd 缓存或 pread 失败
+        let path = match self.inode_manager.get_path(ino) {
+            Some(path) => path,
+            None => { reply.error(libc::ENOENT); return; }
+        };
+
         let nfs_path = self.get_nfs_path(&path);
-        let nfs_start = std::time::Instant::now();
-        
-        tracing::info!("🌐 NFS READ: {} (offset: {}, size: {})", 
-            nfs_path.display(), offset, file_size_str);
-            
-        match Self::read_nfs_direct(&nfs_path, offset, size) {
+        self.cache_manager.record_miss();
+
+        match Self::read_file(&nfs_path, offset, size) {
             Ok(data) => {
-                let nfs_duration = nfs_start.elapsed();
-                let total_duration = start_time.elapsed();
-                let speed_mbps = if nfs_duration.as_secs_f64() > 0.0 {
-                    (data.len() as f64) / (1024.0 * 1024.0) / nfs_duration.as_secs_f64()
-                } else {
-                    0.0
-                };
-                
-                tracing::info!("✅ NFS READ SUCCESS: {} -> {} in {:?} ({:.1} MB/s, total: {:?})", 
-                    path.display(), 
-                    file_size_str,
-                    nfs_duration,
-                    speed_mbps,
-                    total_duration
-                );
-                
                 reply.data(&data);
-                
-                // 异步触发缓存任务（仅对大文件），延迟执行避免与读取竞争
-                let cache_manager = Arc::clone(&self.cache_manager);
-                let nfs_path_clone = nfs_path.clone();
-                let path_clone = path.clone();
-                let config = Arc::clone(&self.config);
-                tokio::spawn(async move {
-                    // 延迟缓存任务，让用户读取优先完成
-                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-                    
-                    if let Ok(metadata) = tokio::fs::metadata(&nfs_path_clone).await {
-                        let min_cache_size = config.min_cache_file_size * 1024 * 1024; // MB转字节
-                        if metadata.len() >= min_cache_size {
-                            let file_size_mb = metadata.len() as f64 / (1024.0 * 1024.0);
-                            tracing::info!("🔄 CACHE TRIGGER (DELAYED): {} ({:.1}MB) -> starting background cache", 
-                                path_clone.display(), file_size_mb);
-                                
-                            // 使用低优先级缓存任务
-                            if let Err(e) = cache_manager.submit_cache_task(
-                                nfs_path_clone, 
-                                crate::cache::state::CachePriority::Low
-                            ).await {
-                                tracing::warn!("❌ CACHE TASK FAILED: {}: {}", path_clone.display(), e);
-                            }
-                        } else {
-                            let file_size_mb = metadata.len() as f64 / (1024.0 * 1024.0);
-                            tracing::debug!("⏭️  CACHE SKIP: {} ({:.1}MB) -> below minimum size ({} MB)", 
-                                path_clone.display(), file_size_mb, config.min_cache_file_size);
-                        }
-                    }
-                });
             }
             Err(err) => {
-                let nfs_duration = nfs_start.elapsed();
-                let total_duration = start_time.elapsed();
-                tracing::error!("❌ NFS READ FAILED: {} -> error {} (nfs: {:?}, total: {:?})", 
-                    path.display(), err, nfs_duration, total_duration);
+                error!("NFS read failed for {}: errno {}", nfs_path.display(), err);
                 reply.error(err);
             }
         }
     }
-    
+
     fn open(&mut self, _req: &Request, ino: u64, _flags: i32, reply: ReplyOpen) {
-        let (sender, receiver) = oneshot::channel();
-        
-        let request = AsyncRequest::Open {
-            ino,
-            responder: sender,
+        let path = match self.inode_manager.get_path(ino) {
+            Some(path) => path,
+            None => { reply.error(libc::ENOENT); return; }
         };
-        
-        if let Err(e) = self.async_executor.submit(request) {
-            error!("Failed to submit open request: {}", e);
-            reply.error(libc::EIO);
-            return;
-        }
-        
-        tokio::spawn(async move {
-            match receiver.await {
-                Ok(Ok(fh)) => reply.opened(fh, 0),
-                Ok(Err(err)) => reply.error(err),
-                Err(_) => reply.error(libc::EIO),
+
+        let nfs_path = self.get_nfs_path(&path);
+        let cache_path = self.get_cache_path(&path);
+
+        // 验证文件存在并刷新属性 — open() 时的唯一 NFS 元数据调用
+        let nfs_metadata = match std::fs::metadata(&nfs_path) {
+            Ok(m) => m,
+            Err(_) => { reply.error(libc::ENOENT); return; }
+        };
+        let attr = Self::build_attr(ino, &nfs_metadata);
+        self.inode_manager.update_attr(ino, attr);
+
+        let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
+
+        // 在 open 时决定读取来源并预打开 fd
+        // 后续所有 read() 调用直接使用此 fd，不再访问 NFS 元数据
+        let mut source = None;
+        let mut fuse_flags = 0u32;
+
+        if cache_path.exists() {
+            if self.validate_cache_mtime(&cache_path, &nfs_metadata) {
+                if let Ok(file) = std::fs::File::open(&cache_path) {
+                    source = Some(OpenFileSource::Cache(file));
+                    // FOPEN_KEEP_CACHE: 内核保持页面缓存，后续读取可完全绕过 FUSE
+                    fuse_flags = FOPEN_KEEP_CACHE;
+                }
+            } else {
+                info!("Cache stale at open for {}, invalidating", path.display());
+                self.cache_manager.invalidate(&cache_path);
             }
+        }
+
+        if source.is_none() {
+            match std::fs::File::open(&nfs_path) {
+                Ok(file) => {
+                    self.trigger_background_cache(&nfs_path, nfs_metadata.len());
+                    source = Some(OpenFileSource::Nfs(file));
+                }
+                Err(_) => { reply.error(libc::EIO); return; }
+            }
+        }
+
+        self.open_files.insert(fh, OpenFileHandle {
+            source: source.unwrap(),
+            cache_path,
         });
+
+        reply.opened(fh, fuse_flags);
     }
-    
+
     fn readdir(
         &mut self,
         _req: &Request,
@@ -507,65 +397,86 @@ impl Filesystem for CacheFs {
         offset: i64,
         mut reply: ReplyDirectory,
     ) {
-        let (sender, receiver) = oneshot::channel();
-        
-        let request = AsyncRequest::ReadDir {
-            ino,
-            responder: sender,
-        };
-        
-        if let Err(e) = self.async_executor.submit(request) {
-            error!("Failed to submit readdir request: {}", e);
-            reply.error(libc::EIO);
-            return;
-        }
-        
-        tokio::spawn(async move {
-            match receiver.await {
-                Ok(Ok(entries)) => {
-                    let mut index = 0;
-                    
-                    // 添加 . 和 .. 条目
-                    if offset <= index {
-                        if reply.add(ino, index + 1, FileType::Directory, ".") {
-                            reply.ok();
-                            return;
-                        }
-                    }
-                    index += 1;
-                    
-                    if offset <= index {
-                        let parent_ino = if ino == FUSE_ROOT_ID {
-                            FUSE_ROOT_ID
-                        } else {
-                            FUSE_ROOT_ID
-                        };
-                        
-                        if reply.add(parent_ino, index + 1, FileType::Directory, "..") {
-                            reply.ok();
-                            return;
-                        }
-                    }
-                    index += 1;
-                    
-                    // 添加实际的目录条目
-                    for (temp_ino, name, file_type) in entries {
-                        if offset <= index {
-                            if reply.add(temp_ino, index + 1, file_type, &name) {
-                                break;
-                            }
-                        }
-                        index += 1;
-                    }
-                    
-                    reply.ok();
-                }
-                Ok(Err(err)) => reply.error(err),
-                Err(_) => reply.error(libc::EIO),
+        let path = if ino == FUSE_ROOT_ID {
+            PathBuf::from("/")
+        } else {
+            match self.inode_manager.get_path(ino) {
+                Some(path) => path,
+                None => { reply.error(libc::ENOENT); return; }
             }
-        });
+        };
+
+        let nfs_path = self.get_nfs_path(&path);
+
+        let entries = match std::fs::read_dir(&nfs_path) {
+            Ok(entries) => entries,
+            Err(_) => { reply.error(libc::ENOENT); return; }
+        };
+
+        let mut index = 0i64;
+
+        // "." 条目
+        if offset <= index {
+            if reply.add(ino, index + 1, FileType::Directory, ".") {
+                reply.ok();
+                return;
+            }
+        }
+        index += 1;
+
+        // ".." 条目
+        if offset <= index {
+            let parent_ino = if ino == FUSE_ROOT_ID {
+                FUSE_ROOT_ID
+            } else {
+                path.parent()
+                    .and_then(|p| self.inode_manager.get_inode(p))
+                    .unwrap_or(FUSE_ROOT_ID)
+            };
+            if reply.add(parent_ino, index + 1, FileType::Directory, "..") {
+                reply.ok();
+                return;
+            }
+        }
+        index += 1;
+
+        // 实际目录条目
+        for entry_result in entries {
+            let entry = match entry_result {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+
+            if offset <= index {
+                let name = entry.file_name();
+                let child_path = path.join(name.to_string_lossy().as_ref());
+                let nfs_child_path = self.get_nfs_path(&child_path);
+
+                // 获取或分配一致的 inode
+                let child_ino = self.inode_manager.get_or_allocate_inode(&child_path);
+
+                let file_type = match entry.file_type() {
+                    Ok(ft) if ft.is_dir() => FileType::Directory,
+                    Ok(ft) if ft.is_symlink() => FileType::Symlink,
+                    _ => FileType::RegularFile,
+                };
+
+                // 创建完整的属性映射
+                if let Ok(metadata) = std::fs::symlink_metadata(&nfs_child_path) {
+                    let attr = Self::build_attr(child_ino, &metadata);
+                    self.inode_manager.insert_mapping(child_path, child_ino, attr);
+                }
+
+                if reply.add(child_ino, index + 1, file_type, name) {
+                    break;
+                }
+            }
+            index += 1;
+        }
+
+        reply.ok();
     }
-    
+
     fn release(
         &mut self,
         _req: &Request,
@@ -576,22 +487,83 @@ impl Filesystem for CacheFs {
         _flush: bool,
         reply: fuser::ReplyEmpty,
     ) {
-        let (sender, receiver) = oneshot::channel();
-        
-        let request = AsyncRequest::Release {
-            fh,
-            responder: sender,
+        // 清理预打开的文件描述符
+        self.open_files.remove(&fh);
+        reply.ok();
+    }
+
+    fn readlink(&mut self, _req: &Request, ino: u64, reply: ReplyData) {
+        let path = match self.inode_manager.get_path(ino) {
+            Some(path) => path,
+            None => { reply.error(libc::ENOENT); return; }
         };
-        
-        if let Err(e) = self.async_executor.submit(request) {
-            error!("Failed to submit release request: {}", e);
+
+        let nfs_path = self.get_nfs_path(&path);
+
+        match std::fs::read_link(&nfs_path) {
+            Ok(target) => {
+                use std::os::unix::ffi::OsStrExt;
+                reply.data(target.as_os_str().as_bytes());
+            }
+            Err(e) => {
+                debug!("readlink failed for {}: {}", nfs_path.display(), e);
+                reply.error(libc::ENOENT);
+            }
+        }
+    }
+
+    fn statfs(&mut self, _req: &Request, _ino: u64, reply: ReplyStatfs) {
+        // 使用 libc::statvfs 直接获取文件系统统计信息
+        use std::ffi::CString;
+        let path_cstr = match CString::new(
+            self.config.nfs_backend_path.to_string_lossy().as_bytes()
+        ) {
+            Ok(s) => s,
+            Err(_) => { reply.error(libc::EINVAL); return; }
+        };
+
+        let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+        let ret = unsafe { libc::statvfs(path_cstr.as_ptr(), &mut stat) };
+
+        if ret == 0 {
+            reply.statfs(
+                stat.f_blocks,
+                stat.f_bfree,
+                stat.f_bavail,
+                stat.f_files,
+                stat.f_ffree,
+                stat.f_bsize as u32,
+                stat.f_namemax as u32,
+                stat.f_frsize as u32,
+            );
+        } else {
+            warn!("statfs failed: errno {}", std::io::Error::last_os_error());
             reply.error(libc::EIO);
+        }
+    }
+
+    fn access(&mut self, _req: &Request, ino: u64, mask: i32, reply: fuser::ReplyEmpty) {
+        // 只读文件系统：拒绝写操作
+        if mask & libc::W_OK != 0 {
+            reply.error(libc::EROFS);
             return;
         }
-        
-        tokio::spawn(async move {
-            let _ = receiver.await;
+
+        // 检查文件是否存在
+        if ino == FUSE_ROOT_ID {
             reply.ok();
-        });
+            return;
+        }
+
+        if let Some(path) = self.inode_manager.get_path(ino) {
+            let nfs_path = self.get_nfs_path(&path);
+            if nfs_path.exists() {
+                reply.ok();
+            } else {
+                reply.error(libc::ENOENT);
+            }
+        } else {
+            reply.error(libc::ENOENT);
+        }
     }
-} 
+}

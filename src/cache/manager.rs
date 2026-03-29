@@ -143,12 +143,37 @@ impl CacheManager {
         self.config.cache_dir.join(relative_path)
     }
     
-    /// 记录文件访问
-    pub fn record_access(&self, path: &PathBuf) {
-        if self.is_cached(path) {
-            self.metrics.record_cache_hit();
+    /// 记录文件访问（传入 cache_path，即 cache_entries 的 key）
+    pub fn record_access(&self, cache_path: &PathBuf) {
+        if let Some(entry) = self.cache_entries.get(cache_path) {
+            if entry.status.is_cached() {
+                self.metrics.record_cache_hit();
+                self.eviction_policy.lock().on_access(cache_path, &*entry);
+            } else {
+                self.metrics.record_cache_miss();
+            }
         } else {
             self.metrics.record_cache_miss();
+        }
+    }
+
+    /// 记录缓存未命中
+    pub fn record_miss(&self) {
+        self.metrics.record_cache_miss();
+    }
+
+    /// 获取缓存条目（用于验证缓存有效性）
+    pub fn get_entry(&self, cache_path: &PathBuf) -> Option<CacheEntry> {
+        self.cache_entries.get(cache_path).map(|e| e.clone())
+    }
+
+    /// 移除缓存条目（用于缓存失效）
+    pub fn invalidate(&self, cache_path: &PathBuf) {
+        if let Some((path, _)) = self.cache_entries.remove(cache_path) {
+            self.eviction_policy.lock().on_remove(&path);
+            let _ = std::fs::remove_file(cache_path);
+            self.metrics.record_cache_invalidation();
+            tracing::info!("Cache invalidated: {}", cache_path.display());
         }
     }
     
@@ -516,7 +541,10 @@ impl CacheManager {
                             let rename_duration = rename_start.elapsed();
                             // 3. 更新缓存条目状态（必须在重命名成功后）
                             if let Some(mut entry) = cache_entries.get_mut(&task.cache_path) {
-                                entry.complete_caching(file_size, checksum);
+                                let source_mtime = std::fs::metadata(&task.source_path)
+                                    .ok()
+                                    .and_then(|m| m.modified().ok());
+                                entry.complete_caching(file_size, checksum, source_mtime);
                                 
                                 let total_duration = start_time.elapsed();
                                 let overall_speed = if total_duration.as_secs_f64() > 0.0 {
@@ -712,6 +740,7 @@ impl CacheManager {
     }
     
     /// 计算文件校验和
+    #[allow(dead_code)]
     async fn calculate_file_checksum(path: &std::path::Path) -> Result<Option<String>> {
         use tokio::io::AsyncReadExt;
         use sha2::{Sha256, Digest};
@@ -774,7 +803,6 @@ impl CacheManager {
         };
         
         let mut buffer = vec![0u8; buffer_size];
-        let mut total_copied = 0u64;
         let mut hasher = if task.enable_checksum {
             Some(sha2::Sha256::new())
         } else {
@@ -793,9 +821,7 @@ impl CacheManager {
         };
         
         let copy_start = std::time::Instant::now();
-        let mut last_progress_log = copy_start;
-        let progress_log_interval = std::time::Duration::from_secs(2);
-        
+
         // 针对小文件的优化：批量复制
         if file_size < 1024 * 1024 { // 1MB以下的小文件
             tracing::info!("🚀 CACHE SMALL FILE: {} ({:.1}KB) -> single-pass copy", 
@@ -812,8 +838,7 @@ impl CacheManager {
                     
                     // 一次性写入
                     dest_file.write_all(data).await.map_err(CacheFsError::IoError)?;
-                    total_copied = file_size;
-                    
+
                     // 更新进度
                     if let Some(ref progress) = progress {
                         progress.store(file_size, std::sync::atomic::Ordering::Relaxed);

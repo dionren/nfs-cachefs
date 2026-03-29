@@ -288,11 +288,11 @@ mod tests {
         let path3 = PathBuf::from("/cache/file3.txt");
         
         let mut entry1 = CacheEntry::new(1000);
-        entry1.complete_caching(1000, None);
+        entry1.complete_caching(1000, None, None);
         let mut entry2 = CacheEntry::new(2000);
-        entry2.complete_caching(2000, None);
+        entry2.complete_caching(2000, None, None);
         let mut entry3 = CacheEntry::new(3000);
-        entry3.complete_caching(3000, None);
+        entry3.complete_caching(3000, None, None);
         
         entries.insert(path1.clone(), entry1.clone());
         entries.insert(path2.clone(), entry2.clone());
@@ -338,9 +338,9 @@ mod tests {
         let path2 = PathBuf::from("/cache/file2.txt");
         
         let mut entry1 = CacheEntry::new(1000);
-        entry1.complete_caching(1000, None);
+        entry1.complete_caching(1000, None, None);
         let mut entry2 = CacheEntry::new(2000);
-        entry2.complete_caching(2000, None);
+        entry2.complete_caching(2000, None, None);
         
         entries.insert(path1.clone(), entry1.clone());
         entries.insert(path2.clone(), entry2.clone());
@@ -368,9 +368,9 @@ mod tests {
         let path2 = PathBuf::from("/cache/file2.txt");
         
         let mut entry1 = CacheEntry::new(1000).with_priority(CachePriority::Critical);
-        entry1.complete_caching(1000, None);
+        entry1.complete_caching(1000, None, None);
         let mut entry2 = CacheEntry::new(2000);
-        entry2.complete_caching(2000, None);
+        entry2.complete_caching(2000, None, None);
         
         entries.insert(path1.clone(), entry1.clone());
         entries.insert(path2.clone(), entry2.clone());

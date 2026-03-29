@@ -158,6 +158,21 @@ impl InodeManager {
     pub fn get_inode(&self, path: &Path) -> Option<Inode> {
         self.path_to_inode.read().get(path).copied()
     }
+
+    /// 根据路径获取已有的 inode，如果不存在则分配新的
+    /// 注意：仅建立 path<->inode 映射，调用者应随后调用 insert_mapping 设置完整属性
+    pub fn get_or_allocate_inode(&self, path: &Path) -> Inode {
+        // 快速路径：读锁检查
+        if let Some(&inode) = self.path_to_inode.read().get(path) {
+            return inode;
+        }
+
+        // 慢路径：分配新 inode 并建立映射
+        let inode = self.allocate_inode();
+        self.path_to_inode.write().insert(path.to_path_buf(), inode);
+        self.inode_to_path.write().insert(inode, path.to_path_buf());
+        inode
+    }
     
     /// 根据 inode 获取路径
     pub fn get_path(&self, inode: Inode) -> Option<PathBuf> {
