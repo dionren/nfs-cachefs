@@ -1,0 +1,44 @@
+# nfs-cachefs daemon configuration.
+#
+# After editing, restart with: systemctl restart nfs-cachefs
+
+# Cache backing directory. MUST be the root of its own filesystem
+# (cachefiles refuses subdirectories of a host fs). Put a dedicated NVMe
+# partition or loop-backed ext4/xfs here for best performance.
+cache_dir = "/var/cache/fscache"
+
+# Identifier for this cache. Change if you run multiple caches; keep
+# whitespace-free.
+tag = "nfscache"
+
+# Optional SELinux/AppArmor security context. Leave commented unless your
+# system enforces a non-default policy on the cache dir.
+# secctx = "system_u:system_r:cachefiles_kernel_t:s0"
+
+# Free space / inode thresholds, all percentages of the cache filesystem:
+#
+#   stop  - kernel refuses new caching below this level
+#   cull  - daemon starts deleting old objects below this level
+#   run   - daemon stops culling once free reaches this level
+#
+# Required ordering: stop < cull < run (each <= 100).
+[limits]
+brun  = 10
+bcull =  7
+bstop =  3
+frun  = 10
+fcull =  7
+fstop =  3
+
+[cull]
+# Maximum number of cache objects to consider in one cull pass. Bounds
+# CPU and disk I/O when the cache is large. The daemon re-runs the pass
+# whenever the kernel signals cull pressure again.
+batch_size = 1024
+
+[log]
+# error | warn | info | debug | trace; overridden by RUST_LOG if set.
+level = "info"
+
+# compact | json
+format = "compact"

@@ -1,0 +1,34 @@
+[Unit]
+Description=NFS-CacheFS userspace daemon for Linux fscache + cachefiles
+Documentation=man:nfs-cachefs(8)
+# Must run before any NFS mount that uses -o fsc, otherwise the mount
+# falls back to no caching.
+DefaultDependencies=no
+After=local-fs.target
+Before=remote-fs-pre.target
+ConditionPathExists=/dev/cachefiles
+ConditionFileNotEmpty=/etc/nfs-cachefs/daemon.toml
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/nfs-cachefs --config /etc/nfs-cachefs/daemon.toml
+ExecStartPre=/sbin/modprobe -q cachefiles
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=10s
+KillSignal=SIGTERM
+
+# Hardening: cache dir is the only writable path.
+ProtectSystem=strict
+ReadWritePaths=/var/cache/fscache
+ProtectHome=true
+NoNewPrivileges=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+PrivateTmp=true
+RestrictAddressFamilies=AF_UNIX
+# CAP_SYS_ADMIN is required to write /dev/cachefiles configuration.
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_DAC_READ_SEARCH
+
+[Install]
+WantedBy=multi-user.target

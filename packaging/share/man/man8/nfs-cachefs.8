@@ -1,0 +1,80 @@
+.TH NFS-CACHEFS 8 "2026-05" "nfs-cachefs" "System Manager's Manual"
+.SH NAME
+nfs-cachefs \- userspace daemon for Linux fscache + cachefiles (traditional mode)
+.SH SYNOPSIS
+.B nfs-cachefs
+[\fB\-\-config\fR \fIPATH\fR]
+[\fB\-\-log-level\fR \fILEVEL\fR]
+.SH DESCRIPTION
+.B nfs-cachefs
+is a modern Rust replacement for the upstream
+.BR cachefilesd (8)
+daemon. It opens
+.I /dev/cachefiles ,
+configures the kernel
+.B cachefiles
+backend, and drives cache culling by deleting LRU objects when the cache
+filesystem approaches its
+.B bcull
+or
+.B fcull
+thresholds.
+
+The daemon does not handle cache hits or misses on the data path \(em that
+is done entirely by the kernel
+.BR cachefiles.ko
+module. NFS clients mounted with
+.B \-o\ fsc
+will transparently populate and read from the local cache filesystem
+configured here.
+
+This implementation supports the traditional userspace protocol only.
+On-demand mode (kernel \(>=\ 5.19,
+.BR CONFIG_CACHEFILES_ONDEMAND ) is not supported by this binary; on
+distributions that ship with
+.B CONFIG_CACHEFILES_ONDEMAND=n
+(e.g. Ubuntu 24.04) only the traditional mode is available anyway.
+.SH OPTIONS
+.TP
+\fB\-c\fR, \fB\-\-config\fR \fIPATH\fR
+TOML configuration file. Default:
+.IR /etc/nfs-cachefs/daemon.toml .
+.TP
+\fB\-\-log-level\fR \fILEVEL\fR
+Override log level (\fIerror\fR, \fIwarn\fR, \fIinfo\fR, \fIdebug\fR,
+\fItrace\fR). The
+.B RUST_LOG
+environment variable takes precedence if set.
+.SH FILES
+.TP
+.I /etc/nfs-cachefs/daemon.toml
+Configuration file. See the comments in the shipped default for the
+schema.
+.TP
+.I /dev/cachefiles
+Kernel control device.
+.TP
+.I /proc/fs/fscache/stats
+Real-time fscache counters; useful for monitoring cache hit rates.
+.TP
+.I /proc/fs/fscache/caches
+Lists active caches; the daemon's
+.B tag
+appears here.
+.TP
+.I /proc/fs/nfsfs/volumes
+Lists NFS mounts; the
+.B FSC
+column shows which mounts have caching enabled.
+.SH ENVIRONMENT
+.TP
+.B RUST_LOG
+Tracing-subscriber filter directive.
+.SH SEE ALSO
+.BR cachefilesd (8),
+.BR mount.nfs (8)
+.PP
+.B Documentation/filesystems/caching/cachefiles.rst
+in the Linux kernel source.
+.SH AUTHORS
+nfs-cachefs is licensed under the MIT license.
