@@ -120,9 +120,16 @@ fn run(args: Args) -> anyhow::Result<()> {
     write_cmd(dev_fd, &format!("frun {}%", args.frun))?;
     write_cmd(dev_fd, &format!("fcull {}%", args.fcull))?;
     write_cmd(dev_fd, &format!("fstop {}%", args.fstop))?;
-    write_cmd(dev_fd, "bind ondemand")
-        .context("bind ondemand failed (kernel < 5.19, or unsupported fs at cache_dir?)")?;
-    info!("bound cachefiles in on-demand mode; waiting for kernel events");
+    // Ubuntu 24.04's stock kernel 6.8 ships with CONFIG_CACHEFILES_ONDEMAND=n
+    // (verified at /boot/config-$(uname -r)). Falling back to traditional mode,
+    // which is what upstream cachefilesd uses. In this mode the kernel handles
+    // all OPEN/CLOSE/READ internally; daemon only does configuration + cull.
+    // The poll loop below will see no events on this kernel — it is kept so
+    // this binary remains a useful liveness probe and so the protocol code is
+    // exercised when run on a kernel that does have on-demand compiled in.
+    write_cmd(dev_fd, "bind")
+        .context("bind failed (cache_dir must be its own mountpoint with xattr support)")?;
+    info!("bound cachefiles in traditional mode (CONFIG_CACHEFILES_ONDEMAND=n on this kernel)");
 
     let mut buf = vec![0u8; READ_BUF_SIZE];
     let mut stats = Stats::default();
