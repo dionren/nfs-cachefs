@@ -1,12 +1,70 @@
 # nfs-cachefs — agent notes
 
 Rust userspace daemon for the Linux kernel's **fscache + cachefiles** path.
-Drop-in replacement for the stagnant upstream `cachefilesd`. Targets
-Ubuntu 24.04 / kernel 6.8.
+Drop-in replacement for the stagnant upstream `cachefilesd`. Minimum
+supported platform is **Ubuntu 24.04 LTS / kernel 6.8**.
 
 Read first: `README.md`, `docs/architecture.md`. The plan that drove the
 current rewrite is at `~/.claude/plans/fs-cache-squishy-umbrella.md` —
 includes P0 verification results and the on-demand → traditional pivot.
+
+## Test machine
+
+Primary remote test box. Credentials are out-of-band — never write the
+password into the repo.
+
+- Host: `cy-ah85009` at `10.20.100.9`, SSH as `root`.
+- OS: Ubuntu 24.04.3 LTS, kernel `6.8.0-71-generic`.
+- Hardware: 96 cores, 503 GiB RAM.
+- NVMe: `/dev/nvme0n1` mounted at `/mnt/nvme` (xfs, 7.0 TiB, ~2 % used —
+  plenty of room). Don't reformat the mount; carve a dedicated cache
+  backing image under a subdir (`/mnt/nvme/nfs-cachefs-test/cache.img`)
+  and loop-mount it (cachefiles requires the cache dir to be its own
+  mountpoint).
+- Cachefiles: `CONFIG_CACHEFILES=m` (built, not autoloaded —
+  `modprobe cachefiles` before starting the daemon). 24.04 ships
+  `CONFIG_CACHEFILES_ONDEMAND=n`, so traditional mode is the only path.
+- `/mnt/llm-data` is **already mounted at boot** via fstab +
+  `x-systemd.automount` (without `fsc`). To test, stop the automount
+  unit and remount with `fsc` (see workflow). Don't edit fstab.
+- Toolchain: **none, on purpose**. The test box is a deployment target,
+  not a build host (see workflow below).
+
+### Test workflow (build here, deploy there)
+
+- **Always build on the dev host (where this repo lives), never on the
+  test box.** Don't `cargo build` over SSH. Deploy the stripped release
+  binary; no toolchain on the test box. Dev box and test box are both
+  Ubuntu 24.04 / glibc 2.39, so binary compat is trivial.
+  ```sh
+  cargo build --release
+  scp target/release/nfs-cachefs root@10.20.100.9:/usr/local/sbin/
+  ```
+- **Cache directory** — `/mnt/nvme/nfs-cachefs-test/cache.img` (loop image)
+  mounted at `/var/cache/fscache`:
+  ```sh
+  mkdir -p /mnt/nvme/nfs-cachefs-test /var/cache/fscache
+  truncate -s 100G /mnt/nvme/nfs-cachefs-test/cache.img
+  mkfs.xfs /mnt/nvme/nfs-cachefs-test/cache.img
+  mount -o loop /mnt/nvme/nfs-cachefs-test/cache.img /var/cache/fscache
+  ```
+- **NFS test mount sequence.** `/mnt/llm-data` is already up via systemd
+  automount, **without** `fsc`. To test:
+  ```sh
+  modprobe cachefiles                          # load kernel module
+  /usr/local/sbin/nfs-cachefs &                # start daemon (binds /dev/cachefiles)
+  systemctl stop mnt-llm\\x2ddata.automount    # disable auto-remount
+  umount /mnt/llm-data
+  mount -t nfs -o vers=3,proto=tcp,fsc,timeo=60,retrans=2,nconnect=4,\
+  noatime,nodiratime,nolock,nocto,actimeo=60,acregmax=3600 \
+  10.20.66.203:/mnt/suanyun/llm-data /mnt/llm-data
+  ```
+  **Daemon must be bound before the fsc mount** — fsc on an unbound system
+  silently falls back to "no caching" without erroring. After testing,
+  `systemctl start mnt-llm\\x2ddata.automount` to restore the box default.
+- **Module load**: `cachefiles.ko` is in-tree on 24.04 but not autoloaded.
+  This is the *kernel module* — distinct from the legacy userspace
+  `cachefilesd` daemon (the package this project replaces).
 
 ## Repo layout
 
@@ -42,9 +100,10 @@ codegen unit, stripped symbols → ~1.9 MB stripped binary.
 ## Hard constraints (don't fight these)
 
 - **Traditional mode only.** Stock Ubuntu 24.04 kernel ships with
-  `CONFIG_CACHEFILES_ONDEMAND=n` (verify via `/boot/config-$(uname -r)`).
-  `bind ondemand` is rejected by the kernel. Daemon role is configurator
-  + cull driver, **not** per-request mediator.
+  `CONFIG_CACHEFILES_ONDEMAND=n` (verify via
+  `grep CACHEFILES /boot/config-$(uname -r)`). `bind ondemand` is
+  rejected by the kernel. Daemon role is configurator + cull driver,
+  **not** per-request mediator.
 - **Cache dir must be its own mountpoint.** `bind` returns `EINVAL`
   otherwise. Test setup uses a loop-mounted ext4 image.
 - **Only one daemon can hold `/dev/cachefiles`.** Open returns `EBUSY` if
@@ -79,23 +138,39 @@ codegen unit, stripped symbols → ~1.9 MB stripped binary.
 ## Verification commands (kernel side)
 
 ```
-cat /proc/fs/nfsfs/volumes        # FSC column = yes after fsc mount
-cat /proc/fs/fscache/caches       # state column = A (active)
-cat /proc/fs/fscache/stats        # IO rd/wr counters move on access
-cat /proc/fs/fscache/cookies      # per-object cookies
-journalctl -u nfs-cachefs -f      # daemon logs
+cat /proc/fs/nfsfs/volumes        # FSC column = yes for fsc-mounted volumes
+cat /proc/fs/fscache/caches       # state column = A (active) after bind
+cat /proc/fs/fscache/volumes      # one row per fsc-mounted NFS server
+cat /proc/fs/fscache/stats        # Stores/RdHelp counters move on access
+cat /proc/fs/fscache/cookies      # per-object cookies (NFS.server entries)
+ls /var/cache/fscache/{cache,graveyard}   # cachefiles creates these on bind
+journalctl -u nfs-cachefs -f      # daemon logs (or /var/log/nfs-cachefs.log if running raw)
 ```
 
 ## Performance baseline (already validated)
 
-Loop-ext4 backing in QEMU on the user's NFSv3 setup:
-- 1 GB cold read: ~850 MB/s (network-bound)
-- 1 GB hot read: ~750–950 MB/s (loop ext4 / VM disk-bound)
-- fscache `IO rd` += 1025 per 1 GB hot read (confirms cache-hit path)
+Real-hardware run on `cy-ah85009` (Ubuntu 24.04, kernel 6.8, WD
+Ultrastar DC SN640 PCIe Gen3 x4 NVMe; loop-xfs cache image on host xfs;
+NFSv3 against 10.20.66.203; single 844 MB safetensors shard):
 
-On real PCIe 5.0 NVMe + DDR5 expect single-digit GB/s on hot reads. The
-FUSE-based predecessor topped out at ~25–40% of NVMe; that's the reason
-for the rewrite — don't reintroduce a FUSE/userspace data path.
+| path | bs / mode | throughput |
+|------|-----------|------------|
+| raw `/dev/nvme0n1` direct | 4M direct | 1.9 GB/s |
+| raw xfs file, direct      | 4M direct | 1.6 GB/s |
+| raw xfs file, pagecache   | 1M after drop_caches | 730–970 MB/s |
+| **NFS cold (network → cache)** | 1M after drop_caches | **695 MB/s** |
+| **NFS hot (fscache hit, pagecache)** | 1M after drop_caches | **1.8 GB/s** |
+| NFS hot, direct I/O       | 4M direct | 1.2 GB/s |
+
+Hot pagecache reads exceed raw xfs+pagecache for the same file, likely
+from NFS netfs read-ahead being more aggressive than xfs's. Hot direct
+I/O at ~75 % of raw xfs direct quantifies the real cost of the
+cachefiles + loop layering — about 25 % overhead, well within budget.
+Cold is network-limited (~5 Gbps NIC).
+
+The FUSE-based predecessor topped out at ~25–40 % of NVMe — the whole
+point of this rewrite is staying on the kernel data path. Don't
+reintroduce a FUSE/userspace data path.
 
 ## Testing
 

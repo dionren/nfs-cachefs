@@ -2,7 +2,7 @@
 
 A Rust userspace daemon for the Linux kernel's **fscache + cachefiles**.
 Drop-in replacement for the stagnant upstream `cachefilesd`, built and
-tested on Ubuntu 24.04 / kernel 6.8.
+tested on Ubuntu 24.04 LTS / kernel 6.8 (minimum supported).
 
 The daemon's job is to make NFS reads transparently cache to local NVMe by
 configuring the kernel's `cachefiles` backend and culling old objects when
@@ -16,9 +16,9 @@ App → VFS → NFS client (-o fsc) → fscache → cachefiles.ko ↔ nfs-cachef
 ```
 
 This is **traditional cachefiles mode**: the daemon does configuration and
-cull, not per-request mediation. On-demand mode (kernel ≥ 5.19) is not used
-because Ubuntu 24.04 ships with `CONFIG_CACHEFILES_ONDEMAND=n`. See the
-P0 verification finding in
+cull, not per-request mediation. On-demand mode (kernel ≥ 5.19) is not
+used because Ubuntu 24.04 ships with `CONFIG_CACHEFILES_ONDEMAND=n`. See
+the P0 verification finding in
 `~/.claude/plans/fs-cache-squishy-umbrella.md`.
 
 ## Build

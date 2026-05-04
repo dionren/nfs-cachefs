@@ -7,9 +7,8 @@
 - **Approach native NVMe bandwidth on cache hits**: avoids the FUSE-style
   triple-memcpy cost that would otherwise cap throughput at ~25–40% of
   PCIe 5.0 NVMe.
-- **Modern kernel only**: targets Linux 6.x, primarily Ubuntu 24.04
-  (kernel 6.8). The legacy `cachefilesd` does not run cleanly on this
-  release.
+- **Modern kernel only**: minimum Ubuntu 24.04 LTS / kernel 6.8. The
+  legacy `cachefilesd` does not run cleanly on this release.
 
 ## Stack
 
