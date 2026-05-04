@@ -2,8 +2,8 @@
 # End-to-end test for nfs-cachefs against a real NFS server.
 #
 # Usage:
-#   sudo NFS_SERVER=10.20.66.203 NFS_EXPORT=/mnt/suanyun/llm-data \
-#        TEST_FILE=/mnt/llm-data/some/large/file \
+#   sudo NFS_SERVER=<server-ip> NFS_EXPORT=<export-path> \
+#        TEST_FILE=<path-to-large-file-on-mount> \
 #        tests/e2e/nfs-fscache.sh
 #
 # Prerequisites: kernel cachefiles module, nfs-common, the binary built at
@@ -14,7 +14,7 @@ set -euo pipefail
 
 NFS_SERVER="${NFS_SERVER:?set NFS_SERVER}"
 NFS_EXPORT="${NFS_EXPORT:?set NFS_EXPORT}"
-NFS_MOUNT="${NFS_MOUNT:-/mnt/llm-data}"
+NFS_MOUNT="${NFS_MOUNT:-/mnt/nfs-test}"
 TEST_FILE="${TEST_FILE:-${NFS_MOUNT}/test-bigfile}"
 TEST_SIZE_MB="${TEST_SIZE_MB:-1024}"
 CACHE_DIR="${CACHE_DIR:-/var/cache/fscache}"

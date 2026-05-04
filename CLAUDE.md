@@ -4,67 +4,32 @@ Rust userspace daemon for the Linux kernel's **fscache + cachefiles** path.
 Drop-in replacement for the stagnant upstream `cachefilesd`. Minimum
 supported platform is **Ubuntu 24.04 LTS / kernel 6.8**.
 
-Read first: `README.md`, `docs/architecture.md`. The plan that drove the
-current rewrite is at `~/.claude/plans/fs-cache-squishy-umbrella.md` —
-includes P0 verification results and the on-demand → traditional pivot.
+Read first: `README.md`, `docs/architecture.md`.
 
 ## Test machine
 
-Primary remote test box. Credentials are out-of-band — never write the
-password into the repo.
+There is a remote test box used to validate every change end-to-end
+against a real NFS server. **Don't put host names, IPs, paths, or
+credentials in this repo** — those live in agent memory (search for
+"test machine" / "test_machine_setup" entries). The repo only encodes
+the generic invariants below.
 
-- Host: `cy-ah85009` at `10.20.100.9`, SSH as `root`.
-- OS: Ubuntu 24.04.3 LTS, kernel `6.8.0-71-generic`.
-- Hardware: 96 cores, 503 GiB RAM.
-- NVMe: `/dev/nvme0n1` mounted at `/mnt/nvme` (xfs, 7.0 TiB, ~2 % used —
-  plenty of room). Don't reformat the mount; carve a dedicated cache
-  backing image under a subdir (`/mnt/nvme/nfs-cachefs-test/cache.img`)
-  and loop-mount it (cachefiles requires the cache dir to be its own
-  mountpoint).
-- Cachefiles: `CONFIG_CACHEFILES=m` (built, not autoloaded —
-  `modprobe cachefiles` before starting the daemon). 24.04 ships
-  `CONFIG_CACHEFILES_ONDEMAND=n`, so traditional mode is the only path.
-- `/mnt/llm-data` is **already mounted at boot** via fstab +
-  `x-systemd.automount` (without `fsc`). To test, stop the automount
-  unit and remount with `fsc` (see workflow). Don't edit fstab.
-- Toolchain: **none, on purpose**. The test box is a deployment target,
-  not a build host (see workflow below).
-
-### Test workflow (build here, deploy there)
-
-- **Always build on the dev host (where this repo lives), never on the
-  test box.** Don't `cargo build` over SSH. Deploy the stripped release
-  binary; no toolchain on the test box. Dev box and test box are both
-  Ubuntu 24.04 / glibc 2.39, so binary compat is trivial.
-  ```sh
-  cargo build --release
-  scp target/release/nfs-cachefs root@10.20.100.9:/usr/local/sbin/
-  ```
-- **Cache directory** — `/mnt/nvme/nfs-cachefs-test/cache.img` (loop image)
-  mounted at `/var/cache/fscache`:
-  ```sh
-  mkdir -p /mnt/nvme/nfs-cachefs-test /var/cache/fscache
-  truncate -s 100G /mnt/nvme/nfs-cachefs-test/cache.img
-  mkfs.xfs /mnt/nvme/nfs-cachefs-test/cache.img
-  mount -o loop /mnt/nvme/nfs-cachefs-test/cache.img /var/cache/fscache
-  ```
-- **NFS test mount sequence.** `/mnt/llm-data` is already up via systemd
-  automount, **without** `fsc`. To test:
-  ```sh
-  modprobe cachefiles                          # load kernel module
-  /usr/local/sbin/nfs-cachefs &                # start daemon (binds /dev/cachefiles)
-  systemctl stop mnt-llm\\x2ddata.automount    # disable auto-remount
-  umount /mnt/llm-data
-  mount -t nfs -o vers=3,proto=tcp,fsc,timeo=60,retrans=2,nconnect=4,\
-  noatime,nodiratime,nolock,nocto,actimeo=60,acregmax=3600 \
-  10.20.66.203:/mnt/suanyun/llm-data /mnt/llm-data
-  ```
-  **Daemon must be bound before the fsc mount** — fsc on an unbound system
-  silently falls back to "no caching" without erroring. After testing,
-  `systemctl start mnt-llm\\x2ddata.automount` to restore the box default.
-- **Module load**: `cachefiles.ko` is in-tree on 24.04 but not autoloaded.
-  This is the *kernel module* — distinct from the legacy userspace
-  `cachefilesd` daemon (the package this project replaces).
+- **Build on the dev host, deploy stripped release binary.** Test box
+  has no toolchain on purpose; never `cargo build` over SSH. Both ends
+  are Ubuntu 24.04 / glibc 2.39 so the binary copies cleanly.
+- **Module is in-tree but not autoloaded** on 24.04 — `modprobe
+  cachefiles` before launching the daemon. (`cachefiles.ko` is the
+  *kernel* module; distinct from the legacy userspace `cachefilesd`
+  this project replaces.)
+- **Cache dir convention**: a loop-mounted xfs image on the test box's
+  NVMe, mounted at `/var/cache/fscache`. The cache dir must be its own
+  mountpoint (`bind` returns `EINVAL` otherwise).
+- **NFS mount on the test box is managed by `x-systemd.automount`
+  without `fsc`.** To test, stop the automount unit, `umount`, then
+  remount with `fsc`. Restart the automount unit when done. Don't
+  edit fstab on the test box.
+- **Daemon must be bound before any `mount -o fsc`.** Otherwise the
+  mount silently falls back to no-caching with no error logged.
 
 ## Repo layout
 
@@ -105,7 +70,8 @@ codegen unit, stripped symbols → ~1.9 MB stripped binary.
   rejected by the kernel. Daemon role is configurator + cull driver,
   **not** per-request mediator.
 - **Cache dir must be its own mountpoint.** `bind` returns `EINVAL`
-  otherwise. Test setup uses a loop-mounted ext4 image.
+  otherwise. xfs or ext4 (with `user_xattr`) on a dedicated partition
+  or loop image both work.
 - **Only one daemon can hold `/dev/cachefiles`.** Open returns `EBUSY` if
   another holds it. There is **no `unbind` command** — closing the fd
   unbinds (kernel 6.8 returns `ENOTSUPP` on `unbind`). `Device::Drop`
@@ -149,9 +115,9 @@ journalctl -u nfs-cachefs -f      # daemon logs (or /var/log/nfs-cachefs.log if 
 
 ## Performance baseline (already validated)
 
-Real-hardware run on `cy-ah85009` (Ubuntu 24.04, kernel 6.8, WD
-Ultrastar DC SN640 PCIe Gen3 x4 NVMe; loop-xfs cache image on host xfs;
-NFSv3 against 10.20.66.203; single 844 MB safetensors shard):
+Real-hardware run on Ubuntu 24.04 / kernel 6.8, WD Ultrastar DC SN640
+PCIe Gen3 x4 NVMe, loop-xfs cache image on host xfs, NFSv3 over a
+~5 Gbps NIC, single 844 MB safetensors shard:
 
 | path | bs / mode | throughput |
 |------|-----------|------------|
@@ -166,7 +132,7 @@ Hot pagecache reads exceed raw xfs+pagecache for the same file, likely
 from NFS netfs read-ahead being more aggressive than xfs's. Hot direct
 I/O at ~75 % of raw xfs direct quantifies the real cost of the
 cachefiles + loop layering — about 25 % overhead, well within budget.
-Cold is network-limited (~5 Gbps NIC).
+Cold is network-limited.
 
 The FUSE-based predecessor topped out at ~25–40 % of NVMe — the whole
 point of this rewrite is staying on the kernel data path. Don't

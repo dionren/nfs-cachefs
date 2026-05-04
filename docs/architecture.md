@@ -70,9 +70,9 @@ on-demand enabled would not be a natural fit for NFS, because the NFS
 client itself populates the cache via fscache writes — there's nothing for
 the daemon to fetch.
 
-Traditional mode also yields the simplest daemon: ~700 LOC of Rust to do
-configuration, monitor `/proc/fs/fscache/stats`-equivalent state, and
-drive cull.
+Traditional mode also yields the simplest daemon: ~900 LOC of production
+Rust (plus a ~300 LOC diagnostic probe binary) to do configuration,
+monitor `/proc/fs/fscache/stats`-equivalent state, and drive cull.
 
 ## Protocol
 
@@ -111,6 +111,30 @@ cull=N frun=H fcull=H fstop=H brun=H bcull=H bstop=H
 current free counts in hex (no `0x` prefix). The kernel sets the device
 readable when it wants the daemon to re-evaluate.
 
+## Cache sizing
+
+There is no fixed-bytes cache limit. The cache fills the backing
+filesystem you mount at `cache_dir`; "size" is shaped by three percentage
+thresholds the kernel evaluates against `statfs(cache_dir)`:
+
+| key                  | role         | default |
+|----------------------|--------------|--------:|
+| `brun`  / `frun`     | cull target — daemon stops culling once free reaches this | 10 % |
+| `bcull` / `fcull`    | low-water  — kernel sets `cull=1` below this              |  7 % |
+| `bstop` / `fstop`    | hard floor — kernel refuses new caching below this        |  3 % |
+
+`b*` apply to blocks (capacity); `f*` to inodes (file count). The daemon
+validates `stop < cull < run ≤ 100` both at config load
+(`Config::validate`) and right before sending the limit commands
+(`ConfigCmd::apply_and_bind`).
+
+So a 100 G cache fs with defaults effectively oscillates between roughly
+93 G and 90 G of cached data: kernel signals `cull=1` at 93 G occupied
+(7 % free); daemon evicts oldest-by-atime until 90 G occupied (10 % free)
+and stops. Want a smaller working set? Make the backing fs smaller, or
+raise `bcull` / `brun` to leave more headroom. There is intentionally no
+absolute-bytes knob — the kernel protocol is percentage-only.
+
 ## Cull algorithm
 
 When `cull=1`:
@@ -140,19 +164,31 @@ objects without keeping a persistent index in memory.
 | cull command races against kernel use | EBUSY; daemon skips and tries next |
 | malformed state line from kernel | logged as warn; loop continues |
 
-## Performance expectations
+## Performance baseline
 
-Validated in a QEMU VM with loop-ext4 backing (the user's NFSv3 setup):
+Validated on bare-metal Ubuntu 24.04 / kernel 6.8, WD Ultrastar DC SN640
+PCIe Gen3 ×4 NVMe, loop-xfs cache image on host xfs, NFSv3 over a
+~5 Gbps NIC, single 844 MB safetensors shard:
 
-| read | result | bottleneck |
-|------|--------|-----------|
-| 1 GB cold (fresh page cache) | ~850 MB/s | network bandwidth |
-| 1 GB hot (after drop_caches) | ~750–950 MB/s | loop ext4 / VM disk |
-| fscache IO `rd` counter | +1025 per 1 GB hot | confirms cache hit path |
-| cache dir size after 1 GB read | 1.1 GB sparse file (logical 4.97 GB = source size) | sparse population |
+| path                                | bs / mode                | throughput  |
+|-------------------------------------|--------------------------|------------:|
+| raw `/dev/nvme0n1` direct           | 4 MiB direct             | 1.9 GB/s    |
+| raw xfs file, direct                | 4 MiB direct             | 1.6 GB/s    |
+| raw xfs file, page cache            | 1 MiB after drop_caches  | 730–970 MB/s|
+| **NFS cold (network → cache)**      | 1 MiB after drop_caches  | **695 MB/s**|
+| **NFS hot (fscache hit, pagecache)**| 1 MiB after drop_caches  | **1.8 GB/s**|
+| NFS hot, direct I/O                 | 4 MiB direct             | 1.2 GB/s    |
 
-On real PCIe 5.0 NVMe + DDR5 expect single-digit GB/s on hot reads. Cold
-reads are bounded by NFS network bandwidth regardless.
+Hot pagecache reads exceed raw xfs+pagecache for the same file, likely
+because NFS netfs read-ahead is more aggressive than xfs's. Hot direct
+I/O at ~75 % of raw xfs direct quantifies the real cost of the
+cachefiles + loop layering — about 25 % overhead, well within budget.
+Cold is network-limited.
+
+The FUSE-based predecessor (wiped in commit `76f5744`) topped out at
+~25–40 % of NVMe — the whole point of this rewrite is staying on the
+kernel data path. Don't reintroduce a FUSE/userspace data path. On
+PCIe 5.0 NVMe + DDR5 expect proportionally higher ceilings.
 
 ## Why no tokio / dashmap / parking_lot
 

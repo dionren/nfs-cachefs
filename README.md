@@ -17,9 +17,10 @@ App → VFS → NFS client (-o fsc) → fscache → cachefiles.ko ↔ nfs-cachef
 
 This is **traditional cachefiles mode**: the daemon does configuration and
 cull, not per-request mediation. On-demand mode (kernel ≥ 5.19) is not
-used because Ubuntu 24.04 ships with `CONFIG_CACHEFILES_ONDEMAND=n`. See
-the P0 verification finding in
-`~/.claude/plans/fs-cache-squishy-umbrella.md`.
+used because Ubuntu 24.04 ships with `CONFIG_CACHEFILES_ONDEMAND=n`
+(verify with `grep CACHEFILES /boot/config-$(uname -r)`). See
+[`docs/architecture.md`](docs/architecture.md) for the full rationale and
+protocol details.
 
 ## Build
 
@@ -49,11 +50,16 @@ Override paths via `PREFIX`, `SYSCONFDIR`, `SYSTEMD_UNIT_DIR`, `MANDIR`.
    # Example: dedicated NVMe partition
    sudo mkfs.xfs /dev/nvme0n1p1
    sudo mount /dev/nvme0n1p1 /var/cache/fscache
-   # Or: loop-backed for testing
+   # Or: loop-backed (validated path; xfs preferred — no extra mount opts needed)
    sudo truncate -s 100G /var/lib/nfs-cachefs.img
-   sudo mkfs.ext4 /var/lib/nfs-cachefs.img
-   sudo mount -o loop,user_xattr /var/lib/nfs-cachefs.img /var/cache/fscache
+   sudo mkfs.xfs   /var/lib/nfs-cachefs.img
+   sudo mount -o loop /var/lib/nfs-cachefs.img /var/cache/fscache
    ```
+
+   The size of this filesystem is the upper bound on the cache. There is no
+   `max_size` knob in `daemon.toml` — the cache fills the backing fs and
+   the kernel triggers cull when free space drops below the `bcull` /
+   `fcull` percentages (see `[limits]` in the config).
 
 2. Edit `/etc/nfs-cachefs/daemon.toml` if you want non-default thresholds
    or a different cache directory.
@@ -65,11 +71,27 @@ Override paths via `PREFIX`, `SYSCONFDIR`, `SYSTEMD_UNIT_DIR`, `MANDIR`.
    sudo systemctl status nfs-cachefs
    ```
 
-4. Add `fsc` to your NFS mount options. For the user's setup:
+4. Add `fsc` to your NFS mount options. Full fstab example (one logical
+   line; backslashes shown only for typesetting):
 
    ```
-   10.20.66.203:/mnt/suanyun/llm-data  /mnt/llm-data  nfs  fsc,timeo=60,...  0 0
+   server:/export  /mnt/data  nfs  \
+     vers=3,proto=tcp,fsc,timeo=60,retrans=2,nconnect=4,noatime,nodiratime,\
+     nolock,nocto,actimeo=60,acregmax=3600,_netdev  0  0
    ```
+
+   Or with systemd lazy-mount:
+
+   ```
+   server:/export  /mnt/data  nfs  \
+     vers=3,proto=tcp,fsc,...,_netdev,x-systemd.automount,\
+     x-systemd.idle-timeout=600  0  0
+   ```
+
+   The systemd unit ships with `Before=remote-fs-pre.target`, so
+   `nfs-cachefs` starts before any standard NFS mount in `/etc/fstab`.
+   **This ordering is load-bearing**: if the NFS mount races ahead of the
+   daemon, `fsc` silently falls back to no-caching with no error logged.
 
 5. Verify caching is wired up.
 
@@ -79,10 +101,30 @@ Override paths via `PREFIX`, `SYSCONFDIR`, `SYSTEMD_UNIT_DIR`, `MANDIR`.
    cat /proc/fs/fscache/stats        # IO rd/wr counters move on access
    ```
 
-## Verification
+## How the cache is sized and culled
 
-End-to-end performance check after the daemon is running and NFS is
-mounted with `fsc`:
+There is no fixed-bytes cache limit. The cache fills the backing
+filesystem; the kernel watches its free-space and inode percentages and
+asks the daemon to start deleting LRU objects when space gets tight.
+Three percentage thresholds control this (defaults shown):
+
+| key   | default | meaning                                                  |
+|-------|---------|----------------------------------------------------------|
+| `run` | 10 %    | free-space target — daemon culls until free ≥ this       |
+| `cull`| 7 %     | low-water mark — kernel signals daemon to start culling  |
+| `stop`| 3 %     | hard floor — kernel refuses new caching below this       |
+
+Each appears twice: `b*` for blocks (capacity), `f*` for inodes (file
+count). Required ordering: `stop < cull < run ≤ 100`. A 100 G cache fs
+with defaults effectively keeps cache size around 90–93 G and starts
+shedding the oldest-by-atime objects when it hits 93 G. See `daemon.toml`
+to retune. Cull walks the cache directory in batches of `cull.batch_size`
+(default 1024) per pass.
+
+## Performance
+
+End-to-end check after the daemon is running and NFS is mounted with
+`fsc`:
 
 ```sh
 TESTFILE=/mnt/your-nfs/large-file
@@ -92,10 +134,22 @@ echo 3 | sudo tee /proc/sys/vm/drop_caches
 sudo dd if="$TESTFILE" of=/dev/null bs=1M count=1024 status=progress  # hot
 ```
 
-The hot read should saturate the cache backing storage (≫ network
-bandwidth on PCIe 5.0 NVMe). Validated on the user's NFSv3 setup with a
-loop-ext4 cache: cold = 851 MB/s (network), hot = 739 MB/s (loop ext4 on
-QEMU disk). On real NVMe expect multi-GB/s on hot reads.
+Validated on bare-metal Ubuntu 24.04 / kernel 6.8, WD Ultrastar DC SN640
+PCIe Gen3 ×4 NVMe, loop-xfs cache image, NFSv3 over ~5 Gbps NIC, single
+844 MB safetensors shard:
+
+| read mode                          | throughput |
+|------------------------------------|-----------:|
+| cold (network → cache, 1 MiB bs)   | **695 MB/s** |
+| hot, page cache (1 MiB bs)         | **1.8 GB/s** |
+| hot, direct I/O (4 MiB bs)         | 1.2 GB/s   |
+
+Cold throughput is network-limited. Hot pagecache reads exceed
+local-xfs+pagecache for the same file (~730–970 MB/s) because NFS netfs
+read-ahead is more aggressive than xfs's. Hot direct I/O at ~75 % of raw
+xfs direct quantifies the cachefiles + loop layering overhead at about
+25 %. The FUSE-based predecessor maxed out at 25–40 % of NVMe; the whole
+point of this rewrite is staying on the kernel data path.
 
 ## Diagnostics
 
