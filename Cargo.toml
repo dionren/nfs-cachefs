@@ -3,7 +3,7 @@ name = "nfs-cachefs"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.75"
-description = "Userspace daemon for Linux kernel fscache + cachefiles on-demand mode (NFS read caching backed by NVMe)"
+description = "Userspace daemon for Linux kernel fscache + cachefiles traditional mode (NFS read caching backed by NVMe)"
 license = "MIT"
 readme = "README.md"
 

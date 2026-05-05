@@ -5,11 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use clap::Parser;
 use tracing::{error, info};
 
-mod config;
-mod cull;
-mod daemon;
-mod error;
-mod proto;
+use nfs_cachefs::{config, cull, daemon, proto, signals};
 
 #[derive(Parser, Debug)]
 #[command(version, about = "Userspace daemon for Linux fscache + cachefiles (traditional mode)")]
@@ -26,7 +22,7 @@ struct Args {
 static STOP: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn handle_signal(_sig: i32) {
-    STOP.store(true, Ordering::SeqCst);
+    STOP.store(true, Ordering::Relaxed);
 }
 
 fn main() -> ExitCode {
@@ -40,9 +36,9 @@ fn main() -> ExitCode {
         }
     };
 
-    init_tracing(&args.log_level.as_deref().unwrap_or(&cfg.log.level), &cfg.log.format);
+    init_tracing(args.log_level.as_deref().unwrap_or(&cfg.log.level), &cfg.log.format);
 
-    if let Err(e) = install_signal_handlers() {
+    if let Err(e) = signals::install(handle_signal) {
         error!(error = %e, "failed to install signal handlers");
         return ExitCode::FAILURE;
     }
@@ -96,22 +92,4 @@ fn init_tracing(level: &str, format: &str) {
             builder.compact().init();
         }
     }
-}
-
-fn install_signal_handlers() -> error::Result<()> {
-    use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal};
-    let action = SigAction::new(
-        SigHandler::Handler(handle_signal),
-        SaFlags::empty(),
-        SigSet::empty(),
-    );
-    unsafe {
-        sigaction(Signal::SIGTERM, &action).map_err(|e| {
-            error::Error::Io(std::io::Error::other(format!("sigaction(SIGTERM): {e}")))
-        })?;
-        sigaction(Signal::SIGINT, &action).map_err(|e| {
-            error::Error::Io(std::io::Error::other(format!("sigaction(SIGINT): {e}")))
-        })?;
-    }
-    Ok(())
 }

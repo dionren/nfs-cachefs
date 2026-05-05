@@ -98,9 +98,11 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.tag.is_empty() || self.tag.contains(char::is_whitespace) {
-            return Err(Error::config("tag must be non-empty and whitespace-free"));
-        }
+        crate::proto::cmd::validate_config_args(
+            &self.cache_dir,
+            &self.tag,
+            self.secctx.as_deref(),
+        )?;
         let l = &self.limits;
         for (label, s, c, r) in [
             ("b", l.bstop, l.bcull, l.brun),
@@ -163,6 +165,29 @@ mod tests {
             fstop = 3
         "#;
         let cfg: Config = toml::from_str(s).unwrap();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_protocol_breaks_in_command_args() {
+        let mut cfg = Config {
+            cache_dir: PathBuf::from("/var/cache/fscache"),
+            tag: "nfscache".into(),
+            secctx: None,
+            limits: Limits::default(),
+            cull: Cull::default(),
+            log: Log::default(),
+        };
+
+        cfg.tag = "bad\nbind".into();
+        assert!(cfg.validate().is_err());
+
+        cfg.tag = "nfscache".into();
+        cfg.cache_dir = PathBuf::from("/var/cache/fs cache");
+        assert!(cfg.validate().is_err());
+
+        cfg.cache_dir = PathBuf::from("/var/cache/fscache");
+        cfg.secctx = Some("ctx\nbind".into());
         assert!(cfg.validate().is_err());
     }
 }

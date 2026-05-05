@@ -23,6 +23,15 @@ SBINDIR="${SBINDIR:-${PREFIX}/sbin}"
 SYSCONFDIR="${SYSCONFDIR:-/etc}"
 SYSTEMD_UNIT_DIR="${SYSTEMD_UNIT_DIR:-/lib/systemd/system}"
 CACHE_DIR="${CACHE_DIR:-/var/cache/fscache}"
+DEFAULT_CACHE_DIR="/var/cache/fscache"
+
+sed_replacement_escape() {
+    local s=$1
+    s=${s//\\/\\\\}
+    s=${s//&/\\&}
+    s=${s//|/\\|}
+    printf '%s' "$s"
+}
 
 install -d "$SBINDIR"
 install -m 0755 "$BIN_SRC"   "$SBINDIR/nfs-cachefs"
@@ -31,16 +40,29 @@ install -m 0755 "$PROBE_SRC" "$SBINDIR/nfs-cachefs-probe"
 install -d "$SYSCONFDIR/nfs-cachefs"
 if [[ -f "$SYSCONFDIR/nfs-cachefs/daemon.toml" ]]; then
     echo "leaving existing $SYSCONFDIR/nfs-cachefs/daemon.toml in place"
+    if [[ "$CACHE_DIR" != "$DEFAULT_CACHE_DIR" ]]; then
+        echo "note: CACHE_DIR updates the installed unit; verify the existing daemon.toml cache_dir matches" >&2
+    fi
     install -m 0644 packaging/etc/nfs-cachefs/daemon.toml \
         "$SYSCONFDIR/nfs-cachefs/daemon.toml.dist"
 else
     install -m 0644 packaging/etc/nfs-cachefs/daemon.toml \
         "$SYSCONFDIR/nfs-cachefs/daemon.toml"
+    if [[ "$CACHE_DIR" != "$DEFAULT_CACHE_DIR" ]]; then
+        escaped_cache_dir=$(sed_replacement_escape "$CACHE_DIR")
+        sed -i "s|^cache_dir = .*|cache_dir = \"$escaped_cache_dir\"|" \
+            "$SYSCONFDIR/nfs-cachefs/daemon.toml"
+    fi
 fi
 
 install -d "$SYSTEMD_UNIT_DIR"
 install -m 0644 packaging/systemd/nfs-cachefs.service \
     "$SYSTEMD_UNIT_DIR/nfs-cachefs.service"
+if [[ "$CACHE_DIR" != "$DEFAULT_CACHE_DIR" ]]; then
+    escaped_cache_dir=$(sed_replacement_escape "$CACHE_DIR")
+    sed -i "s|^ReadWritePaths=.*|ReadWritePaths=$escaped_cache_dir|" \
+        "$SYSTEMD_UNIT_DIR/nfs-cachefs.service"
+fi
 
 MANDIR="${MANDIR:-${PREFIX}/share/man/man8}"
 install -d "$MANDIR"

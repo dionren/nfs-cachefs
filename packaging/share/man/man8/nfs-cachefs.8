@@ -50,6 +50,11 @@ environment variable takes precedence if set.
 .I /etc/nfs-cachefs/daemon.toml
 Configuration file. See the comments in the shipped default for the
 schema.
+When changing
+.B cache_dir
+under the packaged systemd unit, update the unit's
+.B ReadWritePaths=
+setting to match.
 .TP
 .I /dev/cachefiles
 Kernel control device.

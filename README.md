@@ -43,26 +43,50 @@ Override paths via `PREFIX`, `SYSCONFDIR`, `SYSTEMD_UNIT_DIR`, `MANDIR`.
 
 ## Configure and run
 
-1. Mount a dedicated filesystem at the cache directory. Cachefiles refuses
-   to use a subdirectory of a host filesystem.
+1. Make `cache_dir` its own mountpoint. Cachefiles refuses a path that
+   isn't a mount root (`mnt->mnt_root == dentry`). Three setups satisfy
+   it; pick the one that matches your disk layout.
+
+   **Recommended — self-bind a subdirectory** of an existing NVMe xfs
+   (no loop driver, no repartitioning):
 
    ```sh
-   # Example: dedicated NVMe partition
+   sudo mkdir -p /mnt/nvme/cache && sudo chmod 0700 /mnt/nvme/cache
+   sudo mount --bind /mnt/nvme/cache /mnt/nvme/cache
+   # persist across reboot:
+   echo '/mnt/nvme/cache  /mnt/nvme/cache  none  bind,x-systemd.requires=mnt-nvme.mount  0 0' \
+     | sudo tee -a /etc/fstab
+   ```
+
+   **Dedicated partition / logical volume** if you have spare disk:
+
+   ```sh
    sudo mkfs.xfs /dev/nvme0n1p1
    sudo mount /dev/nvme0n1p1 /var/cache/fscache
-   # Or: loop-backed (validated path; xfs preferred — no extra mount opts needed)
+   ```
+
+   **Loop-backed image** if you need a fixed-size container on shared fs:
+
+   ```sh
    sudo truncate -s 100G /var/lib/nfs-cachefs.img
    sudo mkfs.xfs   /var/lib/nfs-cachefs.img
    sudo mount -o loop /var/lib/nfs-cachefs.img /var/cache/fscache
    ```
 
-   The size of this filesystem is the upper bound on the cache. There is no
+   On multi-NVMe rigs the bind-mount option avoids ~3 GB/s of loop
+   driver overhead — see [Performance](#performance) for numbers.
+
+   The capacity of this filesystem (or, for bind-mount, the parent fs
+   minus other content) is the upper bound on the cache. There is no
    `max_size` knob in `daemon.toml` — the cache fills the backing fs and
    the kernel triggers cull when free space drops below the `bcull` /
    `fcull` percentages (see `[limits]` in the config).
 
 2. Edit `/etc/nfs-cachefs/daemon.toml` if you want non-default thresholds
-   or a different cache directory.
+   or a different cache directory. If you run under the packaged systemd
+   unit and change `cache_dir` after installation, also add a drop-in that
+   sets `ReadWritePaths=` to the same path; the shipped unit keeps the daemon
+   confined to `/var/cache/fscache` by default.
 
 3. Enable and start.
 
@@ -134,22 +158,38 @@ echo 3 | sudo tee /proc/sys/vm/drop_caches
 sudo dd if="$TESTFILE" of=/dev/null bs=1M count=1024 status=progress  # hot
 ```
 
-Validated on bare-metal Ubuntu 24.04 / kernel 6.8, WD Ultrastar DC SN640
-PCIe Gen3 ×4 NVMe, loop-xfs cache image, NFSv3 over ~5 Gbps NIC, single
-844 MB safetensors shard:
+### Single-thread baseline
 
-| read mode                          | throughput |
-|------------------------------------|-----------:|
-| cold (network → cache, 1 MiB bs)   | **695 MB/s** |
-| hot, page cache (1 MiB bs)         | **1.8 GB/s** |
-| hot, direct I/O (4 MiB bs)         | 1.2 GB/s   |
+Two reference rigs, both Ubuntu 24.04 / kernel 6.8, NFSv3:
 
-Cold throughput is network-limited. Hot pagecache reads exceed
-local-xfs+pagecache for the same file (~730–970 MB/s) because NFS netfs
-read-ahead is more aggressive than xfs's. Hot direct I/O at ~75 % of raw
-xfs direct quantifies the cachefiles + loop layering overhead at about
-25 %. The FUSE-based predecessor maxed out at 25–40 % of NVMe; the whole
-point of this rewrite is staying on the kernel data path.
+| rig | NIC | cache backend | cold | hot |
+|-----|-----|---------------|------|-----|
+| 2× Intel D7-P5510 in md RAID0  | 50 Gbps | **bind-mount** xfs | 0.7–1.2 GB/s | **1.4–1.8 GB/s** |
+| WD Ultrastar SN640 single NVMe | 5 Gbps  | loop-xfs image     | 695 MB/s     | 1.8 GB/s        |
+
+Cold is network-limited on both. Hot equals or exceeds raw xfs
++pagecache for the same file because NFS netfs read-ahead is more
+aggressive than xfs's. Bind-mount avoids a "first-hot-after-cold"
+warm-up that loop images suffer (250–600 MB/s on the first hot
+read until the host pagecache has the loop image's blocks).
+
+### Multi-thread scaling (bind-mount, RAID0 NVMe)
+
+Single-thread is bottlenecked by `netfs`/`cachefiles` per-cookie locking
+and CPU memcpy, **not** disk. Open multiple readers on different files
+to scale up:
+
+| concurrency             | aggregate | comment |
+|-------------------------|----------:|---------|
+| 1 reader, 1 file        | 2.4 GB/s  | baseline |
+| 4 readers, same file    | 5.0 GB/s  | per-cookie lock plateaus here |
+| 4 readers, 4 files      | 6.3 GB/s  | scales across files |
+| **8 readers, 4 files**  | **10 GB/s** | saturates the RAID0 ceiling |
+
+LLM inference loaders (vLLM, sglang) that open N safetensors shards
+in parallel hit ~10 GB/s on this rig directly. The FUSE-based
+predecessor maxed out at 25–40 % of NVMe; this rewrite stays on the
+kernel data path.
 
 ## Diagnostics
 

@@ -20,12 +20,22 @@ TEST_SIZE_MB="${TEST_SIZE_MB:-1024}"
 CACHE_DIR="${CACHE_DIR:-/var/cache/fscache}"
 DAEMON_BIN="${DAEMON_BIN:-./target/release/nfs-cachefs}"
 DAEMON_CFG="${DAEMON_CFG:-/etc/nfs-cachefs/daemon.toml}"
+CACHE_TAG="${CACHE_TAG:-}"
 
 if [[ $EUID -ne 0 ]]; then
     echo "must run as root" >&2; exit 1
 fi
 [[ -x "$DAEMON_BIN" ]] || { echo "missing $DAEMON_BIN — run cargo build --release" >&2; exit 1; }
 [[ -f "$DAEMON_CFG" ]] || { echo "missing $DAEMON_CFG — run packaging/install.sh" >&2; exit 1; }
+
+if [[ -z "$CACHE_TAG" ]]; then
+    CACHE_TAG=$(sed -n 's/^[[:space:]]*tag[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$DAEMON_CFG" | head -n1)
+    CACHE_TAG="${CACHE_TAG:-nfscache}"
+fi
+
+count_fsc_yes() {
+    awk '$NF == "yes" { n++ } END { print n + 0 }' /proc/fs/nfsfs/volumes 2>/dev/null || echo 0
+}
 
 cleanup() {
     local rc=$?
@@ -45,18 +55,45 @@ echo "==> start daemon"
 "$DAEMON_BIN" --config "$DAEMON_CFG" &
 DAEMON_PID=$!
 # Wait for cache binding (up to 5s)
+BOUND=0
 for _ in {1..50}; do
-    if grep -q '^00' /proc/fs/fscache/caches 2>/dev/null; then break; fi
+    if ! kill -0 "$DAEMON_PID" 2>/dev/null; then
+        set +e
+        wait "$DAEMON_PID"
+        rc=$?
+        set -e
+        echo "daemon exited before binding cache tag $CACHE_TAG (rc=$rc)" >&2
+        exit 1
+    fi
+    if grep -Fq "$CACHE_TAG" /proc/fs/fscache/caches 2>/dev/null; then
+        BOUND=1
+        break
+    fi
     sleep 0.1
 done
+if (( BOUND == 0 )); then
+    echo "cache tag $CACHE_TAG did not appear in /proc/fs/fscache/caches" >&2
+    cat /proc/fs/fscache/caches 2>/dev/null || true
+    exit 1
+fi
 
 echo "==> mount NFS with fsc"
 mkdir -p "$NFS_MOUNT"
-mount -t nfs -o "fsc,timeo=60,retrans=2,nconnect=4,noatime,nodiratime,nolock,nfsvers=3,tcp,nocto,actimeo=60,acregmax=3600,async" \
+FSC_YES_BEFORE=$(count_fsc_yes)
+# nosharecache: required when the same export is already mounted elsewhere
+# on the box without fsc — without it, the kernel coalesces NFS SBs by
+# (server, export) and the new -o fsc mount silently inherits the
+# existing non-fsc SB. Harmless when there's no competing mount.
+mount -t nfs -o "fsc,nosharecache,timeo=60,retrans=2,nconnect=4,noatime,nodiratime,nolock,nfsvers=3,tcp,nocto,actimeo=60,acregmax=3600,async" \
     "${NFS_SERVER}:${NFS_EXPORT}" "$NFS_MOUNT"
 
 echo "==> assert FSC=yes"
-grep -q ' yes$' /proc/fs/nfsfs/volumes || { echo "FSC not enabled on mount" >&2; exit 1; }
+FSC_YES_AFTER=$(count_fsc_yes)
+if (( FSC_YES_AFTER <= FSC_YES_BEFORE )); then
+    echo "FSC not enabled on the new mount" >&2
+    cat /proc/fs/nfsfs/volumes 2>/dev/null || true
+    exit 1
+fi
 
 echo "==> drop caches"
 echo 3 > /proc/sys/vm/drop_caches

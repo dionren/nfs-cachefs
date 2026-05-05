@@ -6,27 +6,43 @@ Documentation=man:nfs-cachefs(8)
 DefaultDependencies=no
 After=local-fs.target
 Before=remote-fs-pre.target
-ConditionPathExists=/dev/cachefiles
 ConditionFileNotEmpty=/etc/nfs-cachefs/daemon.toml
 
 [Service]
 Type=simple
 ExecStart=/usr/sbin/nfs-cachefs --config /etc/nfs-cachefs/daemon.toml
-ExecStartPre=/sbin/modprobe -q cachefiles
+# The cachefiles module is in-tree on Ubuntu 24.04 but is not autoloaded.
+# The '+' prefix keeps CAP_SYS_MODULE out of the long-running daemon while
+# allowing this pre-start helper to load the module on a fresh boot.
+ExecStartPre=+/sbin/modprobe -q cachefiles
 Restart=on-failure
 RestartSec=2s
 TimeoutStopSec=10s
 KillSignal=SIGTERM
 
-# Hardening: cache dir is the only writable path.
+# Hardening: cache dir is the only writable path. Daemon does no
+# networking, no kernel module loading (the '+' ExecStartPre handles
+# that with elevated caps), no realtime scheduling, and runs only on
+# the host's native syscall ABI. Lock everything else down.
 ProtectSystem=strict
 ReadWritePaths=/var/cache/fscache
 ProtectHome=true
 NoNewPrivileges=true
 ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
 ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
 PrivateTmp=true
+PrivateNetwork=true
+IPAddressDeny=any
 RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
 # CAP_SYS_ADMIN is required to write /dev/cachefiles configuration.
 CapabilityBoundingSet=CAP_SYS_ADMIN CAP_DAC_READ_SEARCH
 

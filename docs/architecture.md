@@ -37,8 +37,9 @@
  └─────────┬───────▲────────┘
            │       │ /dev/cachefiles
  ┌─────────▼───────┴────────┐
- │ cache filesystem (NVMe)  │  ext4/xfs on a dedicated mountpoint
- └──────────────────────────┘                     ▲
+ │ cache filesystem (NVMe)  │  ext4/xfs on its own mountpoint —
+ └──────────────────────────┘  bind-mount, partition, or loop image
+                                                  ▲
                                                   │ writes "dir/tag/limits/bind",
                                                   │ reads "cull=N frun=...",
                                                   │ writes "cull <name>"
@@ -166,24 +167,76 @@ objects without keeping a persistent index in memory.
 
 ## Performance baseline
 
-Validated on bare-metal Ubuntu 24.04 / kernel 6.8, WD Ultrastar DC SN640
-PCIe Gen3 ×4 NVMe, loop-xfs cache image on host xfs, NFSv3 over a
-~5 Gbps NIC, single 844 MB safetensors shard:
+The interesting variables are the **cache backend kind**
+(bind-mount / loop image / dedicated partition) and **read concurrency**.
+Storage and NIC set the ceiling; fscache layer overhead and per-cookie
+locking shape the curve.
 
-| path                                | bs / mode                | throughput  |
-|-------------------------------------|--------------------------|------------:|
-| raw `/dev/nvme0n1` direct           | 4 MiB direct             | 1.9 GB/s    |
-| raw xfs file, direct                | 4 MiB direct             | 1.6 GB/s    |
-| raw xfs file, page cache            | 1 MiB after drop_caches  | 730–970 MB/s|
-| **NFS cold (network → cache)**      | 1 MiB after drop_caches  | **695 MB/s**|
-| **NFS hot (fscache hit, pagecache)**| 1 MiB after drop_caches  | **1.8 GB/s**|
-| NFS hot, direct I/O                 | 4 MiB direct             | 1.2 GB/s    |
+### Single-thread reads (Ubuntu 24.04 / kernel 6.8, NFSv3, 1 MiB bs after drop_caches)
 
-Hot pagecache reads exceed raw xfs+pagecache for the same file, likely
-because NFS netfs read-ahead is more aggressive than xfs's. Hot direct
-I/O at ~75 % of raw xfs direct quantifies the real cost of the
-cachefiles + loop layering — about 25 % overhead, well within budget.
-Cold is network-limited.
+Reference rig A — 2× Intel D7-P5510 in md RAID0, 50 Gbps NIC,
+**bind-mount** cache_dir on host xfs:
+
+| path                                | throughput   |
+|-------------------------------------|-------------:|
+| md RAID0 direct, qd=1               | 2.7 GB/s     |
+| xfs file direct, qd=1               | 4.5 GB/s     |
+| **NFS cold (network → cache)**      | 0.7–1.2 GB/s |
+| **NFS hot (fscache hit, pagecache)**| **1.4–1.8 GB/s** |
+
+Reference rig B — single WD Ultrastar SN640 PCIe Gen3 ×4 NVMe, 5 Gbps NIC,
+**loop-xfs** cache image (the original validation rig):
+
+| path                                | throughput   |
+|-------------------------------------|-------------:|
+| raw `/dev/nvme0n1` direct           | 1.9 GB/s     |
+| raw xfs file, direct                | 1.6 GB/s     |
+| raw xfs file, page cache            | 730–970 MB/s |
+| **NFS cold (network → cache)**      | 695 MB/s     |
+| **NFS hot, steady-state**           | 1.8 GB/s     |
+| NFS hot, **first read after cold**  | 250–600 MB/s |
+
+The "first read after cold" dip is specific to loop image — the loop
+driver's host-pagecache hasn't been populated yet, so the first hot
+read pays a buffered-but-cold-host-fs cost on top of fscache. Bind-mount
+hits the host xfs directly with no intermediate pagecache layer and
+shows no such dip. On rig B's slow NIC the loop overhead is masked by
+the smaller absolute throughput; on rig A it dominates.
+
+### Multi-thread scaling (rig A, bind-mount)
+
+Single-thread is bottlenecked by `netfs`/`cachefiles` per-cookie locking
+and CPU memcpy, not disk. Concurrency gets you to the storage ceiling:
+
+| concurrency             | aggregate    | per-worker | comment |
+|-------------------------|-------------:|-----------:|---------|
+| qd=1                    | 2.4 GB/s     | 2.4        | baseline |
+| qd=4 same file          | 5.0 GB/s     | 1.25       | per-cookie lock plateau |
+| qd=8 same file          | 4.6 GB/s     | 0.6        | plateaued |
+| qd=4 distinct files     | 6.3 GB/s     | 1.6        | scales |
+| **qd=8 distinct files** | **10.0 GB/s**| 1.25       | saturates md2 RAID0 |
+
+fscache parallelizes well across file cookies but serializes within a
+single cookie (a single NFS file). Per-file caps at ~5 GB/s on this
+hardware regardless of how many readers; per-rig caps near the RAID0
+direct-IO ceiling (9.86 GB/s).
+
+LLM weight loaders that open N safetensors shards in parallel get
+~10 GB/s on rig A directly. Single-threaded `dd` benchmarks understate
+the real-workload throughput.
+
+### Layer ceilings on rig A
+
+| layer                    | qd=1     | qd=8     |
+|--------------------------|---------:|---------:|
+| md RAID0 direct          | 2.7 GB/s | 9.9 GB/s |
+| xfs file direct          | 4.5 GB/s | 8.1 GB/s |
+| **loop-xfs file direct** | 2.3 GB/s | 3.0 GB/s |
+
+The loop driver caps ~3 GB/s regardless of underlying storage (it's
+single-threaded inside the kernel, and double-buffers via host
+pagecache). On a multi-NVMe rig that's the binding constraint —
+hence the bind-mount recommendation.
 
 The FUSE-based predecessor (wiped in commit `76f5744`) topped out at
 ~25–40 % of NVMe — the whole point of this rewrite is staying on the

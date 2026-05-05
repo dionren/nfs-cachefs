@@ -21,13 +21,21 @@ the generic invariants below.
   cachefiles` before launching the daemon. (`cachefiles.ko` is the
   *kernel* module; distinct from the legacy userspace `cachefilesd`
   this project replaces.)
-- **Cache dir convention**: a loop-mounted xfs image on the test box's
-  NVMe, mounted at `/var/cache/fscache`. The cache dir must be its own
-  mountpoint (`bind` returns `EINVAL` otherwise).
-- **NFS mount on the test box is managed by `x-systemd.automount`
-  without `fsc`.** To test, stop the automount unit, `umount`, then
-  remount with `fsc`. Restart the automount unit when done. Don't
-  edit fstab on the test box.
+- **Cache dir convention**: a **self-bind-mounted subdirectory** on
+  the host's NVMe xfs (e.g.,
+  `mount --bind /mnt/nvme/cache /mnt/nvme/cache`). Cachefiles' "must
+  be its own mountpoint" check is `mnt->mnt_root == dentry`, which a
+  self-bind satisfies. This is preferred over a loop-mounted image
+  because it skips the loop driver entirely (no host-pagecache
+  double-buffering, no "first-hot-after-cold" warm-up penalty).
+  Loop images and dedicated partitions also work; bind-mount is just
+  the simplest and fastest on shared NVMe.
+- **NFS test mount**: a separate `fsc,nosharecache` mount, never the
+  test box's existing production NFS mount. If the same export is
+  already mounted elsewhere on the box, the kernel coalesces NFS SBs
+  by `(server, export)` unless `nosharecache` is given — without it,
+  the new `-o fsc` mount silently inherits the existing non-fsc SB
+  and `/proc/fs/nfsfs/volumes` shows FSC=no.
 - **Daemon must be bound before any `mount -o fsc`.** Otherwise the
   mount silently falls back to no-caching with no error logged.
 
@@ -70,8 +78,14 @@ codegen unit, stripped symbols → ~1.9 MB stripped binary.
   rejected by the kernel. Daemon role is configurator + cull driver,
   **not** per-request mediator.
 - **Cache dir must be its own mountpoint.** `bind` returns `EINVAL`
-  otherwise. xfs or ext4 (with `user_xattr`) on a dedicated partition
-  or loop image both work.
+  otherwise. Three setups satisfy the check; xfs or ext4 (with
+  `user_xattr`) underneath in any case:
+  - **Self-bind a subdir** — `mount --bind /path /path`. Preferred:
+    no loop overhead, no extra fs to manage. The kernel only checks
+    `mnt->mnt_root == dentry`, which a self-bind makes true.
+  - **Loop-mounted image** — works but adds a host-pagecache layer
+    and a "first hot read after cold" warm-up cost.
+  - **Dedicated partition / LV** — fine but invasive on shared disks.
 - **Only one daemon can hold `/dev/cachefiles`.** Open returns `EBUSY` if
   another holds it. There is **no `unbind` command** — closing the fd
   unbinds (kernel 6.8 returns `ENOTSUPP` on `unbind`). `Device::Drop`
@@ -115,24 +129,62 @@ journalctl -u nfs-cachefs -f      # daemon logs (or /var/log/nfs-cachefs.log if 
 
 ## Performance baseline (already validated)
 
-Real-hardware run on Ubuntu 24.04 / kernel 6.8, WD Ultrastar DC SN640
-PCIe Gen3 x4 NVMe, loop-xfs cache image on host xfs, NFSv3 over a
-~5 Gbps NIC, single 844 MB safetensors shard:
+### Single-thread reads (1 MiB bs after drop_caches)
 
-| path | bs / mode | throughput |
-|------|-----------|------------|
-| raw `/dev/nvme0n1` direct | 4M direct | 1.9 GB/s |
-| raw xfs file, direct      | 4M direct | 1.6 GB/s |
-| raw xfs file, pagecache   | 1M after drop_caches | 730–970 MB/s |
-| **NFS cold (network → cache)** | 1M after drop_caches | **695 MB/s** |
-| **NFS hot (fscache hit, pagecache)** | 1M after drop_caches | **1.8 GB/s** |
-| NFS hot, direct I/O       | 4M direct | 1.2 GB/s |
+Numbers depend heavily on cache backend kind, NIC, and the underlying
+storage; the cache backend kind is the lever the daemon controls.
+Two reference points:
 
-Hot pagecache reads exceed raw xfs+pagecache for the same file, likely
-from NFS netfs read-ahead being more aggressive than xfs's. Hot direct
-I/O at ~75 % of raw xfs direct quantifies the real cost of the
-cachefiles + loop layering — about 25 % overhead, well within budget.
-Cold is network-limited.
+**Bind-mount cache on RAID0 NVMe + 50 Gbps NIC**:
+
+| path                                 | throughput   |
+|--------------------------------------|-------------:|
+| NFS cold (network → cache)           | 0.7–1.2 GB/s |
+| NFS hot (fscache hit, pagecache)     | **1.4–1.8 GB/s** |
+| no first-hot warm-up; reads are stable from the first hot pass |
+
+**Loop-image cache on single SN640 + 5 Gbps NIC** (the original
+validation rig):
+
+| path                                 | throughput   |
+|--------------------------------------|-------------:|
+| NFS cold (network → cache)           | 695 MB/s     |
+| NFS hot (fscache hit, pagecache)     | 1.8 GB/s (steady) |
+| NFS hot, **first read after cold**   | 250–600 MB/s |
+
+The loop driver has a host-pagecache warm-up step on the first hot
+read after cold population; bind-mount avoids it. On a 5 Gbps NIC,
+that overhead is masked by the smaller absolute throughput; on a
+beefier rig it dominates.
+
+### Multi-thread scaling (bind-mount cache, RAID0 NVMe, 50 Gbps NIC)
+
+`dd` worker per file, drop_caches between runs:
+
+| concurrency        | aggregate    | per-worker |
+|--------------------|-------------:|-----------:|
+| qd=1               | 2.4 GB/s     | 2.4        |
+| qd=4 same file     | 5.0 GB/s     | 1.25       |
+| qd=8 same file     | 4.6 GB/s     | 0.6        |
+| qd=4 distinct files| 6.3 GB/s     | 1.6        |
+| **qd=8 distinct files** | **10.0 GB/s** | 1.25 |
+
+fscache has **per-cookie locking** — same-file parallelism plateaus
+~5 GB/s. Different-file parallelism scales to the underlying RAID0
+ceiling (md2 RAID0 direct: 9.86 GB/s). LLM weight loaders that open
+N safetensors shards in parallel benefit naturally.
+
+### Layer ceilings (RAID0 NVMe ref)
+
+| layer                    | qd=1     | qd=8     |
+|--------------------------|---------:|---------:|
+| md RAID0 direct          | 2.7 GB/s | 9.9 GB/s |
+| xfs file direct          | 4.5 GB/s | 8.1 GB/s |
+| loop-xfs file direct     | 2.3 GB/s | 3.0 GB/s |
+
+Loop layer caps at ~3 GB/s regardless of underlying RAID — that's
+why bind-mount wins on multi-NVMe rigs. Single-disk rigs have a
+disk ceiling below the loop ceiling, so the gap doesn't matter.
 
 The FUSE-based predecessor topped out at ~25–40 % of NVMe — the whole
 point of this rewrite is staying on the kernel data path. Don't

@@ -30,7 +30,7 @@ impl Device {
     /// Issue a single command. The kernel rejects commands with embedded NULs
     /// or newlines; callers should not include them.
     pub fn write_cmd(&self, cmd: &str) -> Result<()> {
-        debug_assert!(!cmd.contains('\0') && !cmd.contains('\n'));
+        validate_command(cmd)?;
         let n = unsafe {
             libc::write(
                 self.file.as_raw_fd(),
@@ -101,13 +101,11 @@ impl<'a> ConfigCmd<'a> {
             }
         }
 
+        validate_config_args(self.cache_dir, self.tag, self.secctx)?;
         let cache_dir = self
             .cache_dir
             .to_str()
             .ok_or_else(|| Error::config("cache_dir is not valid UTF-8"))?;
-        if self.tag.is_empty() || self.tag.contains(char::is_whitespace) {
-            return Err(Error::config("tag must be non-empty and whitespace-free"));
-        }
 
         dev.write_cmd(&format!("dir {cache_dir}"))?;
         dev.write_cmd(&format!("tag {}", self.tag))?;
@@ -125,6 +123,87 @@ impl<'a> ConfigCmd<'a> {
     }
 }
 
+pub(crate) fn validate_config_args(
+    cache_dir: &Path,
+    tag: &str,
+    secctx: Option<&str>,
+) -> Result<()> {
+    let cache_dir = cache_dir
+        .to_str()
+        .ok_or_else(|| Error::config("cache_dir is not valid UTF-8"))?;
+    validate_path_arg("cache_dir", cache_dir)?;
+    validate_token_arg("tag", tag)?;
+    if let Some(ctx) = secctx {
+        validate_token_arg("secctx", ctx)?;
+    }
+    Ok(())
+}
+
+fn validate_command(cmd: &str) -> Result<()> {
+    if cmd.is_empty() {
+        return Err(Error::protocol("empty cachefiles command"));
+    }
+    if has_command_break(cmd) {
+        return Err(Error::protocol(format!(
+            "cachefiles command contains NUL or newline: {cmd:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_path_arg(label: &str, value: &str) -> Result<()> {
+    if value.is_empty() {
+        return Err(Error::config(format!("{label} must be non-empty")));
+    }
+    if has_command_break(value) {
+        return Err(Error::config(format!(
+            "{label} must not contain NUL or newline"
+        )));
+    }
+    if value.contains(char::is_whitespace) {
+        return Err(Error::config(format!(
+            "{label} must not contain whitespace; cachefiles commands are whitespace-delimited"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_token_arg(label: &str, value: &str) -> Result<()> {
+    if value.is_empty()
+        || value.contains(char::is_whitespace)
+        || has_command_break(value)
+    {
+        return Err(Error::config(format!(
+            "{label} must be non-empty and whitespace-free"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_object_name(op: &str, name: &str) -> Result<()> {
+    if name.is_empty() {
+        return Err(Error::protocol(format!("{op} name is empty")));
+    }
+    if name.contains('/') {
+        return Err(Error::protocol(format!("{op} name has '/': {name:?}")));
+    }
+    if name.contains(char::is_whitespace) {
+        return Err(Error::protocol(format!(
+            "{op} name contains whitespace: {name:?}"
+        )));
+    }
+    if has_command_break(name) {
+        return Err(Error::protocol(format!(
+            "{op} name contains NUL or newline: {name:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn has_command_break(value: &str) -> bool {
+    value.chars().any(|c| c == '\0' || c == '\n' || c == '\r')
+}
+
 // There is no `unbind` command in the kernel cachefiles daemon protocol
 // (verified on kernel 6.8: write returns ENOTSUPP). The cache is unbound
 // implicitly when /dev/cachefiles is closed, which `Device::Drop` handles
@@ -140,9 +219,7 @@ impl<'a> ConfigCmd<'a> {
 /// even-trying-to-cull obviously-busy objects).
 #[allow(dead_code)]
 pub fn inuse(dev: &Device, name: &str) -> Result<bool> {
-    if name.contains('/') {
-        return Err(Error::protocol(format!("inuse name has '/': {name:?}")));
-    }
+    validate_object_name("inuse", name)?;
     match dev.write_cmd(&format!("inuse {name}")) {
         Ok(()) => Ok(true),
         Err(Error::Kernel { source, .. }) if source.raw_os_error() == Some(libc::EBUSY) => {
@@ -156,9 +233,7 @@ pub fn inuse(dev: &Device, name: &str) -> Result<bool> {
 /// `Ok(true)` on success, `Ok(false)` if the object was held by the kernel
 /// (`EBUSY`) — caller should skip and try later.
 pub fn cull(dev: &Device, name: &str) -> Result<bool> {
-    if name.contains('/') {
-        return Err(Error::protocol(format!("cull name has '/': {name:?}")));
-    }
+    validate_object_name("cull", name)?;
     match dev.write_cmd(&format!("cull {name}")) {
         Ok(()) => Ok(true),
         Err(Error::Kernel { source, .. }) if source.raw_os_error() == Some(libc::EBUSY) => {
@@ -189,5 +264,42 @@ mod tests {
         // touch /dev/cachefiles. We construct without applying.
         let bs = (bad.bstop, bad.bcull, bad.brun);
         assert!(!(bs.0 < bs.1 && bs.1 < bs.2));
+    }
+
+    #[test]
+    fn rejects_multiline_commands() {
+        assert!(validate_command("tag ok").is_ok());
+        assert!(validate_command("tag ok\nbind").is_err());
+        assert!(validate_command("tag ok\0bind").is_err());
+    }
+
+    #[test]
+    fn validates_config_command_arguments() {
+        assert!(
+            validate_config_args(Path::new("/var/cache/fscache"), "nfscache", None).is_ok()
+        );
+        assert!(
+            validate_config_args(Path::new("/var/cache/fs cache"), "nfscache", None).is_err()
+        );
+        assert!(
+            validate_config_args(Path::new("/var/cache/fscache"), "nfs cache", None).is_err()
+        );
+        assert!(
+            validate_config_args(
+                Path::new("/var/cache/fscache"),
+                "nfscache",
+                Some("ctx\nbind")
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn validates_object_names() {
+        assert!(validate_object_name("cull", "012345").is_ok());
+        assert!(validate_object_name("cull", "dir/file").is_err());
+        assert!(validate_object_name("cull", "file name").is_err());
+        assert!(validate_object_name("cull", "file\nbind").is_err());
+        assert!(validate_object_name("cull", "").is_err());
     }
 }
