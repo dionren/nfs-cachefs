@@ -6,7 +6,7 @@
 //! reduces to:
 //!
 //!   - boot:  open dev → write `dir`/`tag`/`*run`/`*cull`/`*stop` → write `bind`
-//!   - run:   poll(dev, POLLIN) → read state line → if `cull=1`, drive cull
+//!   - run:   poll(dev, POLLIN|POLLOUT) → read state line → if `cull=1`, drive cull
 //!   - cull:  chdir to object's parent → write `cull <name>`
 //!   - exit:  close dev; the kernel withdraws the cache
 //!

@@ -1,5 +1,5 @@
-//! Main event loop. Polls `/dev/cachefiles`; on POLLIN, reads the kernel's
-//! state line and triggers a cull pass when needed.
+//! Main event loop. Polls `/dev/cachefiles`; on POLLIN/POLLOUT, reads the
+//! kernel's state line and triggers a cull pass when needed.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,6 +17,11 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
 /// Poll timeout. The kernel marks the device readable on state changes,
 /// but a wakeup also lets us run the heartbeat and check the stop flag.
 const POLL_TIMEOUT_MS: i32 = 5_000;
+
+/// Backoff when the kernel says culling is active but a pass cannot free
+/// anything. This prevents a POLLOUT-driven busy loop when all candidates are
+/// busy or the cache layout is not cullable by this daemon version.
+const NO_PROGRESS_BACKOFF: Duration = Duration::from_secs(1);
 
 pub struct Daemon<'a> {
     pub dev: Device,
@@ -45,7 +50,7 @@ impl<'a> Daemon<'a> {
         while !self.stop.load(Ordering::Relaxed) {
             let mut pollfd = libc::pollfd {
                 fd: self.dev.as_raw_fd(),
-                events: libc::POLLIN,
+                events: libc::POLLIN | libc::POLLOUT,
                 revents: 0,
             };
             let r = unsafe { libc::poll(&mut pollfd, 1, POLL_TIMEOUT_MS) };
@@ -57,14 +62,32 @@ impl<'a> Daemon<'a> {
                 return Err(Error::Io(err));
             }
 
-            if r > 0 && (pollfd.revents & libc::POLLIN) != 0 {
+            if r > 0
+                && (pollfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)) != 0
+            {
+                return Err(Error::Io(std::io::Error::other(format!(
+                    "/dev/cachefiles poll returned revents=0x{:x}",
+                    pollfd.revents
+                ))));
+            }
+
+            if r > 0 && (pollfd.revents & (libc::POLLIN | libc::POLLOUT)) != 0 {
                 match self.dev.read_state(&mut buf) {
                     Ok(0) => {} // not ready yet
                     Ok(n) => match CacheState::parse(&buf[..n]) {
                         Ok(state) => {
                             debug!(?state, "state");
                             if state.culling {
-                                cull::run_pass(&self.dev, &self.cull);
+                                let stats = cull::run_pass(&self.dev, &self.cull);
+                                if !stats.made_progress() {
+                                    warn!(
+                                        candidates = stats.candidates,
+                                        skipped_busy = stats.skipped_busy,
+                                        errored = stats.errored,
+                                        "cull remains active but pass made no progress; backing off"
+                                    );
+                                    sleep_with_stop(self.stop, NO_PROGRESS_BACKOFF);
+                                }
                             }
                             last_state = Some(state);
                         }
@@ -96,6 +119,14 @@ impl<'a> Daemon<'a> {
         info!("stop signal received; closing /dev/cachefiles (kernel will unbind)");
         // self.dev drops here, closing the fd; the kernel withdraws the cache.
         Ok(())
+    }
+}
+
+fn sleep_with_stop(stop: &AtomicBool, duration: Duration) {
+    let started = Instant::now();
+    while !stop.load(Ordering::Relaxed) && started.elapsed() < duration {
+        let remaining = duration.saturating_sub(started.elapsed());
+        std::thread::sleep(remaining.min(Duration::from_millis(100)));
     }
 }
 

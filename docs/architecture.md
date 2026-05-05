@@ -109,8 +109,10 @@ cull=N frun=H fcull=H fstop=H brun=H bcull=H bstop=H
 ```
 
 `cull=1` means the daemon should start culling. The other fields are the
-current free counts in hex (no `0x` prefix). The kernel sets the device
-readable when it wants the daemon to re-evaluate.
+current free counts in hex (no `0x` prefix). The kernel sets `POLLIN`
+when the state line changed and `POLLOUT` while culling remains active.
+The daemon listens for both so one cull batch that does not reach `run`
+does not stall further culling.
 
 ## Cache sizing
 
@@ -125,7 +127,7 @@ thresholds the kernel evaluates against `statfs(cache_dir)`:
 | `bstop` / `fstop`    | hard floor — kernel refuses new caching below this        |  3 % |
 
 `b*` apply to blocks (capacity); `f*` to inodes (file count). The daemon
-validates `stop < cull < run ≤ 100` both at config load
+validates `stop < cull < run < 100` both at config load
 (`Config::validate`) and right before sending the limit commands
 (`ConfigCmd::apply_and_bind`).
 
@@ -138,15 +140,36 @@ absolute-bytes knob — the kernel protocol is percentage-only.
 
 ## Cull algorithm
 
+The on-disk layout cachefiles produces (kernel ≥ 5.17) is:
+
+```text
+<cache_root>/cache/Ivolume,…/             ← volume index   (depth 1)
+<cache_root>/cache/Ivolume,…/@xx/         ← hash bucket    (depth 2)
+<cache_root>/cache/Ivolume,…/@xx/Scookie  ← cookie object  (depth 3)
+```
+
 When `cull=1`:
 
-1. Walk the cache directory (`<cache_dir>/cache/...`) using `walkdir`.
-2. For each regular file collect `(parent, basename, atime, size)`.
-3. Sort by `atime` ascending (oldest first).
-4. Process at most `cull.batch_size` candidates. For each:
+1. Delete entries that the kernel moved into `<cache_dir>/graveyard`.
+2. Walk **only depth 3** under `<cache_dir>/cache/` using `walkdir`
+   (`min_depth(3).max_depth(3)`). Both bounds matter:
+   - skipping depth 1 protects the volume index — `cull Ivolume,…`
+     succeeds whenever no client mount is currently using the volume
+     (boot before mount, after umount, e2e setup) and erases the
+     entire cache;
+   - skipping depth 2 avoids the hash buckets, which the kernel would
+     reject anyway;
+   - capping at depth 3 prevents the daemon from descending into an
+     index-cookie directory and trying to cull its children
+     individually — culling the parent removes the subtree.
+3. For each cookie collect `(parent, basename, atime, size)`.
+4. Sort by `atime` ascending (oldest first).
+5. Process at most `cull.batch_size` candidates. For each:
    - `chdir(parent)`
    - Send `cull <basename>`. Kernel returns `EBUSY` if held → skip.
-5. Re-poll state. If `cull=0`, done; else repeat.
+6. Re-poll state. If `cull=0`, done; else repeat. If a pass makes no
+   progress because every candidate is busy or errored, briefly back off
+   before trying again.
 
 This is the same shape as upstream cachefilesd's algorithm. The
 walk-on-demand approach scales to caches with hundreds of thousands of

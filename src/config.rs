@@ -104,16 +104,8 @@ impl Config {
             self.secctx.as_deref(),
         )?;
         let l = &self.limits;
-        for (label, s, c, r) in [
-            ("b", l.bstop, l.bcull, l.brun),
-            ("f", l.fstop, l.fcull, l.frun),
-        ] {
-            if !(s < c && c < r && r <= 100) {
-                return Err(Error::config(format!(
-                    "{label}stop({s}) < {label}cull({c}) < {label}run({r}) <= 100 required"
-                )));
-            }
-        }
+        crate::proto::cmd::validate_limit_triplet("b", l.bstop, l.bcull, l.brun)?;
+        crate::proto::cmd::validate_limit_triplet("f", l.fstop, l.fcull, l.frun)?;
         if self.cull.batch_size == 0 {
             return Err(Error::config("cull.batch_size must be > 0"));
         }
@@ -158,6 +150,23 @@ mod tests {
             tag = "t"
             [limits]
             brun = 5
+            bcull = 7
+            bstop = 3
+            frun = 10
+            fcull = 7
+            fstop = 3
+        "#;
+        let cfg: Config = toml::from_str(s).unwrap();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_run_at_100() {
+        let s = r#"
+            cache_dir = "/x"
+            tag = "t"
+            [limits]
+            brun = 100
             bcull = 7
             bstop = 3
             frun = 10

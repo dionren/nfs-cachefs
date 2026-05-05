@@ -90,16 +90,8 @@ pub struct ConfigCmd<'a> {
 impl<'a> ConfigCmd<'a> {
     /// Send `dir`, `tag`, optional `secctx`, the six limits, then `bind`.
     pub fn apply_and_bind(&self, dev: &Device) -> Result<()> {
-        // Validate strict ordering: stop < cull < run, all 0..100.
-        let bs = (self.bstop, self.bcull, self.brun);
-        let fs = (self.fstop, self.fcull, self.frun);
-        for (label, (s, c, r)) in [("b", bs), ("f", fs)] {
-            if !(s < c && c < r && r <= 100) {
-                return Err(Error::config(format!(
-                    "{label}stop({s}) < {label}cull({c}) < {label}run({r}) <= 100 required"
-                )));
-            }
-        }
+        validate_limit_triplet("b", self.bstop, self.bcull, self.brun)?;
+        validate_limit_triplet("f", self.fstop, self.fcull, self.frun)?;
 
         validate_config_args(self.cache_dir, self.tag, self.secctx)?;
         let cache_dir = self
@@ -112,15 +104,39 @@ impl<'a> ConfigCmd<'a> {
         if let Some(ctx) = self.secctx {
             dev.write_cmd(&format!("secctx {ctx}"))?;
         }
-        dev.write_cmd(&format!("brun {}%", self.brun))?;
-        dev.write_cmd(&format!("bcull {}%", self.bcull))?;
-        dev.write_cmd(&format!("bstop {}%", self.bstop))?;
-        dev.write_cmd(&format!("frun {}%", self.frun))?;
-        dev.write_cmd(&format!("fcull {}%", self.fcull))?;
-        dev.write_cmd(&format!("fstop {}%", self.fstop))?;
+        for cmd in limit_commands("b", self.bstop, self.bcull, self.brun)? {
+            dev.write_cmd(&cmd)?;
+        }
+        for cmd in limit_commands("f", self.fstop, self.fcull, self.frun)? {
+            dev.write_cmd(&cmd)?;
+        }
         dev.write_cmd("bind")?;
         Ok(())
     }
+}
+
+pub(crate) fn validate_limit_triplet(label: &str, stop: u8, cull: u8, run: u8) -> Result<()> {
+    if !(stop < cull && cull < run && run < 100) {
+        return Err(Error::config(format!(
+            "{label}stop({stop}) < {label}cull({cull}) < {label}run({run}) < 100 required"
+        )));
+    }
+    Ok(())
+}
+
+fn limit_commands(label: &str, stop: u8, cull: u8, run: u8) -> Result<Vec<String>> {
+    validate_limit_triplet(label, stop, cull, run)?;
+
+    // The kernel validates each limit command against the values currently
+    // stored on the freshly opened device. Raise the run/cull ceilings first,
+    // then install the requested values from bottom to top.
+    Ok(vec![
+        format!("{label}run 99%"),
+        format!("{label}cull 98%"),
+        format!("{label}stop {stop}%"),
+        format!("{label}cull {cull}%"),
+        format!("{label}run {run}%"),
+    ])
 }
 
 pub(crate) fn validate_config_args(
@@ -264,6 +280,27 @@ mod tests {
         // touch /dev/cachefiles. We construct without applying.
         let bs = (bad.bstop, bad.bcull, bad.brun);
         assert!(!(bs.0 < bs.1 && bs.1 < bs.2));
+    }
+
+    #[test]
+    fn rejects_run_at_100() {
+        assert!(validate_limit_triplet("b", 3, 7, 99).is_ok());
+        assert!(validate_limit_triplet("b", 3, 7, 100).is_err());
+    }
+
+    #[test]
+    fn formats_limits_in_kernel_safe_order() {
+        let cmds = limit_commands("b", 0, 1, 2).unwrap();
+        assert_eq!(
+            cmds,
+            vec![
+                "brun 99%",
+                "bcull 98%",
+                "bstop 0%",
+                "bcull 1%",
+                "brun 2%",
+            ]
+        );
     }
 
     #[test]

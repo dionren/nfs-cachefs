@@ -1,6 +1,22 @@
-//! Cache cull driver. Walks `<cache_dir>/cache`, picks the K oldest-by-
-//! atime files via a streaming top-K, and sends `cull <name>` commands
-//! to the kernel one at a time.
+//! Cache cull driver. Walks `<cache_dir>/cache/<volume>/@<bucket>/`, picks
+//! the K oldest-by-atime cookie objects via a streaming top-K, and sends
+//! `cull <name>` commands to the kernel one at a time.
+//!
+//! ## Cachefiles layout (kernel ≥ 5.17)
+//!
+//! ```text
+//!   <cache_root>/cache/Ivolume/             ← volume index — never cull
+//!   <cache_root>/cache/Ivolume/@xx/         ← hash bucket  — never cull
+//!   <cache_root>/cache/Ivolume/@xx/Scookie  ← cookie       — cull target
+//! ```
+//!
+//! The walk is therefore restricted to **exactly depth 3** under the
+//! cache subdir. Including the volume index as a candidate is unsafe:
+//! the kernel only marks it `EBUSY` while a client mount is actively
+//! using the volume; between mounts (boot before mount, after umount,
+//! e2e setup) `cull Ivolume` succeeds and erases the entire cache.
+//! Hash buckets at depth 2 are also not cullable, so we exclude them
+//! up front rather than letting the kernel reject them per-pass.
 //!
 //! ## CWD requirement
 //!
@@ -40,6 +56,22 @@ pub struct CullCtx {
     pub batch_size: usize,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct CullStats {
+    pub candidates: usize,
+    pub culled: usize,
+    pub bytes_freed: u64,
+    pub skipped_busy: usize,
+    pub errored: usize,
+    pub graveyard_removed: usize,
+}
+
+impl CullStats {
+    pub fn made_progress(self) -> bool {
+        self.culled > 0 || self.graveyard_removed > 0
+    }
+}
+
 #[derive(Debug, Eq, PartialEq, Ord, PartialOrd)]
 struct Candidate {
     // atime_secs is the primary sort key. Putting it first makes the
@@ -53,51 +85,49 @@ struct Candidate {
 }
 
 /// Run one cull pass. Walks the cache subtree, keeps the `batch_size`
-/// oldest-by-atime files, and culls them in atime-ascending order.
+/// oldest-by-atime objects, and culls them in atime-ascending order.
 ///
 /// Per-object errors (EBUSY, chdir failure, etc.) are logged and counted
 /// but never propagated: the kernel re-signals if more culling is needed,
 /// and a single bad object should not bring the daemon down.
-pub fn run_pass(dev: &Device, ctx: &CullCtx) {
+pub fn run_pass(dev: &Device, ctx: &CullCtx) -> CullStats {
     let started = std::time::Instant::now();
+    let mut stats = clean_graveyard(&ctx.cache_root);
     let cache_subdir = ctx.cache_root.join("cache");
     if !cache_subdir.exists() {
         warn!(
             path = %cache_subdir.display(),
             "cache subdir does not exist; kernel layout changed or bind never created it"
         );
-        return;
+        return stats;
     }
 
     let oldest = collect_oldest(&cache_subdir, ctx.batch_size);
-    debug!(found = oldest.len(), "cull candidates");
+    stats.candidates = oldest.len();
+    debug!(found = stats.candidates, "cull candidates");
     if oldest.is_empty() {
-        return;
+        return stats;
     }
 
     let saved_cwd = std::env::current_dir().ok();
-    let mut culled = 0usize;
-    let mut bytes_freed: u64 = 0;
-    let mut skipped_busy = 0usize;
-    let mut errored = 0usize;
 
     for cand in oldest {
         if let Err(e) = std::env::set_current_dir(&cand.parent) {
             warn!(parent = %cand.parent.display(), error = %e, "chdir failed; skip");
-            errored += 1;
+            stats.errored += 1;
             continue;
         }
         match cmd::cull(dev, &cand.name) {
             Ok(true) => {
-                culled += 1;
-                bytes_freed += cand.size;
+                stats.culled += 1;
+                stats.bytes_freed += cand.size;
             }
             Ok(false) => {
-                skipped_busy += 1;
+                stats.skipped_busy += 1;
             }
             Err(e) => {
                 warn!(name = cand.name, error = %e, "cull failed");
-                errored += 1;
+                stats.errored += 1;
             }
         }
     }
@@ -110,15 +140,17 @@ pub fn run_pass(dev: &Device, ctx: &CullCtx) {
 
     info!(
         elapsed_ms = started.elapsed().as_millis() as u64,
-        culled,
-        bytes_freed,
-        skipped_busy,
-        errored,
+        culled = stats.culled,
+        bytes_freed = stats.bytes_freed,
+        skipped_busy = stats.skipped_busy,
+        errored = stats.errored,
+        graveyard_removed = stats.graveyard_removed,
         "cull pass done"
     );
+    stats
 }
 
-/// Walk the cache subtree and return the `k` oldest-by-atime files in
+/// Walk the cache subtree and return the `k` oldest-by-atime objects in
 /// ascending-atime order. Uses a max-heap of size k → O(N log k) time,
 /// O(k) memory regardless of cache size.
 fn collect_oldest(root: &Path, k: usize) -> Vec<Candidate> {
@@ -127,18 +159,30 @@ fn collect_oldest(root: &Path, k: usize) -> Vec<Candidate> {
     }
     let mut heap: BinaryHeap<Candidate> = BinaryHeap::with_capacity(k);
 
-    for entry in walkdir::WalkDir::new(root)
+    // Depth 3 = cookie objects (see module docs for the layout). Both
+    // bounds are required: min_depth(3) skips the volume index (depth 1)
+    // and hash buckets (depth 2); max_depth(3) prevents descending into
+    // an index-cookie directory and culling its children individually
+    // — culling the parent removes the whole subtree.
+    let mut entries = walkdir::WalkDir::new(root)
+        .min_depth(3)
+        .max_depth(3)
         .follow_links(false)
         .same_file_system(true)
-        .into_iter()
-        .filter_map(|r| r.ok())
-    {
-        if !entry.file_type().is_file() {
+        .into_iter();
+
+    while let Some(entry) = entries.next() {
+        let Ok(entry) = entry else { continue };
+        let file_type = entry.file_type();
+        if !(file_type.is_file() || file_type.is_dir()) {
             continue;
         }
         let Some(name) = entry.file_name().to_str() else {
             continue;
         };
+        if !is_cache_object_name(name) {
+            continue;
+        }
         let Some(parent) = entry.path().parent() else { continue };
         let Ok(meta) = entry.metadata() else { continue };
         let cand = Candidate {
@@ -163,6 +207,42 @@ fn collect_oldest(root: &Path, k: usize) -> Vec<Candidate> {
     heap.into_sorted_vec()
 }
 
+fn is_cache_object_name(name: &str) -> bool {
+    matches!(
+        name.as_bytes().first(),
+        Some(b'I' | b'J' | b'D' | b'E' | b'S' | b'T')
+    )
+}
+
+fn clean_graveyard(cache_root: &Path) -> CullStats {
+    let mut stats = CullStats::default();
+    let graveyard = cache_root.join("graveyard");
+    let Ok(entries) = std::fs::read_dir(&graveyard) else {
+        return stats;
+    };
+
+    for entry in entries {
+        let Ok(entry) = entry else {
+            stats.errored += 1;
+            continue;
+        };
+        let path = entry.path();
+        let remove_result = match entry.file_type() {
+            Ok(ft) if ft.is_dir() => std::fs::remove_dir_all(&path),
+            Ok(_) => std::fs::remove_file(&path),
+            Err(e) => Err(e),
+        };
+        match remove_result {
+            Ok(()) => stats.graveyard_removed += 1,
+            Err(e) => {
+                stats.errored += 1;
+                warn!(path = %path.display(), error = %e, "failed to remove graveyard entry");
+            }
+        }
+    }
+    stats
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -182,33 +262,98 @@ mod tests {
             .unwrap();
     }
 
+    /// Build a fixture matching the cachefiles layout
+    /// `<root>/Ivolume/@<bucket>/<cookie>` and return the bucket path so
+    /// callers can drop cookie files in the right place.
+    fn cookie_bucket(root: &Path) -> PathBuf {
+        let bucket = root.join("Ivolume").join("@00");
+        fs::create_dir_all(&bucket).unwrap();
+        bucket
+    }
+
     #[test]
     fn top_k_returns_k_oldest_in_ascending_order() {
         let dir = tempdir();
-        for (n, off) in [("a", 100), ("b", 50), ("c", 200), ("d", 25), ("e", 75)] {
-            touch(&dir.join(n), off);
+        let bucket = cookie_bucket(&dir);
+        for (n, off) in [
+            ("Da", 100),
+            ("Db", 50),
+            ("Dc", 200),
+            ("Dd", 25),
+            ("De", 75),
+        ] {
+            touch(&bucket.join(n), off);
         }
         let oldest = collect_oldest(&dir, 3);
         let names: Vec<_> = oldest.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(names, vec!["d", "b", "e"]);
+        assert_eq!(names, vec!["Dd", "Db", "De"]);
     }
 
     #[test]
     fn top_k_handles_k_greater_than_n() {
         let dir = tempdir();
-        touch(&dir.join("a"), 10);
-        touch(&dir.join("b"), 20);
+        let bucket = cookie_bucket(&dir);
+        touch(&bucket.join("Da"), 10);
+        touch(&bucket.join("Db"), 20);
         let oldest = collect_oldest(&dir, 100);
         assert_eq!(oldest.len(), 2);
-        assert_eq!(oldest[0].name, "a");
-        assert_eq!(oldest[1].name, "b");
+        assert_eq!(oldest[0].name, "Da");
+        assert_eq!(oldest[1].name, "Db");
     }
 
     #[test]
     fn top_k_zero_returns_empty() {
         let dir = tempdir();
-        touch(&dir.join("a"), 10);
+        let bucket = cookie_bucket(&dir);
+        touch(&bucket.join("Da"), 10);
         assert!(collect_oldest(&dir, 0).is_empty());
+    }
+
+    #[test]
+    fn top_k_skips_volume_index_and_hash_buckets() {
+        // Regression: previously the depth-1 `Ivolume` directory matched
+        // `is_cache_object_name` (prefix `I`) and ended up as a cull
+        // candidate. With the volume unbound (e.g., between client
+        // mounts) the kernel let the cull through and emptied the cache.
+        let dir = tempdir();
+        let volume = dir.join("Ivolume,uniq");
+        let bucket = volume.join("@1d");
+        fs::create_dir_all(&bucket).unwrap();
+        touch(&bucket.join("Scookie"), 100);
+
+        let oldest = collect_oldest(&dir, 10);
+        let names: Vec<_> = oldest.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["Scookie"]);
+    }
+
+    #[test]
+    fn top_k_does_not_descend_into_index_cookie_subtree() {
+        // An index-style cookie can be a directory at depth 3 with its
+        // own children at depth 4+. The daemon must enqueue only the
+        // depth-3 cookie itself; culling it removes the subtree.
+        let dir = tempdir();
+        let bucket = cookie_bucket(&dir);
+        let index_cookie = bucket.join("Iindex");
+        fs::create_dir_all(&index_cookie).unwrap();
+        touch(&index_cookie.join("Schild"), 1);
+        touch(&bucket.join("Scookie"), 2);
+
+        let oldest = collect_oldest(&dir, 10);
+        let mut names: Vec<_> = oldest.iter().map(|c| c.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, vec!["Iindex", "Scookie"]);
+    }
+
+    #[test]
+    fn graveyard_cleanup_removes_entries() {
+        let dir = tempdir();
+        let graveyard = dir.join("graveyard");
+        fs::create_dir_all(graveyard.join("dead-dir")).unwrap();
+        fs::write(graveyard.join("dead-file"), b"x").unwrap();
+
+        let stats = clean_graveyard(&dir);
+        assert_eq!(stats.graveyard_removed, 2);
+        assert!(fs::read_dir(&graveyard).unwrap().next().is_none());
     }
 
     fn tempdir() -> PathBuf {

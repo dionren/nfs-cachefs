@@ -93,7 +93,7 @@ codegen unit, stripped symbols → ~1.9 MB stripped binary.
 - **CWD requirement for `cull` / `inuse`.** Kernel resolves the object
   name via `current->fs`, so the daemon must `chdir(parent)` first. See
   `cull::run_pass`. This is why cull is single-threaded.
-- **Limits ordering**: `stop < cull < run ≤ 100`, separately for `b*`
+- **Limits ordering**: `stop < cull < run < 100`, separately for `b*`
   (blocks) and `f*` (inodes). Validated in both `Config::validate` and
   `ConfigCmd::apply_and_bind`.
 - **Daemon must start before any `mount -o fsc`.** Otherwise the mount

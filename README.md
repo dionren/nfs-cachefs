@@ -139,7 +139,7 @@ Three percentage thresholds control this (defaults shown):
 | `stop`| 3 %     | hard floor — kernel refuses new caching below this       |
 
 Each appears twice: `b*` for blocks (capacity), `f*` for inodes (file
-count). Required ordering: `stop < cull < run ≤ 100`. A 100 G cache fs
+count). Required ordering: `stop < cull < run < 100`. A 100 G cache fs
 with defaults effectively keeps cache size around 90–93 G and starts
 shedding the oldest-by-atime objects when it hits 93 G. See `daemon.toml`
 to retune. Cull walks the cache directory in batches of `cull.batch_size`

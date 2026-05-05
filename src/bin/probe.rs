@@ -27,23 +27,23 @@ struct Args {
     tag: String,
 
     /// Free space % to resume caching (brun > bcull > bstop).
-    #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u8).range(0..=100))]
+    #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u8).range(0..=99))]
     brun: u8,
     /// Free space % at which to start culling.
-    #[arg(long, default_value_t = 7, value_parser = clap::value_parser!(u8).range(0..=100))]
+    #[arg(long, default_value_t = 7, value_parser = clap::value_parser!(u8).range(0..=99))]
     bcull: u8,
     /// Free space % at which to refuse new opens.
-    #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u8).range(0..=100))]
+    #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u8).range(0..=99))]
     bstop: u8,
 
     /// Free inode % to resume caching.
-    #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u8).range(0..=100))]
+    #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u8).range(0..=99))]
     frun: u8,
     /// Free inode % to start culling.
-    #[arg(long, default_value_t = 7, value_parser = clap::value_parser!(u8).range(0..=100))]
+    #[arg(long, default_value_t = 7, value_parser = clap::value_parser!(u8).range(0..=99))]
     fcull: u8,
     /// Free inode % at which to refuse new opens.
-    #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u8).range(0..=100))]
+    #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u8).range(0..=99))]
     fstop: u8,
 }
 
@@ -96,7 +96,7 @@ fn run() -> anyhow::Result<()> {
     while !STOP.load(Ordering::Relaxed) {
         let mut pollfd = libc::pollfd {
             fd: dev.as_raw_fd(),
-            events: libc::POLLIN,
+            events: libc::POLLIN | libc::POLLOUT,
             revents: 0,
         };
         let r = unsafe { libc::poll(&mut pollfd, 1, 1000) };
@@ -107,7 +107,7 @@ fn run() -> anyhow::Result<()> {
             }
             anyhow::bail!("poll: {err}");
         }
-        if r == 0 || (pollfd.revents & libc::POLLIN) == 0 {
+        if r == 0 || (pollfd.revents & (libc::POLLIN | libc::POLLOUT)) == 0 {
             continue;
         }
         match dev.read_state(&mut buf) {

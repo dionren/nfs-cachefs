@@ -2,9 +2,9 @@
 #
 # After editing, restart with: systemctl restart nfs-cachefs
 
-# Cache backing directory. MUST be the root of its own filesystem
-# (cachefiles refuses subdirectories of a host fs). Put a dedicated NVMe
-# partition or loop-backed ext4/xfs here for best performance.
+# Cache backing directory. MUST be its own mountpoint. A self-bind-mounted
+# subdirectory on NVMe xfs/ext4 is the usual fast path; a dedicated partition
+# or loop-backed filesystem also works.
 cache_dir = "/var/cache/fscache"
 
 # Identifier for this cache. Change if you run multiple caches; keep
@@ -21,7 +21,7 @@ tag = "nfscache"
 #   cull  - daemon starts deleting old objects below this level
 #   run   - daemon stops culling once free reaches this level
 #
-# Required ordering: stop < cull < run (each <= 100).
+# Required ordering: stop < cull < run < 100.
 [limits]
 brun  = 10
 bcull =  7
