@@ -5,11 +5,13 @@ Documentation=man:nfs-cachefs(8)
 # falls back to no caching.
 DefaultDependencies=no
 After=local-fs.target
+Wants=remote-fs-pre.target
 Before=remote-fs-pre.target
 ConditionFileNotEmpty=/etc/nfs-cachefs/daemon.toml
 
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=main
 ExecStart=/usr/sbin/nfs-cachefs --config /etc/nfs-cachefs/daemon.toml
 # The cachefiles module is in-tree on Ubuntu 24.04 but is not autoloaded.
 # The '+' prefix keeps CAP_SYS_MODULE out of the long-running daemon while
@@ -17,6 +19,7 @@ ExecStart=/usr/sbin/nfs-cachefs --config /etc/nfs-cachefs/daemon.toml
 ExecStartPre=+/sbin/modprobe -q cachefiles
 Restart=on-failure
 RestartSec=2s
+TimeoutStartSec=30s
 TimeoutStopSec=10s
 KillSignal=SIGTERM
 

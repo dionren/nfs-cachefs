@@ -40,7 +40,10 @@ impl Device {
         };
         if n < 0 {
             let source = io::Error::last_os_error();
-            return Err(Error::Kernel { cmd: cmd.to_string(), source });
+            return Err(Error::Kernel {
+                cmd: cmd.to_string(),
+                source,
+            });
         }
         if (n as usize) != cmd.len() {
             return Err(Error::Kernel {
@@ -185,10 +188,7 @@ fn validate_path_arg(label: &str, value: &str) -> Result<()> {
 }
 
 fn validate_token_arg(label: &str, value: &str) -> Result<()> {
-    if value.is_empty()
-        || value.contains(char::is_whitespace)
-        || has_command_break(value)
-    {
+    if value.is_empty() || value.contains(char::is_whitespace) || has_command_break(value) {
         return Err(Error::config(format!(
             "{label} must be non-empty and whitespace-free"
         )));
@@ -293,13 +293,7 @@ mod tests {
         let cmds = limit_commands("b", 0, 1, 2).unwrap();
         assert_eq!(
             cmds,
-            vec![
-                "brun 99%",
-                "bcull 98%",
-                "bstop 0%",
-                "bcull 1%",
-                "brun 2%",
-            ]
+            vec!["brun 99%", "bcull 98%", "bstop 0%", "bcull 1%", "brun 2%",]
         );
     }
 
@@ -312,23 +306,15 @@ mod tests {
 
     #[test]
     fn validates_config_command_arguments() {
-        assert!(
-            validate_config_args(Path::new("/var/cache/fscache"), "nfscache", None).is_ok()
-        );
-        assert!(
-            validate_config_args(Path::new("/var/cache/fs cache"), "nfscache", None).is_err()
-        );
-        assert!(
-            validate_config_args(Path::new("/var/cache/fscache"), "nfs cache", None).is_err()
-        );
-        assert!(
-            validate_config_args(
-                Path::new("/var/cache/fscache"),
-                "nfscache",
-                Some("ctx\nbind")
-            )
-            .is_err()
-        );
+        assert!(validate_config_args(Path::new("/var/cache/fscache"), "nfscache", None).is_ok());
+        assert!(validate_config_args(Path::new("/var/cache/fs cache"), "nfscache", None).is_err());
+        assert!(validate_config_args(Path::new("/var/cache/fscache"), "nfs cache", None).is_err());
+        assert!(validate_config_args(
+            Path::new("/var/cache/fscache"),
+            "nfscache",
+            Some("ctx\nbind")
+        )
+        .is_err());
     }
 
     #[test]

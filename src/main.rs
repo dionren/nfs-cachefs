@@ -8,7 +8,10 @@ use tracing::{error, info};
 use nfs_cachefs::{config, cull, daemon, proto, signals};
 
 #[derive(Parser, Debug)]
-#[command(version, about = "Userspace daemon for Linux fscache + cachefiles (traditional mode)")]
+#[command(
+    version,
+    about = "Userspace daemon for Linux fscache + cachefiles (traditional mode)"
+)]
 struct Args {
     /// Path to the TOML configuration file.
     #[arg(short, long, default_value = "/etc/nfs-cachefs/daemon.toml")]
@@ -36,7 +39,10 @@ fn main() -> ExitCode {
         }
     };
 
-    init_tracing(args.log_level.as_deref().unwrap_or(&cfg.log.level), &cfg.log.format);
+    init_tracing(
+        args.log_level.as_deref().unwrap_or(&cfg.log.level),
+        &cfg.log.format,
+    );
 
     if let Err(e) = signals::install(handle_signal) {
         error!(error = %e, "failed to install signal handlers");
@@ -81,8 +87,7 @@ fn main() -> ExitCode {
 
 fn init_tracing(level: &str, format: &str) {
     use tracing_subscriber::{fmt, EnvFilter};
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(level));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
     let builder = fmt().with_env_filter(filter).with_target(false);
     match format {
         "json" => {

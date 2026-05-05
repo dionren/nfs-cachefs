@@ -14,6 +14,10 @@ use crate::proto::{CacheState, ConfigCmd, Device};
 /// How often to log a heartbeat / metrics summary at INFO when idle.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
 
+/// How often to drain cachefiles' graveyard even when the kernel is not asking
+/// for active culling.
+const GRAVEYARD_INTERVAL: Duration = Duration::from_secs(30);
+
 /// Poll timeout. The kernel marks the device readable on state changes,
 /// but a wakeup also lets us run the heartbeat and check the stop flag.
 const POLL_TIMEOUT_MS: i32 = 5_000;
@@ -42,10 +46,21 @@ impl<'a> Daemon<'a> {
             cache_dir = %self.config.cache_dir.display(),
             "cache bound (traditional mode)"
         );
+        match crate::systemd_notify::ready("cache bound") {
+            Ok(true) => debug!("sent systemd readiness notification"),
+            Ok(false) => debug!("NOTIFY_SOCKET not set; readiness notification skipped"),
+            Err(e) => {
+                return Err(Error::Io(std::io::Error::other(format!(
+                    "failed to notify systemd readiness: {e}"
+                ))));
+            }
+        }
 
         let mut buf = [0u8; 256];
         let mut last_heartbeat = Instant::now();
+        let mut last_graveyard = Instant::now();
         let mut last_state: Option<CacheState> = None;
+        log_graveyard_cleanup(cull::clean_graveyard(&self.cull.cache_root));
 
         while !self.stop.load(Ordering::Relaxed) {
             let mut pollfd = libc::pollfd {
@@ -62,9 +77,7 @@ impl<'a> Daemon<'a> {
                 return Err(Error::Io(err));
             }
 
-            if r > 0
-                && (pollfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)) != 0
-            {
+            if r > 0 && (pollfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)) != 0 {
                 return Err(Error::Io(std::io::Error::other(format!(
                     "/dev/cachefiles poll returned revents=0x{:x}",
                     pollfd.revents
@@ -78,7 +91,7 @@ impl<'a> Daemon<'a> {
                         Ok(state) => {
                             debug!(?state, "state");
                             if state.culling {
-                                let stats = cull::run_pass(&self.dev, &self.cull);
+                                let stats = cull::run_pass(&self.dev, &self.cull, self.stop);
                                 if !stats.made_progress() {
                                     warn!(
                                         candidates = stats.candidates,
@@ -101,13 +114,22 @@ impl<'a> Daemon<'a> {
                 }
             }
 
+            if last_graveyard.elapsed() >= GRAVEYARD_INTERVAL {
+                last_graveyard = Instant::now();
+                log_graveyard_cleanup(cull::clean_graveyard(&self.cull.cache_root));
+            }
+
             if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
                 last_heartbeat = Instant::now();
                 if let Some(s) = last_state {
                     info!(
                         culling = s.culling,
-                        bstop = s.bstop, bcull = s.bcull, brun = s.brun,
-                        fstop = s.fstop, fcull = s.fcull, frun = s.frun,
+                        bstop = s.bstop,
+                        bcull = s.bcull,
+                        brun = s.brun,
+                        fstop = s.fstop,
+                        fcull = s.fcull,
+                        frun = s.frun,
                         "heartbeat"
                     );
                 } else {
@@ -119,6 +141,16 @@ impl<'a> Daemon<'a> {
         info!("stop signal received; closing /dev/cachefiles (kernel will unbind)");
         // self.dev drops here, closing the fd; the kernel withdraws the cache.
         Ok(())
+    }
+}
+
+fn log_graveyard_cleanup(stats: cull::CullStats) {
+    if stats.graveyard_removed > 0 || stats.errored > 0 {
+        info!(
+            removed = stats.graveyard_removed,
+            errored = stats.errored,
+            "graveyard cleanup done"
+        );
     }
 }
 

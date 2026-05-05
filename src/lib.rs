@@ -11,3 +11,4 @@ pub mod daemon;
 pub mod error;
 pub mod proto;
 pub mod signals;
+pub(crate) mod systemd_notify;

@@ -56,9 +56,8 @@ impl CacheState {
                     });
                 }
                 "frun" | "fcull" | "fstop" | "brun" | "bcull" | "bstop" => {
-                    let n = u64::from_str_radix(v, 16).map_err(|e| {
-                        Error::protocol(format!("hex parse {k}={v:?}: {e}"))
-                    })?;
+                    let n = u64::from_str_radix(v, 16)
+                        .map_err(|e| Error::protocol(format!("hex parse {k}={v:?}: {e}")))?;
                     match k {
                         "frun" => frun = Some(n),
                         "fcull" => fcull = Some(n),

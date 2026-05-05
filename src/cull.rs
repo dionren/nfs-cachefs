@@ -44,6 +44,7 @@
 use std::collections::BinaryHeap;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tracing::{debug, info, warn};
 
@@ -62,6 +63,7 @@ pub struct CullStats {
     pub culled: usize,
     pub bytes_freed: u64,
     pub skipped_busy: usize,
+    pub skipped_changed: usize,
     pub errored: usize,
     pub graveyard_removed: usize,
 }
@@ -79,9 +81,25 @@ struct Candidate {
     // as a max-heap, the root is the YOUNGEST of the K kept so far —
     // the one we should evict if a still-older file shows up.
     atime_secs: i64,
+    atime_nsecs: i64,
     size: u64,
     parent: PathBuf,
     name: String,
+}
+
+impl Candidate {
+    fn path(&self) -> PathBuf {
+        self.parent.join(&self.name)
+    }
+
+    fn atime_changed(&self) -> std::io::Result<bool> {
+        let meta = std::fs::symlink_metadata(self.path())?;
+        Ok(meta.atime() != self.atime_secs || meta.atime_nsec() != self.atime_nsecs)
+    }
+
+    fn is_older_than(&self, other: &Self) -> bool {
+        (self.atime_secs, self.atime_nsecs) < (other.atime_secs, other.atime_nsecs)
+    }
 }
 
 /// Run one cull pass. Walks the cache subtree, keeps the `batch_size`
@@ -90,9 +108,12 @@ struct Candidate {
 /// Per-object errors (EBUSY, chdir failure, etc.) are logged and counted
 /// but never propagated: the kernel re-signals if more culling is needed,
 /// and a single bad object should not bring the daemon down.
-pub fn run_pass(dev: &Device, ctx: &CullCtx) -> CullStats {
+pub fn run_pass(dev: &Device, ctx: &CullCtx, stop: &AtomicBool) -> CullStats {
     let started = std::time::Instant::now();
-    let mut stats = clean_graveyard(&ctx.cache_root);
+    let mut stats = clean_graveyard_interruptible(&ctx.cache_root, Some(stop));
+    if stop.load(Ordering::Relaxed) {
+        return stats;
+    }
     let cache_subdir = ctx.cache_root.join("cache");
     if !cache_subdir.exists() {
         warn!(
@@ -102,7 +123,7 @@ pub fn run_pass(dev: &Device, ctx: &CullCtx) -> CullStats {
         return stats;
     }
 
-    let oldest = collect_oldest(&cache_subdir, ctx.batch_size);
+    let oldest = collect_oldest_interruptible(&cache_subdir, ctx.batch_size, Some(stop));
     stats.candidates = oldest.len();
     debug!(found = stats.candidates, "cull candidates");
     if oldest.is_empty() {
@@ -112,6 +133,24 @@ pub fn run_pass(dev: &Device, ctx: &CullCtx) -> CullStats {
     let saved_cwd = std::env::current_dir().ok();
 
     for cand in oldest {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        match cand.atime_changed() {
+            Ok(false) => {}
+            Ok(true) => {
+                stats.skipped_changed += 1;
+                continue;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                continue;
+            }
+            Err(e) => {
+                warn!(path = %cand.path().display(), error = %e, "metadata recheck failed; skip");
+                stats.errored += 1;
+                continue;
+            }
+        }
         if let Err(e) = std::env::set_current_dir(&cand.parent) {
             warn!(parent = %cand.parent.display(), error = %e, "chdir failed; skip");
             stats.errored += 1;
@@ -143,6 +182,7 @@ pub fn run_pass(dev: &Device, ctx: &CullCtx) -> CullStats {
         culled = stats.culled,
         bytes_freed = stats.bytes_freed,
         skipped_busy = stats.skipped_busy,
+        skipped_changed = stats.skipped_changed,
         errored = stats.errored,
         graveyard_removed = stats.graveyard_removed,
         "cull pass done"
@@ -153,7 +193,16 @@ pub fn run_pass(dev: &Device, ctx: &CullCtx) -> CullStats {
 /// Walk the cache subtree and return the `k` oldest-by-atime objects in
 /// ascending-atime order. Uses a max-heap of size k → O(N log k) time,
 /// O(k) memory regardless of cache size.
+#[cfg(test)]
 fn collect_oldest(root: &Path, k: usize) -> Vec<Candidate> {
+    collect_oldest_interruptible(root, k, None)
+}
+
+fn collect_oldest_interruptible(
+    root: &Path,
+    k: usize,
+    stop: Option<&AtomicBool>,
+) -> Vec<Candidate> {
     if k == 0 {
         return Vec::new();
     }
@@ -164,14 +213,17 @@ fn collect_oldest(root: &Path, k: usize) -> Vec<Candidate> {
     // and hash buckets (depth 2); max_depth(3) prevents descending into
     // an index-cookie directory and culling its children individually
     // — culling the parent removes the whole subtree.
-    let mut entries = walkdir::WalkDir::new(root)
+    let entries = walkdir::WalkDir::new(root)
         .min_depth(3)
         .max_depth(3)
         .follow_links(false)
         .same_file_system(true)
         .into_iter();
 
-    while let Some(entry) = entries.next() {
+    for entry in entries {
+        if stop_requested(stop) {
+            break;
+        }
         let Ok(entry) = entry else { continue };
         let file_type = entry.file_type();
         if !(file_type.is_file() || file_type.is_dir()) {
@@ -183,10 +235,13 @@ fn collect_oldest(root: &Path, k: usize) -> Vec<Candidate> {
         if !is_cache_object_name(name) {
             continue;
         }
-        let Some(parent) = entry.path().parent() else { continue };
+        let Some(parent) = entry.path().parent() else {
+            continue;
+        };
         let Ok(meta) = entry.metadata() else { continue };
         let cand = Candidate {
             atime_secs: meta.atime(),
+            atime_nsecs: meta.atime_nsec(),
             size: meta.len(),
             parent: parent.to_path_buf(),
             name: name.to_string(),
@@ -196,7 +251,7 @@ fn collect_oldest(root: &Path, k: usize) -> Vec<Candidate> {
         } else if let Some(top) = heap.peek() {
             // Heap root = youngest of the K so far. If this candidate is
             // older, evict the youngest and keep this one.
-            if cand.atime_secs < top.atime_secs {
+            if cand.is_older_than(top) {
                 heap.pop();
                 heap.push(cand);
             }
@@ -207,6 +262,10 @@ fn collect_oldest(root: &Path, k: usize) -> Vec<Candidate> {
     heap.into_sorted_vec()
 }
 
+fn stop_requested(stop: Option<&AtomicBool>) -> bool {
+    stop.is_some_and(|stop| stop.load(Ordering::Relaxed))
+}
+
 fn is_cache_object_name(name: &str) -> bool {
     matches!(
         name.as_bytes().first(),
@@ -214,7 +273,11 @@ fn is_cache_object_name(name: &str) -> bool {
     )
 }
 
-fn clean_graveyard(cache_root: &Path) -> CullStats {
+pub fn clean_graveyard(cache_root: &Path) -> CullStats {
+    clean_graveyard_interruptible(cache_root, None)
+}
+
+fn clean_graveyard_interruptible(cache_root: &Path, stop: Option<&AtomicBool>) -> CullStats {
     let mut stats = CullStats::default();
     let graveyard = cache_root.join("graveyard");
     let Ok(entries) = std::fs::read_dir(&graveyard) else {
@@ -222,6 +285,9 @@ fn clean_graveyard(cache_root: &Path) -> CullStats {
     };
 
     for entry in entries {
+        if stop_requested(stop) {
+            break;
+        }
         let Ok(entry) = entry else {
             stats.errored += 1;
             continue;
@@ -275,13 +341,7 @@ mod tests {
     fn top_k_returns_k_oldest_in_ascending_order() {
         let dir = tempdir();
         let bucket = cookie_bucket(&dir);
-        for (n, off) in [
-            ("Da", 100),
-            ("Db", 50),
-            ("Dc", 200),
-            ("Dd", 25),
-            ("De", 75),
-        ] {
+        for (n, off) in [("Da", 100), ("Db", 50), ("Dc", 200), ("Dd", 25), ("De", 75)] {
             touch(&bucket.join(n), off);
         }
         let oldest = collect_oldest(&dir, 3);
@@ -354,6 +414,21 @@ mod tests {
         let stats = clean_graveyard(&dir);
         assert_eq!(stats.graveyard_removed, 2);
         assert!(fs::read_dir(&graveyard).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn candidate_recheck_detects_atime_change() {
+        let dir = tempdir();
+        let bucket = cookie_bucket(&dir);
+        let path = bucket.join("Scookie");
+        touch(&path, 10);
+
+        let oldest = collect_oldest(&dir, 1);
+        assert_eq!(oldest.len(), 1);
+        assert!(!oldest[0].atime_changed().unwrap());
+
+        touch(&path, 20);
+        assert!(oldest[0].atime_changed().unwrap());
     }
 
     fn tempdir() -> PathBuf {

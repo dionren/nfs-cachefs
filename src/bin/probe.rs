@@ -16,7 +16,10 @@ use nfs_cachefs::proto::{CacheState, ConfigCmd, Device};
 use nfs_cachefs::signals;
 
 #[derive(Parser, Debug)]
-#[command(version, about = "Diagnostic probe for Linux cachefiles traditional mode")]
+#[command(
+    version,
+    about = "Diagnostic probe for Linux cachefiles traditional mode"
+)]
 struct Args {
     /// Cache directory on NVMe (must be a dedicated mountpoint).
     #[arg(long, default_value = "/var/cache/fscache")]

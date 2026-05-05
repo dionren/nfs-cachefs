@@ -9,6 +9,7 @@ use serde::Deserialize;
 use crate::error::{Error, Result};
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     pub cache_dir: PathBuf,
     pub tag: String,
@@ -22,13 +23,20 @@ pub struct Config {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Limits {
-    #[serde(default = "default_brun")]  pub brun: u8,
-    #[serde(default = "default_bcull")] pub bcull: u8,
-    #[serde(default = "default_bstop")] pub bstop: u8,
-    #[serde(default = "default_brun")]  pub frun: u8,
-    #[serde(default = "default_bcull")] pub fcull: u8,
-    #[serde(default = "default_bstop")] pub fstop: u8,
+    #[serde(default = "default_brun")]
+    pub brun: u8,
+    #[serde(default = "default_bcull")]
+    pub bcull: u8,
+    #[serde(default = "default_bstop")]
+    pub bstop: u8,
+    #[serde(default = "default_brun")]
+    pub frun: u8,
+    #[serde(default = "default_bcull")]
+    pub fcull: u8,
+    #[serde(default = "default_bstop")]
+    pub fstop: u8,
 }
 
 impl Default for Limits {
@@ -44,11 +52,18 @@ impl Default for Limits {
     }
 }
 
-fn default_brun()  -> u8 { 10 }
-fn default_bcull() -> u8 { 7 }
-fn default_bstop() -> u8 { 3 }
+fn default_brun() -> u8 {
+    10
+}
+fn default_bcull() -> u8 {
+    7
+}
+fn default_bstop() -> u8 {
+    3
+}
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Cull {
     /// Max objects to consider per cull pass. Bounds CPU and IO.
     #[serde(default = "default_batch_size")]
@@ -57,13 +72,18 @@ pub struct Cull {
 
 impl Default for Cull {
     fn default() -> Self {
-        Self { batch_size: default_batch_size() }
+        Self {
+            batch_size: default_batch_size(),
+        }
     }
 }
 
-fn default_batch_size() -> usize { 1024 }
+fn default_batch_size() -> usize {
+    1024
+}
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Log {
     #[serde(default = "default_log_level")]
     pub level: String,
@@ -80,8 +100,12 @@ impl Default for Log {
     }
 }
 
-fn default_log_level()  -> String { "info".into() }
-fn default_log_format() -> String { "compact".into() }
+fn default_log_level() -> String {
+    "info".into()
+}
+fn default_log_format() -> String {
+    "compact".into()
+}
 
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
@@ -108,6 +132,17 @@ impl Config {
         crate::proto::cmd::validate_limit_triplet("f", l.fstop, l.fcull, l.frun)?;
         if self.cull.batch_size == 0 {
             return Err(Error::config("cull.batch_size must be > 0"));
+        }
+        if !matches!(
+            self.log.level.as_str(),
+            "error" | "warn" | "info" | "debug" | "trace"
+        ) {
+            return Err(Error::config(
+                "log.level must be one of: error, warn, info, debug, trace",
+            ));
+        }
+        if !matches!(self.log.format.as_str(), "compact" | "json") {
+            return Err(Error::config("log.format must be compact or json"));
         }
         Ok(())
     }
@@ -197,6 +232,50 @@ mod tests {
 
         cfg.cache_dir = PathBuf::from("/var/cache/fscache");
         cfg.secctx = Some("ctx\nbind".into());
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_unknown_fields() {
+        let s = r#"
+            cache_dir = "/var/cache/fscache"
+            tag = "nfscache"
+            max_size = "100G"
+        "#;
+        assert!(toml::from_str::<Config>(s).is_err());
+
+        let s = r#"
+            cache_dir = "/var/cache/fscache"
+            tag = "nfscache"
+            [limits]
+            brun = 10
+            bcull = 7
+            bstop = 3
+            unknown = 1
+        "#;
+        assert!(toml::from_str::<Config>(s).is_err());
+    }
+
+    #[test]
+    fn rejects_bad_log_settings() {
+        let s = r#"
+            cache_dir = "/var/cache/fscache"
+            tag = "nfscache"
+            [log]
+            level = "verbose"
+            format = "compact"
+        "#;
+        let cfg: Config = toml::from_str(s).unwrap();
+        assert!(cfg.validate().is_err());
+
+        let s = r#"
+            cache_dir = "/var/cache/fscache"
+            tag = "nfscache"
+            [log]
+            level = "info"
+            format = "pretty"
+        "#;
+        let cfg: Config = toml::from_str(s).unwrap();
         assert!(cfg.validate().is_err());
     }
 }
