@@ -22,7 +22,36 @@ used because Ubuntu 24.04 ships with `CONFIG_CACHEFILES_ONDEMAND=n`
 [`docs/architecture.md`](docs/architecture.md) for the full rationale and
 protocol details.
 
-## Build
+## Quick install (one command, Ubuntu 24.04 / x86_64)
+
+```sh
+curl -fsSL https://github.com/dionren/nfs-cachefs/releases/latest/download/install.sh | sudo bash
+```
+
+The installer prompts for three values (defaults shown), checks the kernel
+and `cachefiles` module, downloads the released binary tarball, writes the
+systemd unit + drop-in + `daemon.toml`, sets up the bind-mounted cache dir
+and the cached NFS mount in `/etc/fstab`, then enables and starts the
+daemon. Existing fstab entries and configs are preserved.
+
+| prompt | default |
+|--------|---------|
+| Cache directory  | `/mnt/nvme/nfs-cachefs` |
+| Mount directory  | `/mnt/llm-data` |
+| NFS endpoint     | *(required, format `server:/export`)* |
+
+Non-interactive (CI / scripted):
+
+```sh
+curl -fsSL https://github.com/dionren/nfs-cachefs/releases/latest/download/install.sh \
+  | sudo CACHE_DIR=/mnt/nvme/nfs-cachefs \
+         MOUNT_DIR=/mnt/llm-data \
+         NFS_ENDPOINT=nfs.example.com:/srv/share \
+         NFSCACHEFS_YES=1 \
+         bash
+```
+
+## Build from source
 
 Requires Rust ≥ 1.75 (`rustup install stable`).
 

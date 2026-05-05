@@ -1,0 +1,68 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build release
+        run: cargo build --release --locked
+
+      - name: Bundle artifacts
+        run: |
+          set -euxo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          STAGE="dist/nfs-cachefs"
+          mkdir -p "$STAGE/sbin" \
+                   "$STAGE/etc/nfs-cachefs" \
+                   "$STAGE/lib/systemd/system" \
+                   "$STAGE/share/man/man8"
+          cp target/release/nfs-cachefs       "$STAGE/sbin/"
+          cp target/release/nfs-cachefs-probe "$STAGE/sbin/"
+          cp packaging/etc/nfs-cachefs/daemon.toml \
+                                              "$STAGE/etc/nfs-cachefs/"
+          cp packaging/systemd/nfs-cachefs.service \
+                                              "$STAGE/lib/systemd/system/"
+          cp packaging/share/man/man8/nfs-cachefs.8 \
+                                              "$STAGE/share/man/man8/"
+          echo "$VERSION" > "$STAGE/VERSION"
+
+          (cd dist && tar czf nfs-cachefs-linux-amd64.tar.gz nfs-cachefs)
+          (cd dist && sha256sum nfs-cachefs-linux-amd64.tar.gz \
+                              > nfs-cachefs-linux-amd64.tar.gz.sha256)
+
+          cp packaging/remote-install.sh dist/install.sh
+          chmod +x dist/install.sh
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euxo pipefail
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            dist/nfs-cachefs-linux-amd64.tar.gz \
+            dist/nfs-cachefs-linux-amd64.tar.gz.sha256 \
+            dist/install.sh
