@@ -40,6 +40,7 @@ set -euo pipefail
 REPO="dionren/nfs-cachefs"
 RELEASE="${NFSCACHEFS_RELEASE:-latest}"
 ASSET="nfs-cachefs-linux-amd64.tar.gz"
+UPGRADE_MODE=""
 
 DEFAULT_CACHE_DIR="/mnt/nvme/nfs-cachefs"
 DEFAULT_MOUNT_DIR="/mnt/llm-data"
@@ -115,6 +116,49 @@ confirm() {
 
 cleanup() { [[ -n "${WORKDIR:-}" && -d "$WORKDIR" ]] && rm -rf "$WORKDIR"; }
 trap cleanup EXIT
+
+# ─── Upgrade detection ────────────────────────────────────────────────────
+detect_upgrade() {
+    [[ -x /usr/sbin/nfs-cachefs && -f /etc/nfs-cachefs/daemon.toml ]] || return 0
+    UPGRADE_MODE=1
+    info "existing installation detected — upgrade mode (configuration will be preserved)"
+}
+
+load_existing_config() {
+    step "Reading existing configuration"
+
+    CACHE_DIR=$(awk -F'"' '/^[[:space:]]*cache_dir[[:space:]]*=[[:space:]]*"/{print $2; exit}' \
+                /etc/nfs-cachefs/daemon.toml)
+    [[ -n "${CACHE_DIR:-}" ]] || { err "cannot read cache_dir from /etc/nfs-cachefs/daemon.toml"; exit 1; }
+    info "cache_dir:    $CACHE_DIR"
+
+    # Read NFS mount info from fstab (first nfs entry with fsc option)
+    if [[ -z "${MOUNT_DIR:-}" ]]; then
+        MOUNT_DIR=$(awk '$3=="nfs" && ("," $4 ",") ~ /,fsc,/{print $2; exit}' /etc/fstab 2>/dev/null || true)
+    fi
+    if [[ -z "${NFS_ENDPOINT:-}" ]]; then
+        NFS_ENDPOINT=$(awk '$3=="nfs" && ("," $4 ",") ~ /,fsc,/{print $1; exit}' /etc/fstab 2>/dev/null || true)
+    fi
+
+    local opts=""
+    if [[ -n "${MOUNT_DIR:-}" ]]; then
+        opts=$(awk -v t="$MOUNT_DIR" '$3=="nfs" && $2==t{print $4; exit}' /etc/fstab 2>/dev/null || true)
+    fi
+    if [[ -z "${NFS_RW:-}" ]]; then
+        [[ ",$opts," == *",ro,"* ]] && NFS_RW=0 || NFS_RW=1
+    fi
+    if [[ -z "${NFS_NCONNECT:-}" ]]; then
+        NFS_NCONNECT=$DEFAULT_NFS_NCONNECT
+        if [[ "$opts" =~ nconnect=([0-9]+) ]]; then NFS_NCONNECT=${BASH_REMATCH[1]}; fi
+    fi
+    if [[ -z "${NFS_VERS:-}" ]]; then
+        NFS_VERS=$DEFAULT_NFS_VERS
+        if [[ "$opts" =~ vers=([0-9.]+) ]]; then NFS_VERS=${BASH_REMATCH[1]}; fi
+    fi
+
+    info "mount_dir:    ${MOUNT_DIR:-(not found in fstab)}"
+    info "nfs_endpoint: ${NFS_ENDPOINT:-(not found in fstab)}"
+}
 
 # ─── Environment check ────────────────────────────────────────────────────
 need_root() {
@@ -613,14 +657,16 @@ start_service() {
         exit 1
     fi
 
-    if mountpoint -q "$MOUNT_DIR"; then
-        info "$MOUNT_DIR already mounted; not remounting"
-    else
-        info "mounting $MOUNT_DIR"
-        if ! mount "$MOUNT_DIR"; then
-            err "failed to mount $MOUNT_DIR"
-            err "  check the new fstab entry and that the NFS server is reachable"
-            exit 1
+    if [[ -n "${MOUNT_DIR:-}" ]]; then
+        if mountpoint -q "$MOUNT_DIR"; then
+            info "$MOUNT_DIR already mounted; not remounting"
+        else
+            info "mounting $MOUNT_DIR"
+            if ! mount "$MOUNT_DIR"; then
+                err "failed to mount $MOUNT_DIR"
+                err "  check the new fstab entry and that the NFS server is reachable"
+                exit 1
+            fi
         fi
     fi
 }
@@ -637,7 +683,7 @@ verify() {
         sed 's/^/    /' /proc/fs/nfsfs/volumes
     fi
 
-    local rw_label="rw"; [[ "$NFS_RW" == "0" ]] && rw_label="ro"
+    local rw_label="rw"; [[ "${NFS_RW:-1}" == "0" ]] && rw_label="ro"
     cat <<EOF
 
 ${GREEN}${BOLD}nfs-cachefs $SRC_VERSION installed.${RESET}
@@ -646,7 +692,7 @@ ${GREEN}${BOLD}nfs-cachefs $SRC_VERSION installed.${RESET}
   config:     /etc/nfs-cachefs/daemon.toml
   drop-in:    /etc/systemd/system/nfs-cachefs.service.d/local.conf
   cache dir:  $CACHE_DIR
-  nfs mount:  $MOUNT_DIR  ←  $NFS_ENDPOINT  ($rw_label, fsc, vers=$NFS_VERS, nconnect=$NFS_NCONNECT)
+  nfs mount:  ${MOUNT_DIR:-(see /etc/fstab)}  ←  ${NFS_ENDPOINT:-(see /etc/fstab)}  ($rw_label, fsc, vers=${NFS_VERS:-?}, nconnect=${NFS_NCONNECT:-?})
 
 Quick check (FSC=yes proves caching is wired up):
   cat /proc/fs/nfsfs/volumes
@@ -665,14 +711,23 @@ EOF
 }
 
 main() {
+    detect_upgrade
     check_environment
-    collect_inputs
-    resolve_source
-    install_files
-    setup_cache
-    setup_nfs
-    start_service
-    verify
+    if [[ -n "$UPGRADE_MODE" ]]; then
+        load_existing_config
+        resolve_source
+        install_files
+        start_service
+        verify
+    else
+        collect_inputs
+        resolve_source
+        install_files
+        setup_cache
+        setup_nfs
+        start_service
+        verify
+    fi
 }
 
 main "$@"
