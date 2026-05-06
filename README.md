@@ -40,17 +40,31 @@ match wins:
 
 ### Online (Ubuntu 24.04 / x86_64)
 
+Interactive — three prompts (defaults shown):
+
 ```sh
 curl -fsSL https://github.com/dionren/nfs-cachefs/releases/latest/download/install.sh | sudo bash
 ```
-
-Three prompts (defaults shown):
 
 | prompt           | default                      |
 |------------------|------------------------------|
 | Cache directory  | `/mnt/nvme/nfs-cachefs`      |
 | Mount directory  | `/mnt/llm-data`              |
 | NFS endpoint     | *(required, `server:/export`)* |
+
+Non-interactive — pass values via env vars (also the recommended form for
+**upgrades**: rerun this on an existing install and the script preserves
+your `daemon.toml` customizations, rewrites the fstab line in place, and
+restarts the daemon without dropping the live mount):
+
+```sh
+curl -fsSL https://github.com/dionren/nfs-cachefs/releases/latest/download/install.sh \
+  | sudo CACHE_DIR=/mnt/nvme/nfs-cachefs \
+         MOUNT_DIR=/mnt/llm-data \
+         NFS_ENDPOINT=nfs.example.com:/srv/share \
+         NFSCACHEFS_YES=1 \
+         bash
+```
 
 ### Offline / air-gapped
 
@@ -75,10 +89,12 @@ cargo build --release      # Rust ≥ 1.75
 sudo packaging/install.sh  # auto-detects the in-source build
 ```
 
-### Non-interactive (CI / scripted)
+### All env knobs
 
-All prompts have env-var equivalents; set `NFSCACHEFS_YES=1` to skip the
-"proceed?" confirmation:
+The curl-piped non-interactive form above is the minimum; below are all
+knobs the script honors. They work the same whether the script is piped
+from curl, run from disk (`./install.sh`), or run from the repo
+(`packaging/install.sh`):
 
 ```sh
 sudo CACHE_DIR=/mnt/nvme/nfs-cachefs \
@@ -106,11 +122,12 @@ sudo CACHE_DIR=/mnt/nvme/nfs-cachefs \
 
 The installer is idempotent and preserves existing entries:
 
-1. Stops a previously running `nfs-cachefs` (if any), then writes the
-   binaries (`/usr/sbin/`), config (`/etc/nfs-cachefs/daemon.toml`),
+1. Writes the binaries (`/usr/sbin/`), config (`/etc/nfs-cachefs/daemon.toml`),
    unit file (`/lib/systemd/system/`), and a drop-in
    (`/etc/systemd/system/nfs-cachefs.service.d/local.conf`) that pins
-   `ReadWritePaths=` and `RequiresMountsFor=` to your `cache_dir`.
+   `ReadWritePaths=` and `RequiresMountsFor=` to your `cache_dir`. A
+   running daemon is **not** stopped here — the kernel keeps the old
+   binary mmapped, and step 5 picks up the new code via `restart`.
 2. Adds `cachefiles` to `/etc/modules-load.d/` so the kernel module is
    loaded on boot.
 3. Creates `cache_dir` 0700 and self-bind-mounts it (cachefiles
