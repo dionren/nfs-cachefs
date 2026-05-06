@@ -52,8 +52,7 @@ jobs:
           (cd dist && sha256sum nfs-cachefs-linux-amd64.tar.gz \
                               > nfs-cachefs-linux-amd64.tar.gz.sha256)
 
-          cp packaging/remote-install.sh dist/install.sh
-          chmod +x dist/install.sh
+          install -m 0755 packaging/install.sh dist/install.sh
 
       - name: Create GitHub Release
         env:

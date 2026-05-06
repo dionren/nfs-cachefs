@@ -22,137 +22,149 @@ used because Ubuntu 24.04 ships with `CONFIG_CACHEFILES_ONDEMAND=n`
 [`docs/architecture.md`](docs/architecture.md) for the full rationale and
 protocol details.
 
-## Quick install (one command, Ubuntu 24.04 / x86_64)
+## Install
+
+A single end-to-end installer (`packaging/install.sh`, also published as
+`install.sh` in each GitHub release) handles everything: environment
+checks, file installation, the bind-mounted cache directory, the cached
+NFS mount in `/etc/fstab`, the systemd unit + drop-in, module autoload,
+and starting the daemon. It works in three modes — auto-detected, first
+match wins:
+
+1. **In-source build** — `sudo packaging/install.sh` from a built repo
+   (uses `target/release/*` directly).
+2. **Offline tarball** — `sudo ./install.sh` with the release tarball
+   `nfs-cachefs-linux-amd64.tar.gz` next to the script (or
+   `NFSCACHEFS_TARBALL=/path/to/tarball.tar.gz`).
+3. **Online** — fetched from GitHub releases.
+
+### Online (Ubuntu 24.04 / x86_64)
 
 ```sh
 curl -fsSL https://github.com/dionren/nfs-cachefs/releases/latest/download/install.sh | sudo bash
 ```
 
-The installer prompts for three values (defaults shown), checks the kernel
-and `cachefiles` module, downloads the released binary tarball, writes the
-systemd unit + drop-in + `daemon.toml`, sets up the bind-mounted cache dir
-and the cached NFS mount in `/etc/fstab`, then enables and starts the
-daemon. Existing fstab entries and configs are preserved.
+Three prompts (defaults shown):
 
-| prompt | default |
-|--------|---------|
-| Cache directory  | `/mnt/nvme/nfs-cachefs` |
-| Mount directory  | `/mnt/llm-data` |
-| NFS endpoint     | *(required, format `server:/export`)* |
+| prompt           | default                      |
+|------------------|------------------------------|
+| Cache directory  | `/mnt/nvme/nfs-cachefs`      |
+| Mount directory  | `/mnt/llm-data`              |
+| NFS endpoint     | *(required, `server:/export`)* |
 
-Non-interactive (CI / scripted):
+### Offline / air-gapped
 
-```sh
-curl -fsSL https://github.com/dionren/nfs-cachefs/releases/latest/download/install.sh \
-  | sudo CACHE_DIR=/mnt/nvme/nfs-cachefs \
-         MOUNT_DIR=/mnt/llm-data \
-         NFS_ENDPOINT=nfs.example.com:/srv/share \
-         NFSCACHEFS_YES=1 \
-         bash
-```
-
-## Build from source
-
-Requires Rust ≥ 1.75 (`rustup install stable`).
+Download the script and the tarball ahead of time, drop them in the same
+directory, then run as root:
 
 ```sh
-cargo build --release
-# target/release/nfs-cachefs       — the daemon
-# target/release/nfs-cachefs-probe — diagnostic: bind, log heartbeats, exit on signal
+RELEASE=https://github.com/dionren/nfs-cachefs/releases/latest/download
+curl -fsSLO "$RELEASE/install.sh"
+curl -fsSLO "$RELEASE/nfs-cachefs-linux-amd64.tar.gz"
+curl -fsSLO "$RELEASE/nfs-cachefs-linux-amd64.tar.gz.sha256"   # optional, verified if present
+chmod +x install.sh
+sudo ./install.sh
 ```
 
-## Install
+Or point at a tarball anywhere with `NFSCACHEFS_TARBALL=/path/to/tar.gz sudo ./install.sh`.
+
+### Build from source
 
 ```sh
-sudo packaging/install.sh
-# Installs to /usr/sbin/, /etc/nfs-cachefs/, /lib/systemd/system/, /usr/share/man/man8/
+cargo build --release      # Rust ≥ 1.75
+sudo packaging/install.sh  # auto-detects the in-source build
 ```
 
-Override paths via `PREFIX`, `SYSCONFDIR`, `SYSTEMD_UNIT_DIR`, `MANDIR`.
+### Non-interactive (CI / scripted)
 
-## Configure and run
+All prompts have env-var equivalents; set `NFSCACHEFS_YES=1` to skip the
+"proceed?" confirmation:
 
-1. Make `cache_dir` its own mountpoint. Cachefiles refuses a path that
-   isn't a mount root (`mnt->mnt_root == dentry`). Three setups satisfy
-   it; pick the one that matches your disk layout.
+```sh
+sudo CACHE_DIR=/mnt/nvme/nfs-cachefs \
+     MOUNT_DIR=/mnt/llm-data \
+     NFS_ENDPOINT=nfs.example.com:/srv/share \
+     NFS_RW=1 NFS_NCONNECT=4 NFS_VERS=3 \
+     NFSCACHEFS_YES=1 \
+     ./install.sh
+```
 
-   **Recommended — self-bind a subdirectory** of an existing NVMe xfs
-   (no loop driver, no repartitioning):
+| env var               | default                  | notes                              |
+|-----------------------|--------------------------|------------------------------------|
+| `CACHE_DIR`           | `/mnt/nvme/nfs-cachefs`  | self-bind-mounted                  |
+| `MOUNT_DIR`           | `/mnt/llm-data`          | NFS mount target                   |
+| `NFS_ENDPOINT`        | *(required)*             | `server:/export`                   |
+| `NFS_RW`              | `1`                      | `0` for read-only                  |
+| `NFS_NCONNECT`        | `4`                      | TCP connections (1..16)            |
+| `NFS_VERS`            | `3`                      | `3`, `4`, `4.1`, `4.2`             |
+| `NFSCACHEFS_TARBALL`  | *(auto-detect / online)* | force a specific tarball           |
+| `NFSCACHEFS_RELEASE`  | `latest`                 | pin a release tag                  |
+| `NFSCACHEFS_YES`      | unset                    | skip confirmation prompts          |
+| `NFSCACHEFS_NO_START` | unset                    | install only; don't start daemon   |
 
-   ```sh
-   sudo mkdir -p /mnt/nvme/cache && sudo chmod 0700 /mnt/nvme/cache
-   sudo mount --bind /mnt/nvme/cache /mnt/nvme/cache
-   # persist across reboot:
-   echo '/mnt/nvme/cache  /mnt/nvme/cache  none  bind,x-systemd.requires=mnt-nvme.mount  0 0' \
-     | sudo tee -a /etc/fstab
-   ```
+### What the installer actually does
 
-   **Dedicated partition / logical volume** if you have spare disk:
+The installer is idempotent and preserves existing entries:
 
-   ```sh
-   sudo mkfs.xfs /dev/nvme0n1p1
-   sudo mount /dev/nvme0n1p1 /var/cache/fscache
-   ```
+1. Stops a previously running `nfs-cachefs` (if any), then writes the
+   binaries (`/usr/sbin/`), config (`/etc/nfs-cachefs/daemon.toml`),
+   unit file (`/lib/systemd/system/`), and a drop-in
+   (`/etc/systemd/system/nfs-cachefs.service.d/local.conf`) that pins
+   `ReadWritePaths=` and `RequiresMountsFor=` to your `cache_dir`.
+2. Adds `cachefiles` to `/etc/modules-load.d/` so the kernel module is
+   loaded on boot.
+3. Creates `cache_dir` 0700 and self-bind-mounts it (cachefiles
+   requires `mnt->mnt_root == dentry`); appends an fstab `bind` entry
+   with `x-systemd.requires=` pointing at the parent mount unit.
+4. Writes / **replaces** the fstab line at `MOUNT_DIR`. If a non-`fsc`
+   NFS entry is already there, it's commented out and the new line is
+   inserted in place; backups land at `/etc/fstab.bak.<timestamp>`.
+   The new options:
+   `auto,_netdev,fsc,nosharecache,vers=$NFS_VERS,proto=tcp,nconnect=$NFS_NCONNECT,timeo=60,retrans=2,noatime,nodiratime,nolock,nocto,actimeo=60,acregmax=3600,$rw_or_ro`
+5. `modprobe cachefiles`, `daemon-reload`, then either `enable --now`
+   (fresh install) or `restart` (upgrade) on `nfs-cachefs`. Finally
+   `mount $MOUNT_DIR` if it isn't already mounted.
+6. Verifies: `/proc/fs/nfsfs/volumes` should now show `FSC=yes` for the
+   cached export, and `/proc/fs/fscache/caches` shows state `A`.
 
-   **Loop-backed image** if you need a fixed-size container on shared fs:
+The unit's `Before=remote-fs-pre.target` ordering keeps the daemon
+ahead of any standard NFS mount at boot — that's load-bearing because a
+mount that races ahead of the daemon silently falls back to no-caching
+with no error logged. The fstab line intentionally omits
+`x-systemd.requires=nfs-cachefs.service`: with that option set, every
+daemon restart cascades to a forced unmount, and the subsequent
+re-mount can land on a stale fscache superblock (visible in
+`/proc/fs/nfsfs/volumes` as a duplicate FSID line with `FSC=no`).
+Boot-time ordering alone is sufficient; for clean live upgrades use
+`systemctl restart nfs-cachefs` (the live mount keeps `fsc` because
+the kernel re-attaches cookies when the cache rebinds).
 
-   ```sh
-   sudo truncate -s 100G /var/lib/nfs-cachefs.img
-   sudo mkfs.xfs   /var/lib/nfs-cachefs.img
-   sudo mount -o loop /var/lib/nfs-cachefs.img /var/cache/fscache
-   ```
+### Manual setup (without the installer)
 
-   On multi-NVMe rigs the bind-mount option avoids ~3 GB/s of loop
-   driver overhead — see [Performance](#performance) for numbers.
+If you'd rather do each step yourself, the recipe is the same as the
+installer's: `cache_dir` must be its own mountpoint (a self-bind on an
+xfs/ext4 NVMe is the fast path; a dedicated partition or loop image
+also works), the NFS mount needs `fsc,nosharecache,_netdev`, and the
+daemon must start before the mount. Quick check after wiring it up:
 
-   The capacity of this filesystem (or, for bind-mount, the parent fs
-   minus other content) is the upper bound on the cache. There is no
-   `max_size` knob in `daemon.toml` — the cache fills the backing fs and
-   the kernel triggers cull when free space drops below the `bcull` /
-   `fcull` percentages (see `[limits]` in the config).
+```sh
+cat /proc/fs/nfsfs/volumes        # FSC column = yes
+cat /proc/fs/fscache/caches       # state = A (active)
+cat /proc/fs/fscache/stats        # IO rd/wr counters move on access
+```
 
-2. Edit `/etc/nfs-cachefs/daemon.toml` if you want non-default thresholds
-   or a different cache directory. If you run under the packaged systemd
-   unit and change `cache_dir` after installation, also add a drop-in that
-   sets `ReadWritePaths=` to the same path; the shipped unit keeps the daemon
-   confined to `/var/cache/fscache` by default.
+### Uninstall
 
-3. Enable and start.
-
-   ```sh
-   sudo systemctl enable --now nfs-cachefs
-   sudo systemctl status nfs-cachefs
-   ```
-
-4. Add `fsc` to your NFS mount options. Full fstab example (one logical
-   line; backslashes shown only for typesetting):
-
-   ```
-   server:/export  /mnt/data  nfs  \
-     vers=3,proto=tcp,fsc,timeo=60,retrans=2,nconnect=4,noatime,nodiratime,\
-     nolock,nocto,actimeo=60,acregmax=3600,_netdev  0  0
-   ```
-
-   Or with systemd lazy-mount:
-
-   ```
-   server:/export  /mnt/data  nfs  \
-     vers=3,proto=tcp,fsc,...,_netdev,x-systemd.automount,\
-     x-systemd.idle-timeout=600  0  0
-   ```
-
-   The systemd unit ships with `Before=remote-fs-pre.target`, so
-   `nfs-cachefs` starts before any standard NFS mount in `/etc/fstab`.
-   **This ordering is load-bearing**: if the NFS mount races ahead of the
-   daemon, `fsc` silently falls back to no-caching with no error logged.
-
-5. Verify caching is wired up.
-
-   ```sh
-   cat /proc/fs/nfsfs/volumes        # FSC column = yes
-   cat /proc/fs/fscache/caches       # state = A (active)
-   cat /proc/fs/fscache/stats        # IO rd/wr counters move on access
-   ```
+```sh
+sudo systemctl disable --now nfs-cachefs
+sudo umount /mnt/llm-data /mnt/nvme/nfs-cachefs 2>/dev/null || true
+sudo rm -f  /usr/sbin/nfs-cachefs /usr/sbin/nfs-cachefs-probe
+sudo rm -f  /usr/share/man/man8/nfs-cachefs.8
+sudo rm -rf /etc/nfs-cachefs /etc/systemd/system/nfs-cachefs.service.d
+sudo rm -f  /lib/systemd/system/nfs-cachefs.service
+sudo rm -f  /etc/modules-load.d/cachefiles.conf
+# then remove the two fstab entries the installer added (or restore from /etc/fstab.bak.*)
+```
 
 ## How the cache is sized and culled
 

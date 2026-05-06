@@ -27,9 +27,10 @@ Thumbs.db
 /tmp/
 
 
-# Release packages - these should be uploaded to GitHub releases, not committed
-nfs-cachefs-v*.tar.gz
-nfs-cachefs-v*.tar.gz.sha256
+# Release packages - built locally or by CI, never committed
+/dist/
+nfs-cachefs-*.tar.gz
+nfs-cachefs-*.tar.gz.sha256
 nfs-cachefs-v*-linux-*/
 
 # Temporary files
