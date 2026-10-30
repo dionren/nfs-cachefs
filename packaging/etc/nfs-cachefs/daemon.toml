@@ -15,7 +15,8 @@ tag = "nfscache"
 # system enforces a non-default policy on the cache dir.
 # secctx = "system_u:system_r:cachefiles_kernel_t:s0"
 
-# Free space / inode thresholds, all percentages of the cache filesystem:
+# Free space / inode thresholds, all percentages of the cache filesystem
+# (the whole filesystem: other data stored on it counts too):
 #
 #   stop  - kernel refuses new caching below this level
 #   cull  - daemon starts deleting old objects below this level
@@ -31,9 +32,10 @@ fcull =  7
 fstop =  3
 
 [cull]
-# Maximum number of cache objects to consider in one cull pass. Bounds
-# CPU and disk I/O when the cache is large. The daemon re-runs the pass
-# whenever the kernel signals cull pressure again.
+# How many of the oldest cache objects to collect per walk of the cache
+# directory. Bounds memory and CPU when the cache is large. A cull pass
+# deletes only as many as it needs to bring free space back to `run`, and
+# walks again if one batch is not enough.
 batch_size = 1024
 
 [log]

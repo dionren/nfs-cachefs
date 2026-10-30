@@ -200,8 +200,17 @@ Each appears twice: `b*` for blocks (capacity), `f*` for inodes (file
 count). Required ordering: `stop < cull < run < 100`. A 100 G cache fs
 with defaults effectively keeps cache size around 90–93 G and starts
 shedding the oldest-by-atime objects when it hits 93 G. See `daemon.toml`
-to retune. Cull walks the cache directory in batches of `cull.batch_size`
-(default 1024) per pass.
+to retune. Each cull frees only what is missing to get back to `run`
+(counting the space files really occupy, not their sparse size), reading
+the cache directory `cull.batch_size` (default 1024) objects at a time.
+
+The percentages are of the whole filesystem, so on a volume shared with
+other data that data counts too: the cache grows until the volume is
+93 % full and gives space back as the other data grows.
+
+The `heartbeat` log line shows where the cache stands: `bavail` / `ffree`
+are the current free blocks / inodes, `bcull` / `brun` (and `fcull` /
+`frun`) the limits they are compared against.
 
 ## Performance
 

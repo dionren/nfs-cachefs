@@ -111,9 +111,26 @@ codegen unit, stripped symbols → ~1.9 MB stripped binary.
 - Kernel state line is space-separated `k=v`; `cull` is decimal, others
   are **hex without `0x`**. Parser ignores unknown fields for forward
   compat (`proto/state.rs`).
+- The state line's `b*` / `f*` are the kernel's **limits** (fixed at
+  bind, in fs blocks / inodes), not free counts. Current free space comes
+  from `statfs(cache_dir)` `f_bavail` / `f_ffree`, the same numbers the
+  kernel compares against them.
 - The kernel marks the device readable to wake the daemon up for state
   changes; we still poll with a 5 s timeout to drive heartbeat + check
-  the stop flag.
+  the stop flag. `POLLOUT` stays asserted while `cull=1`.
+- The kernel re-checks free space only on cache writes and daemon reads,
+  so the daemon also reads the state on every poll timeout. Without that
+  an idle cache never culls while other data fills a shared filesystem.
+- `/proc/fs/fscache/caches` keeps a cache record in state `-` after its
+  daemon exits while an `fsc` mount references it; a restart's bind with
+  the same tag takes it over. Only `P`/`A`/`E`/`W` mean the tag is taken.
+- **Size each cull pass, then wait for statfs.** A pass frees only the
+  shortfall to `brun` / `frun`, counted in `st_blocks` (cache files are
+  sparse; `st_size` overstates several-fold). XFS frees unlinked inodes
+  in background workers, so statfs — and the kernel — lag a burst of
+  culls; the daemon waits (`daemon.rs` `Settle`) before sizing another
+  pass. Culling whole batches and re-reading state immediately emptied
+  production caches on every cull episode.
 
 ## Verification commands (kernel side)
 
@@ -193,7 +210,10 @@ reintroduce a FUSE/userspace data path.
 ## Testing
 
 - Unit tests live inline (`#[cfg(test)] mod tests`) in `config.rs`,
-  `proto/state.rs`, `proto/cmd.rs`. Run with `cargo test`.
+  `cull.rs`, `daemon.rs`, `proto/state.rs`, `proto/cmd.rs`. Run with
+  `cargo test`. Cull pass logic is tested through `run_pass_with` with a
+  fake kernel `cull`; production caches sit on XFS, so also run the tests
+  with `TMPDIR` on an XFS mount when touching size accounting.
 - E2E (`tests/e2e/nfs-fscache.sh`) requires root, `cachefiles` module,
   `/var/cache/fscache` as its own mountpoint, and a reachable NFS
   server. Pass via env vars: `NFS_SERVER`, `NFS_EXPORT`, `TEST_FILE`.
