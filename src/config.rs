@@ -65,7 +65,8 @@ fn default_bstop() -> u8 {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Cull {
-    /// Max objects to consider per cull pass. Bounds CPU and IO.
+    /// Oldest objects collected per walk of the cache directory. Bounds
+    /// memory and CPU; a pass walks again if one batch is not enough.
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
 }

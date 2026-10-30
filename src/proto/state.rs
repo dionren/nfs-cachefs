@@ -6,15 +6,20 @@
 //! cull=N frun=H fcull=H fstop=H brun=H bcull=H bstop=H
 //! ```
 //!
-//! - `cull` is `1` if the cache is below the bcull/fcull threshold and the
-//!   daemon should start culling, `0` otherwise.
-//! - The other fields are current free counts, hex-formatted (no `0x`
-//!   prefix). `f*` are inode counts; `b*` are block counts.
+//! - `cull` is `1` while the kernel wants culling: it is set when free space
+//!   drops below `bcull`/`fcull` and cleared once free space is back at
+//!   `brun`/`frun`. The kernel re-checks free space on every read.
+//! - The other fields are the limits themselves, not free counts: the
+//!   configured percentages converted at bind time into filesystem blocks
+//!   (`b*`) and inodes (`f*`), hex-formatted (no `0x` prefix). They stay
+//!   fixed while the cache is bound. The kernel compares them with
+//!   `f_bavail` / `f_ffree` from `statfs(cache_dir)`.
 //!
 //! There is no trailing newline. Whitespace separates fields.
 
 use crate::error::{Error, Result};
 
+/// One state line. `b*` / `f*` are the kernel's limits, not free counts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CacheState {
     pub culling: bool,

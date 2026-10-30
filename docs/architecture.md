@@ -108,11 +108,25 @@ A single line is returned on each successful `read()`:
 cull=N frun=H fcull=H fstop=H brun=H bcull=H bstop=H
 ```
 
-`cull=1` means the daemon should start culling. The other fields are the
-current free counts in hex (no `0x` prefix). The kernel sets `POLLIN`
-when the state line changed and `POLLOUT` while culling remains active.
-The daemon listens for both so one cull batch that does not reach `run`
-does not stall further culling.
+`cull=1` means the kernel wants culling: it is set when free space drops
+below `bcull`/`fcull` and cleared once free space is back at
+`brun`/`frun`. The kernel re-checks free space on every read and on cache
+writes. The other fields are **the limits themselves, not free counts**:
+the configured percentages converted at bind time into filesystem blocks
+(`b*`) and inodes (`f*`), in hex (no `0x` prefix). They stay fixed while
+the cache is bound; the kernel compares them with `f_bavail` / `f_ffree`
+from `statfs(cache_dir)`. The daemon's heartbeat log prints the current
+`bavail` / `ffree` next to the limits.
+
+The kernel sets `POLLIN` when the state line changed and `POLLOUT` for as
+long as culling remains active. The daemon listens for both, except while
+it waits for the space a pass freed to show up (see "Cull algorithm"),
+when it listens for `POLLIN` only so that `POLLOUT` does not spin the loop.
+
+The daemon also reads the state whenever `poll` times out (every 5 s; every
+0.5 s while waiting). The kernel re-checks free space only when the cache
+writes or the daemon reads, so without these reads an idle cache would
+never be told to cull while other data fills a shared filesystem.
 
 ## Cache sizing
 
@@ -138,6 +152,13 @@ and stops. Want a smaller working set? Make the backing fs smaller, or
 raise `bcull` / `brun` to leave more headroom. There is intentionally no
 absolute-bytes knob — the kernel protocol is percentage-only.
 
+The percentages apply to the whole filesystem under `cache_dir`, not just
+to cached data. When `cache_dir` is a subdirectory of a volume that also
+holds other data, that data counts too: the cache grows until the
+*filesystem* is 93 % full and gives space back as the other data grows.
+If the other data alone keeps free space below `brun`, culling cannot
+reach its target and ends up emptying the cache.
+
 ## Cull algorithm
 
 The on-disk layout cachefiles produces (kernel ≥ 5.17) is:
@@ -150,8 +171,14 @@ The on-disk layout cachefiles produces (kernel ≥ 5.17) is:
 
 When `cull=1`:
 
-1. Delete entries that the kernel moved into `<cache_dir>/graveyard`.
-2. Walk **only depth 3** under `<cache_dir>/cache/` using `walkdir`
+1. Size the pass: from `statfs(cache_dir)`, the bytes and inodes missing
+   to bring free space back up to `brun` / `frun` — exactly what the
+   kernel needs to clear `cull=1`. If nothing is missing (the kernel also
+   counts in-flight cache writes as used), back off for a second and
+   re-read the state instead of culling.
+2. Delete entries that the kernel moved into `<cache_dir>/graveyard`,
+   counting what they occupied toward the target.
+3. Walk **only depth 3** under `<cache_dir>/cache/` using `walkdir`
    (`min_depth(3).max_depth(3)`). Both bounds matter:
    - skipping depth 1 protects the volume index — `cull Ivolume,…`
      succeeds whenever no client mount is currently using the volume
@@ -162,14 +189,32 @@ When `cull=1`:
    - capping at depth 3 prevents the daemon from descending into an
      index-cookie directory and trying to cull its children
      individually — culling the parent removes the subtree.
-3. For each cookie collect `(parent, basename, atime, size)`.
-4. Sort by `atime` ascending (oldest first).
-5. Process at most `cull.batch_size` candidates. For each:
+4. Keep the `cull.batch_size` oldest-by-atime cookies, each as
+   `(parent, basename, atime, allocated bytes)`. Allocated bytes are
+   `st_blocks × 512`, not `st_size`: cachefiles sizes each cache file to
+   the whole remote file but only stores the ranges that were read, so
+   `st_size` can be several times what culling the file gives back.
+5. Cull them oldest first and **stop as soon as the target is met**. For
+   each:
    - `chdir(parent)`
    - Send `cull <basename>`. Kernel returns `EBUSY` if held → skip.
-6. Re-poll state. If `cull=0`, done; else repeat. If a pass makes no
-   progress because every candidate is busy or errored, briefly back off
-   before trying again.
+
+   If the batch runs out first, walk again. A batch that frees nothing
+   ends the pass (everything left is busy or failing); the daemon then
+   backs off briefly before trying again.
+6. Wait for the freed space to show up in statfs: until free space
+   reaches what the pass freed (capped at `brun` / `frun`), drops below
+   `bstop` / `fstop`, or 30 s have passed. XFS reclaims unlinked inodes
+   in background workers, so right after a pass statfs — and the kernel
+   with it — still reports the old free count and keeps `cull=1`. Sizing
+   another pass on those numbers would cull the same shortfall again.
+7. Read the state. If `cull=0`, done; else size a new pass from fresh
+   numbers.
+
+Earlier versions culled a whole batch per pass and re-read the state right
+away. On caches made of a few thousand large files that emptied nearly the
+whole cache every time free space crossed `bcull`, instead of trimming it
+back to `brun`.
 
 This is the same shape as upstream cachefilesd's algorithm. The
 walk-on-demand approach scales to caches with hundreds of thousands of

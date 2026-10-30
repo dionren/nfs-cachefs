@@ -57,12 +57,14 @@ extern "C" fn handle_signal(_sig: i32) {
 }
 
 fn main() {
+    use std::io::IsTerminal;
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("debug")),
         )
         .with_target(false)
+        .with_ansi(std::io::stdout().is_terminal())
         .init();
 
     if let Err(e) = run() {

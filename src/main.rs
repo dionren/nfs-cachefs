@@ -86,9 +86,15 @@ fn main() -> ExitCode {
 }
 
 fn init_tracing(level: &str, format: &str) {
+    use std::io::IsTerminal;
     use tracing_subscriber::{fmt, EnvFilter};
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
-    let builder = fmt().with_env_filter(filter).with_target(false);
+    // Color only on a terminal. Under systemd stdout goes to the journal,
+    // where escape codes are stored in the message and break grep.
+    let builder = fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .with_ansi(std::io::stdout().is_terminal());
     match format {
         "json" => {
             builder.json().init();
