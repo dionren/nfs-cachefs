@@ -5,7 +5,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use clap::Parser;
 use tracing::{error, info};
 
-use nfs_cachefs::{config, cull, daemon, proto, signals};
+use nfs_cachefs::error::Error;
+use nfs_cachefs::{config, daemon, proto, signals};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -17,7 +18,8 @@ struct Args {
     #[arg(short, long, default_value = "/etc/nfs-cachefs/daemon.toml")]
     config: PathBuf,
 
-    /// Override log level (else read from config / RUST_LOG).
+    /// Log level (error, warn, info, debug, trace). Takes precedence over
+    /// RUST_LOG, which takes precedence over the config file.
     #[arg(long)]
     log_level: Option<String>,
 }
@@ -30,6 +32,12 @@ extern "C" fn handle_signal(_sig: i32) {
 
 fn main() -> ExitCode {
     let args = Args::parse();
+    if let Some(level) = &args.log_level {
+        if !config::LOG_LEVELS.contains(&level.as_str()) {
+            eprintln!("--log-level must be one of: error, warn, info, debug, trace");
+            return ExitCode::from(2);
+        }
+    }
     let cfg = match config::Config::load(&args.config) {
         Ok(c) => c,
         Err(e) => {
@@ -39,10 +47,7 @@ fn main() -> ExitCode {
         }
     };
 
-    init_tracing(
-        args.log_level.as_deref().unwrap_or(&cfg.log.level),
-        &cfg.log.format,
-    );
+    init_tracing(args.log_level.as_deref(), &cfg.log.level, &cfg.log.format);
 
     if let Err(e) = signals::install(handle_signal) {
         error!(error = %e, "failed to install signal handlers");
@@ -63,44 +68,46 @@ fn main() -> ExitCode {
         }
     };
 
-    let cmd = cfg.as_config_cmd();
-    let cull_ctx = cull::CullCtx {
-        cache_root: cfg.cache_dir.clone(),
-        batch_size: cfg.cull.batch_size,
-    };
-
     let d = daemon::Daemon {
         dev,
-        config: cmd,
-        cull: cull_ctx,
+        config: &cfg,
         stop: &STOP,
     };
-
-    if let Err(e) = d.run() {
-        error!(error = %e, "daemon exited with error");
-        return ExitCode::FAILURE;
+    match d.run() {
+        Ok(()) => {
+            info!("daemon exited cleanly");
+            ExitCode::SUCCESS
+        }
+        Err(Error::Interrupted) => {
+            info!("stopped before the cache was bound");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            error!(error = %e, "daemon exited with error");
+            ExitCode::FAILURE
+        }
     }
-
-    info!("daemon exited cleanly");
-    ExitCode::SUCCESS
 }
 
-fn init_tracing(level: &str, format: &str) {
+fn init_tracing(cli_level: Option<&str>, config_level: &str, format: &str) {
     use std::io::IsTerminal;
     use tracing_subscriber::{fmt, EnvFilter};
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
+    let filter = match cli_level {
+        Some(level) => EnvFilter::new(level),
+        None => EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(config_level)),
+    };
     // Color only on a terminal. Under systemd stdout goes to the journal,
     // where escape codes are stored in the message and break grep.
     let builder = fmt()
         .with_env_filter(filter)
         .with_target(false)
         .with_ansi(std::io::stdout().is_terminal());
-    match format {
-        "json" => {
-            builder.json().init();
-        }
-        _ => {
-            builder.compact().init();
-        }
+    // The journal timestamps every line itself (systemd sets JOURNAL_STREAM
+    // when stdout goes there); a second, UTC timestamp only confuses.
+    let journal = std::env::var_os("JOURNAL_STREAM").is_some();
+    match (format, journal) {
+        ("json", _) => builder.json().init(),
+        (_, true) => builder.compact().without_time().init(),
+        (_, false) => builder.compact().init(),
     }
 }

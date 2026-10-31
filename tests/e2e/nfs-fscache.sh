@@ -37,6 +37,18 @@ count_fsc_yes() {
     awk '$NF == "yes" { n++ } END { print n + 0 }' /proc/fs/nfsfs/volumes 2>/dev/null || echo 0
 }
 
+# State letter of the cache record named $CACHE_TAG: A = active. A record in
+# state - (no cache bound) outlives the previous daemon while an fsc mount
+# references it, so the tag merely being listed proves nothing.
+cache_state() {
+    awk -v tag="$CACHE_TAG" '$NF == tag { print $(NF-1); exit }' /proc/fs/fscache/caches 2>/dev/null
+}
+
+# Number of fscache volumes served by the cache named $CACHE_TAG.
+volumes_on_tag() {
+    awk -v tag="$CACHE_TAG" 'NR > 2 && $6 == tag { n++ } END { print n + 0 }' /proc/fs/fscache/volumes 2>/dev/null || echo 0
+}
+
 cleanup() {
     local rc=$?
     set +e
@@ -65,14 +77,14 @@ for _ in {1..50}; do
         echo "daemon exited before binding cache tag $CACHE_TAG (rc=$rc)" >&2
         exit 1
     fi
-    if grep -Fq "$CACHE_TAG" /proc/fs/fscache/caches 2>/dev/null; then
+    if [[ "$(cache_state)" == "A" ]]; then
         BOUND=1
         break
     fi
     sleep 0.1
 done
 if (( BOUND == 0 )); then
-    echo "cache tag $CACHE_TAG did not appear in /proc/fs/fscache/caches" >&2
+    echo "cache $CACHE_TAG did not become active (state A) in /proc/fs/fscache/caches" >&2
     cat /proc/fs/fscache/caches 2>/dev/null || true
     exit 1
 fi
@@ -92,6 +104,15 @@ FSC_YES_AFTER=$(count_fsc_yes)
 if (( FSC_YES_AFTER <= FSC_YES_BEFORE )); then
     echo "FSC not enabled on the new mount" >&2
     cat /proc/fs/nfsfs/volumes 2>/dev/null || true
+    exit 1
+fi
+
+# FSC=yes only says the mount has an fscache volume; the volume must also be
+# served by this daemon's cache.
+echo "==> assert the volume is served by cache $CACHE_TAG"
+if (( $(volumes_on_tag) == 0 )); then
+    echo "no fscache volume is attached to cache $CACHE_TAG" >&2
+    cat /proc/fs/fscache/volumes 2>/dev/null || true
     exit 1
 fi
 

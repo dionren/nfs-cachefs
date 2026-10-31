@@ -9,6 +9,18 @@ use std::path::Path;
 
 use crate::error::{Error, Result};
 
+/// The daemon's channel to cachefiles: [`Device`] in production. The cull
+/// pass and the event loop only need these three operations, which lets
+/// tests drive them with a fake kernel.
+pub trait Kernel {
+    /// Descriptor to poll for state changes.
+    fn as_raw_fd(&self) -> RawFd;
+    /// Issue one command.
+    fn write_cmd(&self, cmd: &str) -> Result<()>;
+    /// Read one state line; 0 bytes while no cache is bound.
+    fn read_state(&self, buf: &mut [u8]) -> Result<usize>;
+}
+
 /// A handle to an open `/dev/cachefiles` device. Owns the file descriptor.
 pub struct Device {
     file: std::fs::File,
@@ -57,8 +69,9 @@ impl Device {
         Ok(())
     }
 
-    /// Read one state line. Buffer must be ≥ 256 bytes; kernel writes at most
-    /// ~150 bytes (formatted decimal counters).
+    /// Read one state line. Buffer must be ≥ 256 bytes: the kernel formats
+    /// the line into a 256-byte buffer and fails the read with `EMSGSIZE`
+    /// if ours is shorter than the line.
     pub fn read_state(&self, buf: &mut [u8]) -> Result<usize> {
         let n = unsafe {
             libc::read(
@@ -71,6 +84,20 @@ impl Device {
             return Err(Error::Io(io::Error::last_os_error()));
         }
         Ok(n as usize)
+    }
+}
+
+impl Kernel for Device {
+    fn as_raw_fd(&self) -> RawFd {
+        Device::as_raw_fd(self)
+    }
+
+    fn write_cmd(&self, cmd: &str) -> Result<()> {
+        Device::write_cmd(self, cmd)
+    }
+
+    fn read_state(&self, buf: &mut [u8]) -> Result<usize> {
+        Device::read_state(self, buf)
     }
 }
 
@@ -92,7 +119,7 @@ pub struct ConfigCmd<'a> {
 
 impl<'a> ConfigCmd<'a> {
     /// Send `dir`, `tag`, optional `secctx`, the six limits, then `bind`.
-    pub fn apply_and_bind(&self, dev: &Device) -> Result<()> {
+    pub fn apply_and_bind(&self, dev: &impl Kernel) -> Result<()> {
         validate_limit_triplet("b", self.bstop, self.bcull, self.brun)?;
         validate_limit_triplet("f", self.fstop, self.fcull, self.frun)?;
 
@@ -234,7 +261,7 @@ fn has_command_break(value: &str) -> bool {
 /// explicit pre-check is redundant. Kept for future optimization (avoid
 /// even-trying-to-cull obviously-busy objects).
 #[allow(dead_code)]
-pub fn inuse(dev: &Device, name: &str) -> Result<bool> {
+pub fn inuse(dev: &impl Kernel, name: &str) -> Result<bool> {
     validate_object_name("inuse", name)?;
     match dev.write_cmd(&format!("inuse {name}")) {
         Ok(()) => Ok(true),
@@ -245,17 +272,31 @@ pub fn inuse(dev: &Device, name: &str) -> Result<bool> {
     }
 }
 
-/// Tell the kernel to cull `name` from the current directory. Returns
-/// `Ok(true)` on success, `Ok(false)` if the object was held by the kernel
-/// (`EBUSY`) — caller should skip and try later.
-pub fn cull(dev: &Device, name: &str) -> Result<bool> {
+/// What a `cull` command did with an object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CullOutcome {
+    /// Removed from the cache.
+    Culled,
+    /// In use by the kernel (`EBUSY`); try again later.
+    Busy,
+    /// Already gone (`ENOENT`, or `ESTALE` when the netfs retired it
+    /// between our directory walk and the command).
+    Gone,
+}
+
+/// Tell the kernel to cull `name` from the current directory.
+///
+/// Any other error is returned as is. `EIO` in particular usually means
+/// the kernel has stopped the cache (see `Error::CacheDead`).
+pub fn cull(dev: &impl Kernel, name: &str) -> Result<CullOutcome> {
     validate_object_name("cull", name)?;
     match dev.write_cmd(&format!("cull {name}")) {
-        Ok(()) => Ok(true),
-        Err(Error::Kernel { source, .. }) if source.raw_os_error() == Some(libc::EBUSY) => {
-            Ok(false)
-        }
-        Err(e) => Err(e),
+        Ok(()) => Ok(CullOutcome::Culled),
+        Err(e) => match e.raw_os_error() {
+            Some(libc::EBUSY) => Ok(CullOutcome::Busy),
+            Some(libc::ENOENT | libc::ESTALE) => Ok(CullOutcome::Gone),
+            _ => Err(e),
+        },
     }
 }
 

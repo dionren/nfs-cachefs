@@ -125,7 +125,8 @@ The installer is idempotent and preserves existing entries:
 1. Writes the binaries (`/usr/sbin/`), config (`/etc/nfs-cachefs/daemon.toml`),
    unit file (`/lib/systemd/system/`), and a drop-in
    (`/etc/systemd/system/nfs-cachefs.service.d/local.conf`) that pins
-   `ReadWritePaths=` and `RequiresMountsFor=` to your `cache_dir`. A
+   `ReadWritePaths=` and `RequiresMountsFor=` to your `cache_dir`
+   (upgrades keep an existing drop-in, so hand edits stick). A
    running daemon is **not** stopped here — the kernel keeps the old
    binary mmapped, and step 5 picks up the new code via `restart`.
 2. Adds `cachefiles` to `/etc/modules-load.d/` so the kernel module is
@@ -145,9 +146,11 @@ The installer is idempotent and preserves existing entries:
    cached export, and `/proc/fs/fscache/caches` shows state `A`.
 
 The unit's `Before=remote-fs-pre.target` ordering keeps the daemon
-ahead of any standard NFS mount at boot — that's load-bearing because a
-mount that races ahead of the daemon silently falls back to no-caching
-with no error logged. The fstab line intentionally omits
+ahead of any standard NFS mount at boot — that's load-bearing: a mount
+made while no cache is bound still shows `FSC=yes` but caches nothing,
+and nothing is logged. (Per the kernel source, 6.x hands such a mount to
+the first cache bound afterwards; this has not been verified on the test
+box, so keep the ordering.) The fstab line intentionally omits
 `x-systemd.requires=nfs-cachefs.service`: with that option set, every
 daemon restart cascades to a forced unmount, and the subsequent
 re-mount can land on a stale fscache superblock (visible in
@@ -185,10 +188,10 @@ sudo rm -f  /etc/modules-load.d/cachefiles.conf
 
 ## How the cache is sized and culled
 
-There is no fixed-bytes cache limit. The cache fills the backing
-filesystem; the kernel watches its free-space and inode percentages and
-asks the daemon to start deleting LRU objects when space gets tight.
-Three percentage thresholds control this (defaults shown):
+The kernel protocol has no fixed-bytes cache limit. The cache fills the
+backing filesystem; the kernel watches its free-space and inode
+percentages and asks the daemon to start deleting LRU objects when space
+gets tight. Three percentage thresholds control this (defaults shown):
 
 | key   | default | meaning                                                  |
 |-------|---------|----------------------------------------------------------|
@@ -200,17 +203,59 @@ Each appears twice: `b*` for blocks (capacity), `f*` for inodes (file
 count). Required ordering: `stop < cull < run < 100`. A 100 G cache fs
 with defaults effectively keeps cache size around 90–93 G and starts
 shedding the oldest-by-atime objects when it hits 93 G. See `daemon.toml`
-to retune. Each cull frees only what is missing to get back to `run`
-(counting the space files really occupy, not their sparse size), reading
-the cache directory `cull.batch_size` (default 1024) objects at a time.
+to retune.
 
-The percentages are of the whole filesystem, so on a volume shared with
-other data that data counts too: the cache grows until the volume is
-93 % full and gives space back as the other data grows.
+Each cull pass frees what is missing to get back to `run` (plus a small
+margin), counting the space files really occupy, not their sparse size.
+Culled files are truncated through a descriptor the daemon holds, so
+their space is free — and visible to the kernel — when the pass ends,
+not seconds later when XFS gets to it in the background. Objects the
+kernel reports in use are set aside for a few minutes instead of being
+retried on every pass, and a pass that can free nothing backs off (1 s,
+doubling up to 60 s) instead of spinning.
 
 The `heartbeat` log line shows where the cache stands: `bavail` / `ffree`
 are the current free blocks / inodes, `bcull` / `brun` (and `fcull` /
 `frun`) the limits they are compared against.
+
+### Cache size budget on a shared disk (`max_size`)
+
+The percentages are of the whole filesystem, so on a volume shared with
+other data (container images, swap files) that data counts too: the cache
+grows until the volume is 93 % full, gives space back as the other data
+grows, and is emptied if the other data alone keeps free space below
+`run`. To cap the cache itself, give it a budget in `daemon.toml`:
+
+```toml
+max_size = "3T"
+```
+
+Before binding, the daemon puts the cache tree under an XFS or ext4
+**project quota** of that size. statfs on the cache directory then
+reports the budget as its size and the smaller of "budget left" and the
+real free space as available, so the percentages apply to the budget —
+the cache stays between roughly 2.7 and 2.8 T here — and the cache still
+shrinks when the shared filesystem itself runs low.
+
+- The filesystem must be mounted with project quotas (`prjquota`; XFS
+  also accepts `pquota`). The daemon refuses to start otherwise.
+- `quota_project_id` (default `1852269427`) must not be used by anything
+  else; check with `xfs_quota -x -c 'report -p' <mountpoint>`. Docker
+  hands out small IDs from 2 upward.
+- The first start tags the existing cache files, which takes a moment on a
+  large cache; later starts only check. A new `max_size` takes effect at
+  the next restart.
+- To drop the budget, remove `max_size` and clear the limit:
+  `xfs_quota -x -c 'limit -p bhard=0 1852269427' <mountpoint>`.
+
+### XFS extent size hint (`extsize`)
+
+The kernel writes cache files out of order as NFS reads complete, so a
+large file can end up in hundreds of thousands of extents, which makes it
+slow to delete and costly to map. `extsize = "4M"` sets an XFS extent size
+hint that new cache files inherit, so XFS allocates them in aligned 4 MiB
+chunks. A partially read file may then occupy up to one chunk more per
+hole. Existing files keep their layout.
 
 ## Performance
 
@@ -258,13 +303,63 @@ in parallel hit ~10 GB/s on this rig directly. The FUSE-based
 predecessor maxed out at 25–40 % of NVMe; this rewrite stays on the
 kernel data path.
 
+## Metrics
+
+With
+
+```toml
+[metrics]
+textfile = "/run/nfs-cachefs/nfs-cachefs.prom"
+```
+
+the daemon rewrites a Prometheus text file every 15 s for node_exporter's
+textfile collector: point it at the directory
+(`--collector.textfile.directory=/run/nfs-cachefs`) or symlink the file
+into an existing textfile directory. The unit makes `/run/nfs-cachefs`
+writable; another directory needs a `ReadWritePaths=` line in the
+drop-in. The file is removed when the daemon stops.
+
+| metric | meaning |
+|--------|---------|
+| `nfs_cachefs_cache_active`, `nfs_cachefs_cache_io_error` | kernel state of the cache: active (A) / stopped by an I/O error (E) |
+| `nfs_cachefs_culling` | 1 while the kernel asks for culling |
+| `nfs_cachefs_fs_size_bytes`, `nfs_cachefs_fs_avail_bytes` | the cache filesystem (or the `max_size` budget) as statfs reports it |
+| `nfs_cachefs_limit_bytes{limit="run"\|"cull"\|"stop"}` | the kernel's thresholds |
+| `nfs_cachefs_cache_objects`, `nfs_cachefs_cache_allocated_bytes` | cache size, from a walk of the cache every 5 min |
+| `nfs_cachefs_quota_used_bytes`, `nfs_cachefs_quota_limit_bytes` | the same from the project quota, with `max_size` |
+| `nfs_cachefs_culled_objects_total`, `nfs_cachefs_culled_bytes_total` | what culling removed |
+| `nfs_cachefs_cull_passes_total`, `nfs_cachefs_cull_passes_without_progress_total`, `nfs_cachefs_cull_busy_skips_total`, `nfs_cachefs_cull_errors_total` | cull activity |
+| `nfs_cachefs_fscache_stat{section,field}` | every counter of `/proc/fs/fscache/stats`, e.g. `section="IO",field="rd"` (reads served from the cache) |
+
+Worth alerting on: `nfs_cachefs_cache_io_error == 1` (left in the file
+when the daemon exits to have the cache bound again, until the restarted
+daemon replaces it), the series disappearing, and
+`increase(nfs_cachefs_cull_passes_without_progress_total[15m]) > 0`.
+
+## Service behavior
+
+- `Type=notify`: the unit is up once the cache is bound, and starts before
+  `remote-fs-pre.target`, so fsc mounts at boot find the cache.
+- `Restart=always`, with the delay growing from 2 s to 2 min: the daemon
+  comes back after any exit systemd did not ask for, a stray SIGTERM
+  included.
+- When the kernel stops the cache after an I/O error (state `E` in
+  `/proc/fs/fscache/caches`; a full disk failing a cache metadata write is
+  enough), it caches nothing more until the cache is bound again. The
+  daemon checks every 10 s and exits so that systemd restarts it.
+- `WatchdogSec=2min`: a hung daemon is restarted.
+- Stopping can take a while on a busy shared disk: closing
+  `/dev/cachefiles` makes the kernel sync the cache filesystem
+  (`TimeoutStopSec=90s`).
+
 ## Diagnostics
 
 ```sh
 # Daemon logs
 journalctl -u nfs-cachefs -f
 
-# Run the probe instead of the full daemon (lighter, no cull)
+# Run the probe instead of the full daemon (lighter, no cull). Stop the
+# daemon first: only one process can hold /dev/cachefiles.
 sudo /usr/sbin/nfs-cachefs-probe --cache-dir /var/cache/fscache --tag probe
 
 # Kernel-side

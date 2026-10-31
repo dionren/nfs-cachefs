@@ -1,4 +1,4 @@
-.TH NFS-CACHEFS 8 "2026-05" "nfs-cachefs" "System Manager's Manual"
+.TH NFS-CACHEFS 8 "2026-10-31" "nfs-cachefs 1.1" "System Manager's Manual"
 .SH NAME
 nfs-cachefs \- userspace daemon for Linux fscache + cachefiles (traditional mode)
 .SH SYNOPSIS
@@ -41,20 +41,77 @@ TOML configuration file. Default:
 .IR /etc/nfs-cachefs/daemon.toml .
 .TP
 \fB\-\-log-level\fR \fILEVEL\fR
-Override log level (\fIerror\fR, \fIwarn\fR, \fIinfo\fR, \fIdebug\fR,
-\fItrace\fR). The
-.B RUST_LOG
-environment variable takes precedence if set.
+Log level (\fIerror\fR, \fIwarn\fR, \fIinfo\fR, \fIdebug\fR,
+\fItrace\fR). Takes precedence over
+.BR RUST_LOG ,
+which takes precedence over the configuration file.
+.SH CONFIGURATION
+The shipped
+.I daemon.toml
+documents every key; in short:
+.TP
+.BR cache_dir ", " tag ", " secctx
+Cache directory (its own mount point), cache tag, optional security
+context.
+.TP
+.B max_size
+Size budget for the cache, enforced as an XFS or ext4 project quota on
+.BR cache_dir ,
+which then reports the budget as its size to the kernel. Needs a
+filesystem mounted with project quotas. Applied before the cache is bound;
+changes take effect at the next start.
+.TP
+.B quota_project_id
+Project ID for
+.BR max_size .
+Nothing else on the filesystem may use it.
+.TP
+.B extsize
+XFS extent size hint inherited by new cache files.
+.TP
+.BR [limits] " brun, bcull, bstop, frun, fcull, fstop"
+Free-space and free-inode percentages: culling starts below
+.IR cull ,
+stops at
+.IR run ;
+the kernel stops caching below
+.IR stop .
+.TP
+.BR [cull] " batch_size"
+Candidates kept per walk of the cache before object sizes are known.
+.TP
+.BR [metrics] " textfile, interval_secs, usage_scan_interval_secs"
+Prometheus text file for node_exporter's textfile collector, and how
+often to rewrite it.
+.TP
+.BR [log] " level, format"
+Log level and format (\fIcompact\fR or \fIjson\fR).
+.SH SIGNALS
+.BR SIGTERM ,
+.BR SIGINT " and"
+.B SIGHUP
+stop the daemon: it closes
+.IR /dev/cachefiles ,
+and the kernel withdraws the cache.
+.SH EXIT STATUS
+0 after a requested stop, 2 for an unusable configuration or command
+line, 1 otherwise \(em including when the kernel has stopped the cache
+after an I/O error, so that the service manager starts the daemon, and
+binds the cache, again.
 .SH FILES
 .TP
 .I /etc/nfs-cachefs/daemon.toml
-Configuration file. See the comments in the shipped default for the
-schema.
+Configuration file.
 When changing
 .B cache_dir
 under the packaged systemd unit, update the unit's
 .B ReadWritePaths=
-setting to match.
+setting to match (the installer's drop-in
+.IR /etc/systemd/system/nfs-cachefs.service.d/local.conf ).
+.TP
+.I /run/nfs-cachefs/
+Writable for the daemon under the packaged unit; the suggested place for
+.BR metrics.textfile .
 .TP
 .I /dev/cachefiles
 Kernel control device.
@@ -63,9 +120,13 @@ Kernel control device.
 Real-time fscache counters; useful for monitoring cache hit rates.
 .TP
 .I /proc/fs/fscache/caches
-Lists active caches; the daemon's
+Lists caches; the daemon's
 .B tag
-appears here.
+appears here with state
+.B A
+while active and
+.B E
+after the kernel stopped it for an I/O error.
 .TP
 .I /proc/fs/nfsfs/volumes
 Lists NFS mounts; the
@@ -77,7 +138,8 @@ column shows which mounts have caching enabled.
 Tracing-subscriber filter directive.
 .SH SEE ALSO
 .BR cachefilesd (8),
-.BR mount.nfs (8)
+.BR mount.nfs (8),
+.BR xfs_quota (8)
 .PP
 .B Documentation/filesystems/caching/cachefiles.rst
 in the Linux kernel source.

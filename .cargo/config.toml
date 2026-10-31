@@ -1,0 +1,5 @@
+# Resolve dependencies to versions that support the crate's rust-version
+# (Cargo.toml), so Cargo.lock keeps building on the MSRV toolchain.
+# Needs cargo >= 1.84 to take effect; older cargo ignores the key.
+[resolver]
+incompatible-rust-versions = "fallback"

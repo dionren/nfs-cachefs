@@ -1,13 +1,14 @@
 //! Diagnostic probe for the traditional cachefiles control path.
 //!
 //! Opens /dev/cachefiles, applies the same configuration commands as the
-//! daemon via `ConfigCmd::apply_and_bind`, logs every state line the
-//! kernel emits, and exits on SIGTERM/SIGINT/SIGHUP. It intentionally
-//! does not cull objects; use the full daemon for that.
+//! daemon via `ConfigCmd::apply_and_bind`, logs the kernel's state line
+//! whenever it changes (and every 30 s), and exits on SIGTERM/SIGINT/SIGHUP.
+//! It intentionally does not cull objects; use the full daemon for that.
 
 use std::path::PathBuf;
 use std::process;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use clap::Parser;
 use tracing::{error, info, warn};
@@ -51,6 +52,9 @@ struct Args {
 }
 
 static STOP: AtomicBool = AtomicBool::new(false);
+
+/// Repeat an unchanged state line this often.
+const STATE_REPEAT: Duration = Duration::from_secs(30);
 
 extern "C" fn handle_signal(_sig: i32) {
     STOP.store(true, Ordering::Relaxed);
@@ -98,10 +102,13 @@ fn run() -> anyhow::Result<()> {
     info!("bound cachefiles in traditional mode");
 
     let mut buf = [0u8; 256];
+    let mut last: Option<(CacheState, Instant)> = None;
     while !STOP.load(Ordering::Relaxed) {
+        // POLLIN only: the kernel keeps POLLOUT asserted while its cull flag
+        // is set, which would turn this loop into a busy loop.
         let mut pollfd = libc::pollfd {
             fd: dev.as_raw_fd(),
-            events: libc::POLLIN | libc::POLLOUT,
+            events: libc::POLLIN,
             revents: 0,
         };
         let r = unsafe { libc::poll(&mut pollfd, 1, 1000) };
@@ -112,13 +119,19 @@ fn run() -> anyhow::Result<()> {
             }
             anyhow::bail!("poll: {err}");
         }
-        if r == 0 || (pollfd.revents & (libc::POLLIN | libc::POLLOUT)) == 0 {
-            continue;
-        }
+        // Read on timeouts too: each read makes the kernel re-check free
+        // space, which is what moves the cull flag on an idle cache.
         match dev.read_state(&mut buf) {
             Ok(0) => {}
             Ok(n) => match CacheState::parse(&buf[..n]) {
-                Ok(state) => info!(?state, "state"),
+                Ok(state) => {
+                    let quiet =
+                        last.is_some_and(|(prev, at)| prev == state && at.elapsed() < STATE_REPEAT);
+                    if !quiet {
+                        info!(?state, "state");
+                        last = Some((state, Instant::now()));
+                    }
+                }
                 Err(e) => warn!(error = %e, "parse state"),
             },
             Err(e) => warn!(error = %e, "read /dev/cachefiles"),
