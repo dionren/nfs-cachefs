@@ -303,6 +303,24 @@ in parallel hit ~10 GB/s on this rig directly. The FUSE-based
 predecessor maxed out at 25–40 % of NVMe; this rewrite stays on the
 kernel data path.
 
+### Cache hits vs. raw NVMe
+
+[`HOT-READ-PERFORMANCE.md`](HOT-READ-PERFORMANCE.md) (in Chinese)
+measures how close cache hits get to the NVMe they are stored on (single
+PCIe Gen3 NVMe, kernels 6.8 and 7.0) and what limits them. In short:
+
+- **Raise the NFS mount's `read_ahead_kb`.** It sets the size of every
+  cache read. At the default 128 KB, mmap-based loaders (safetensors)
+  read 128 KB at a time and get about 1 GB/s even from the cache; at
+  4–16 MB two or more readers saturate the NVMe. nfs-common ≥ 2.6.2
+  applies it at every mount from `/etc/nfs.conf.d/*.conf`
+  (`[nfsrahead]` / `nfs=16384`).
+- **A single reader needs kernel ≥ 6.12 to reach the NVMe ceiling.** On
+  6.8 the NFS page cache uses 4 KiB folios and one reader stops at about
+  2 GB/s (65–70 % of the drive), CPU-bound. 6.12 gave NFS large folios;
+  on 7.0 a single `read()` stream reached 3.1–3.2 GB/s, the drive's
+  O_DIRECT ceiling.
+
 ## Metrics
 
 With

@@ -376,6 +376,16 @@ The FUSE-based predecessor (wiped in commit `76f5744`) topped out at
 kernel data path. Don't reintroduce a FUSE/userspace data path. On
 PCIe 5.0 NVMe + DDR5 expect proportionally higher ceilings.
 
+### Cache hits vs. raw NVMe
+
+How close cache hits come to the NVMe, and what limits them, is measured
+in [`HOT-READ-PERFORMANCE.md`](../HOT-READ-PERFORMANCE.md) (in Chinese).
+The NFS mount's `read_ahead_kb` sizes each cache read (cachefiles turns
+each readahead window into one O_DIRECT read of the cache file), so the
+128 KB default caps mmap-based loaders at ~1 GB/s. On 6.8 a single
+reader is also CPU-bound at ~2 GB/s by 4 KiB page-cache folios; kernels
+≥ 6.12, which give NFS large folios, lift that limit.
+
 ## Why no tokio / dashmap / parking_lot
 
 - One open fd, low event rate (state changes are seconds-apart).

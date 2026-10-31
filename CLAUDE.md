@@ -239,6 +239,25 @@ The FUSE-based predecessor topped out at ~25–40 % of NVMe — the whole
 point of this rewrite is staying on the kernel data path. Don't
 reintroduce a FUSE/userspace data path.
 
+### Cache-hit reads vs. raw NVMe
+
+Measured on a single PCIe Gen3 NVMe with kernels 6.8 and 7.0; details,
+numbers and the method are in `HOT-READ-PERFORMANCE.md` (in Chinese).
+
+- The NFS mount's `read_ahead_kb` (default 128) sets the size of each
+  cache read. mmap faults read only `read_ahead_kb`, so mmap loaders get
+  ~1 GB/s on hits until it is raised (4–16 MB). It is set per bdi;
+  `nfsrahead` (nfs-common ≥ 2.6.2) applies `/etc/nfs.conf.d/*.conf` at
+  mount time.
+- On 6.8 one reader is CPU-bound at ~2 GB/s by per-4-KiB-folio page-cache
+  work (NFS has no large folios before 6.12); netfs + cachefiles are
+  < 2 % of the profile. The daemon is not on the data path and cannot fix
+  this; ≥ 6.12 kernels do (7.0: one reader at the drive's ceiling).
+- `/proc/fs/netfs/stats` changed layout in 6.12 (`Netfs  :` lines became
+  `Reads  :`, `DownOps:`, `CaRdOps:` …); field names such as `RA`, `RD`,
+  `DL` stayed. Tools that parse it must handle both.
+- Culling has not been exercised on a ≥ 6.12 kernel yet.
+
 ## Testing
 
 - Unit tests live inline (`#[cfg(test)] mod tests`) in most modules. Run
