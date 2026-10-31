@@ -6,7 +6,7 @@
 //! reduces to:
 //!
 //!   - boot:  open dev → write `dir`/`tag`/`*run`/`*cull`/`*stop` → write `bind`
-//!   - run:   poll(dev, POLLIN|POLLOUT) → read state line → if `cull=1`, drive cull
+//!   - run:   poll(dev, POLLIN) → read state line → if `cull=1`, drive cull
 //!   - cull:  chdir to object's parent → write `cull <name>`
 //!   - exit:  close dev; the kernel withdraws the cache
 //!
@@ -16,7 +16,7 @@
 pub mod cmd;
 pub mod state;
 
-pub use cmd::{ConfigCmd, Device};
+pub use cmd::{ConfigCmd, CullOutcome, Device, Kernel};
 pub use state::CacheState;
 
 /// Kernel device path. There is exactly one global `/dev/cachefiles`; only

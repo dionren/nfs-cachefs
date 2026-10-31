@@ -1,7 +1,7 @@
 //! Cache cull driver. Walks `<cache_dir>/cache/<volume>/@<bucket>/`, picks
-//! the K oldest-by-atime cookie objects via a streaming top-K, and sends
+//! the oldest-by-atime cookie objects via a streaming top-K, and sends
 //! `cull <name>` commands to the kernel one at a time until the pass has
-//! freed what the kernel asked for (see "How much to cull").
+//! freed what it was asked to (see "How much to cull").
 //!
 //! ## Cachefiles layout (kernel ≥ 5.17)
 //!
@@ -23,33 +23,52 @@
 //!
 //! Each `cull` command resolves its argument relative to the daemon's
 //! current working directory (the kernel reads it from `current->fs`).
-//! Before each cull we therefore `chdir(parent)`. This is the reason
-//! cull is single-threaded: `chdir(2)` mutates a struct that, depending
-//! on how threads were created, can be shared between threads. CLAUDE.md
-//! flags single-threaded cull as a design invariant; calling `run_pass`
+//! Before each cull we therefore `chdir(parent)`, skipping it when the
+//! previous object lived in the same bucket. This is the reason cull is
+//! single-threaded: `chdir(2)` mutates a struct that, depending on how
+//! threads were created, can be shared between threads. CLAUDE.md flags
+//! single-threaded cull as a design invariant; calling `run_pass`
 //! concurrently would race even within this process.
 //!
 //! ## How much to cull
 //!
-//! The kernel sets `cull=1` when free space drops below `bcull`/`fcull`
-//! and clears it once free space is back at `brun`/`frun`. A pass is sized
-//! by a [`CullTarget`]: the bytes and inodes missing to reach `brun`/`frun`
-//! according to `statfs(cache_dir)`, the same numbers the kernel compares.
-//! The pass culls oldest-first and stops as soon as the target is met,
-//! walking the cache again if one batch of K is not enough. Freed space is
-//! counted in allocated bytes (`st_blocks`), not `st_size`: cache files are
-//! sparse, often several times larger than what they occupy.
+//! The daemon sizes each pass (`planner.rs`): roughly the bytes and inodes
+//! missing to bring free space back above `brun`/`frun`. The pass culls
+//! oldest-first and stops as soon as that is met. Freed space is counted in
+//! allocated bytes (`st_blocks`), not `st_size`: cache files are sparse,
+//! often several times larger than what they occupy.
 //!
-//! Freed space can take a while to show up in statfs (XFS reclaims
-//! unlinked inodes in background workers) and the kernel keeps `cull=1`
-//! until it does, so the daemon waits for it before sizing another pass.
-//! See `daemon.rs`.
+//! ## Freeing the blocks now
+//!
+//! An unlinked file gives its blocks back only when its last reference
+//! goes, and XFS does that work in background workers: a cache file of
+//! hundreds of thousands of extents takes seconds, during which statfs —
+//! and the kernel's `cull=1` — still count the space as used. The pass
+//! therefore opens each candidate before culling it and, once the kernel
+//! has unlinked it (`st_nlink` 0 on our descriptor), truncates it through
+//! that descriptor. The inode is out of reach for everyone else by then:
+//! cachefiles refuses to cull objects it uses (`EBUSY`) and marks culled
+//! ones so it never picks them up again. The blocks are free when the
+//! truncate returns, so the next pass is sized on accurate numbers.
+//!
+//! ## Candidates between passes
+//!
+//! A walk keeps the K oldest objects. What a pass does not use stays in a
+//! [`CullTable`] for the next pass (every candidate's atime is re-checked
+//! right before it is culled, so a reused list is safe), and a pass walks
+//! again only when the list runs out or is older than [`TABLE_TTL`]. K
+//! starts at `cull.batch_size` and grows to fit what a pass must free,
+//! using the average object size seen by the previous walk.
+//!
+//! Objects the kernel reports busy, or whose cull fails, are left out of
+//! walks for [`SKIP_TTL`]. Without that, a batch made only of busy objects
+//! (files tenants keep open or mapped) came back unchanged from every walk,
+//! being the oldest, and the cull never reached anything it could free.
 //!
 //! ## Memory
 //!
-//! O(K) regardless of cache size, where K = `batch_size`. A million-
-//! object cache with the default batch_size=1024 uses ~64 KiB of heap
-//! state during a pass — it never builds an N-sized vector.
+//! O(K) regardless of cache size, plus the skip set (one hash per object
+//! set aside). Candidates share their bucket path.
 //!
 //! ## Symlinks
 //!
@@ -58,16 +77,35 @@
 //! kernel cachefiles backend never creates symlinks in the cache, so this
 //! is defense-in-depth.
 
-use std::collections::BinaryHeap;
+use std::collections::hash_map::DefaultHasher;
+use std::collections::{BinaryHeap, HashMap, VecDeque};
+use std::fmt;
+use std::hash::{Hash, Hasher};
 use std::io;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use tracing::{debug, info, warn};
 
 use crate::error::{Error, Result};
-use crate::proto::{cmd, CacheState, Device};
+use crate::proto::{cmd, CacheState, CullOutcome, Kernel};
+use crate::systemd_notify::Watchdog;
+
+/// How long the rest of a walk is reused by later passes before the cache
+/// is walked again.
+pub const TABLE_TTL: Duration = Duration::from_secs(300);
+
+/// How long an object found busy, or failing to cull, is left out of walks.
+pub const SKIP_TTL: Duration = Duration::from_secs(300);
+
+/// A walk keeps at most this many times `cull.batch_size` candidates.
+const MAX_BATCH_FACTOR: usize = 64;
+
+/// Per-object cull errors logged per pass; the rest are only counted.
+const MAX_ERROR_LOGS_PER_PASS: usize = 5;
 
 /// Configurable knobs for one cull pass.
 #[derive(Debug, Clone)]
@@ -78,6 +116,7 @@ pub struct CullCtx {
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct CullStats {
+    /// Candidates examined (atime re-checked, possibly culled).
     pub candidates: usize,
     pub culled: usize,
     /// Allocated bytes (`st_blocks`) of everything removed, graveyard
@@ -87,8 +126,20 @@ pub struct CullStats {
     pub files_freed: u64,
     pub skipped_busy: usize,
     pub skipped_changed: usize,
+    /// Objects that disappeared before we got to them.
+    pub gone: usize,
+    /// Part of `bytes_freed` / `files_freed` the filesystem releases in
+    /// the background (the held-descriptor truncate was not possible), so
+    /// statfs may not show it yet.
+    pub bytes_async: u64,
+    pub files_async: u64,
     pub errored: usize,
+    /// Cull commands that failed with `EIO`: the kernel has most likely
+    /// stopped the cache. The pass ends at the first one.
+    pub kernel_eio: usize,
     pub graveyard_removed: usize,
+    /// Walks of the cache directory.
+    pub walks: usize,
 }
 
 impl CullStats {
@@ -99,12 +150,15 @@ impl CullStats {
 
 /// Free space on the cache filesystem in the units of the kernel's limits:
 /// cachefiles compares `f_bavail` and `f_ffree` from `statfs(cache_dir)`
-/// against the `b*` and `f*` values it reports in the state line.
+/// against the `b*` and `f*` values it reports in the state line. With a
+/// project quota on `cache_dir` these reflect the quota (see `quota.rs`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FreeSpace {
-    /// Bytes per block of `blocks_avail` (statvfs `f_frsize`).
+    /// Bytes per block of the block counts (statvfs `f_frsize`).
     pub block_size: u64,
+    pub blocks_total: u64,
     pub blocks_avail: u64,
+    pub files_total: u64,
     pub files_free: u64,
 }
 
@@ -122,14 +176,15 @@ impl FreeSpace {
         }
         Ok(Self {
             block_size,
+            blocks_total: u64::from(st.blocks()),
             blocks_avail: u64::from(st.blocks_available()),
+            files_total: u64::from(st.files()),
             files_free: u64::from(st.files_free()),
         })
     }
 }
 
-/// What a cull pass must free for the kernel to clear `cull=1`: the bytes
-/// and inodes missing to bring free space back up to `brun`/`frun`.
+/// What a cull pass must free.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct CullTarget {
     pub bytes: u64,
@@ -137,6 +192,8 @@ pub struct CullTarget {
 }
 
 impl CullTarget {
+    /// The bytes and inodes missing to bring free space back up to
+    /// `brun`/`frun`, the point where the kernel clears `cull=1`.
     pub fn new(state: &CacheState, space: &FreeSpace) -> Self {
         Self {
             bytes: state
@@ -156,8 +213,16 @@ impl CullTarget {
     }
 }
 
+/// Objects and allocated bytes in the cache as of `at`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Usage {
+    pub objects: u64,
+    pub allocated_bytes: u64,
+    pub at: Instant,
+}
+
 #[derive(Debug, Eq, PartialEq, Ord, PartialOrd)]
-struct Candidate {
+pub(crate) struct Candidate {
     // atime_secs is the primary sort key. Putting it first makes the
     // derived Ord rank by it, which is what the BinaryHeap relies on:
     // as a max-heap, the root is the YOUNGEST of the K kept so far —
@@ -168,13 +233,18 @@ struct Candidate {
     /// cookie directory only its own blocks: the kernel moves its subtree
     /// to the graveyard, which is counted when the graveyard is emptied.
     allocated: u64,
-    parent: PathBuf,
+    /// The bucket directory, shared by all candidates from it.
+    parent: Rc<Path>,
     name: String,
 }
 
 impl Candidate {
     fn path(&self) -> PathBuf {
         self.parent.join(&self.name)
+    }
+
+    fn key(&self) -> u64 {
+        object_key(&self.parent, &self.name)
     }
 
     fn atime_changed(&self) -> std::io::Result<bool> {
@@ -187,133 +257,353 @@ impl Candidate {
     }
 }
 
+fn object_key(parent: &Path, name: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    parent.hash(&mut hasher);
+    name.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// State kept between cull passes: the unused rest of the last walk, the
+/// objects set aside as busy or failing, and what the walk learned about
+/// the cache.
+#[derive(Debug, Default)]
+pub struct CullTable {
+    queue: VecDeque<Candidate>,
+    walked_at: Option<Instant>,
+    /// Object key → until when it stays out of walks.
+    skip: HashMap<u64, Instant>,
+    avg_allocated: Option<u64>,
+    usage: Option<Usage>,
+}
+
+impl CullTable {
+    /// Cache size as of the last complete walk.
+    pub fn usage(&self) -> Option<Usage> {
+        self.usage
+    }
+
+    /// Objects currently left out of walks.
+    pub fn skipped(&self) -> usize {
+        self.skip.len()
+    }
+
+    fn expire(&mut self, now: Instant) {
+        let stale = self
+            .walked_at
+            .map_or(true, |at| now.saturating_duration_since(at) >= TABLE_TTL);
+        if stale {
+            self.queue.clear();
+        }
+        self.skip.retain(|_, until| *until > now);
+    }
+
+    /// Candidates to keep from the next walk: `base`, or enough to cover
+    /// what is left to free if the objects look like the last walk's.
+    fn batch_size(&self, base: usize, remaining_bytes: u64, remaining_files: u64) -> usize {
+        let by_bytes = match self.avg_allocated {
+            Some(avg) if avg > 0 => remaining_bytes.div_ceil(avg),
+            _ => 0,
+        };
+        let want = by_bytes.max(remaining_files).saturating_mul(5) / 4;
+        let max = base.saturating_mul(MAX_BATCH_FACTOR);
+        usize::try_from(want).unwrap_or(usize::MAX).clamp(base, max)
+    }
+
+    fn note_walk(&mut self, walk: &Walk, now: Instant) {
+        if let Some(avg) = walk.allocated.checked_div(walk.objects) {
+            self.avg_allocated = Some(avg);
+        }
+        if walk.complete {
+            self.usage = Some(Usage {
+                objects: walk.objects,
+                allocated_bytes: walk.allocated,
+                at: now,
+            });
+        }
+        self.walked_at = Some(now);
+    }
+
+    fn set_aside(&mut self, cand: &Candidate, now: Instant) {
+        self.skip.insert(cand.key(), now + SKIP_TTL);
+    }
+}
+
 /// Run one cull pass: cull oldest-by-atime objects until `target` has been
-/// freed. Objects are collected `batch_size` at a time and the cache is
-/// walked again if one batch is not enough. The pass also ends on stop, or
-/// when a whole batch frees nothing (everything left is busy or failing).
+/// freed, taking candidates from `table` and walking the cache when it runs
+/// out. The pass also ends on stop, on the first `EIO`, or when a batch
+/// frees nothing and sets nothing new aside (everything left is recently
+/// used).
 ///
 /// Per-object errors (EBUSY, chdir failure, etc.) are logged and counted
-/// but never propagated: the kernel re-signals if more culling is needed,
+/// but never propagated: the daemon sizes another pass if more is needed,
 /// and a single bad object should not bring the daemon down.
-pub fn run_pass(dev: &Device, ctx: &CullCtx, target: CullTarget, stop: &AtomicBool) -> CullStats {
+pub fn run_pass(
+    dev: &impl Kernel,
+    ctx: &CullCtx,
+    table: &mut CullTable,
+    target: CullTarget,
+    stop: &AtomicBool,
+    wd: &Watchdog,
+) -> CullStats {
     let saved_cwd = std::env::current_dir().ok();
-    let stats = run_pass_with(ctx, target, stop, |cand| {
-        std::env::set_current_dir(&cand.parent).map_err(|e| {
-            Error::Io(io::Error::new(
-                e.kind(),
-                format!("chdir {}: {e}", cand.parent.display()),
-            ))
-        })?;
+    let mut cwd: Option<Rc<Path>> = None;
+    let stats = run_pass_with(ctx, table, target, stop, wd, |cand| {
+        let same_dir = cwd
+            .as_ref()
+            .is_some_and(|dir| Rc::ptr_eq(dir, &cand.parent) || **dir == *cand.parent);
+        if !same_dir {
+            std::env::set_current_dir(&cand.parent).map_err(|e| {
+                Error::Io(io::Error::new(
+                    e.kind(),
+                    format!("chdir {}: {e}", cand.parent.display()),
+                ))
+            })?;
+            cwd = Some(Rc::clone(&cand.parent));
+        }
         cmd::cull(dev, &cand.name)
     });
-    if let Some(cwd) = saved_cwd {
-        if let Err(e) = std::env::set_current_dir(&cwd) {
-            warn!(cwd = %cwd.display(), error = %e, "failed to restore cwd");
+    if let Some(dir) = saved_cwd {
+        if let Err(e) = std::env::set_current_dir(&dir) {
+            warn!(cwd = %dir.display(), error = %e, "failed to restore cwd");
         }
     }
     stats
 }
 
 /// [`run_pass`] with the kernel `cull` command passed in, so the pass logic
-/// can be tested without `/dev/cachefiles`. `cull_one` returns `Ok(false)`
-/// when the kernel reports the object busy.
+/// can be tested without `/dev/cachefiles`.
 fn run_pass_with(
     ctx: &CullCtx,
+    table: &mut CullTable,
     target: CullTarget,
     stop: &AtomicBool,
-    mut cull_one: impl FnMut(&Candidate) -> Result<bool>,
+    wd: &Watchdog,
+    mut cull_one: impl FnMut(&Candidate) -> Result<CullOutcome>,
 ) -> CullStats {
-    let started = std::time::Instant::now();
-    let mut stats = clean_graveyard_interruptible(&ctx.cache_root, Some(stop));
+    let started = Instant::now();
+    let mut stats = clean_graveyard(&ctx.cache_root, Some(stop), wd);
     let cache_subdir = ctx.cache_root.join("cache");
-    if !cache_subdir.exists() {
+    if !cache_subdir.is_dir() {
         warn!(
             path = %cache_subdir.display(),
             "cache subdir does not exist; kernel layout changed or bind never created it"
         );
         return stats;
     }
+    table.expire(started);
+    let mut errors = ErrorLog::default();
 
-    while !target.met_by(&stats) && !stop.load(Ordering::Relaxed) {
-        let oldest = collect_oldest_interruptible(&cache_subdir, ctx.batch_size, Some(stop));
-        debug!(found = oldest.len(), "cull candidates");
-        stats.candidates += oldest.len();
-        let culled_before = stats.culled;
-
-        for cand in oldest {
-            if target.met_by(&stats) || stop.load(Ordering::Relaxed) {
+    'pass: while !target.met_by(&stats) && !stop.load(Ordering::Relaxed) {
+        if table.queue.is_empty() {
+            let k = table.batch_size(
+                ctx.batch_size,
+                target.bytes.saturating_sub(stats.bytes_freed),
+                target.files.saturating_sub(stats.files_freed),
+            );
+            let walk = collect_oldest(&cache_subdir, k, &table.skip, Some(stop), wd);
+            stats.walks += 1;
+            table.note_walk(&walk, Instant::now());
+            debug!(
+                found = walk.candidates.len(),
+                objects = walk.objects,
+                batch = k,
+                set_aside = table.skip.len(),
+                "cull candidates"
+            );
+            if walk.candidates.is_empty() {
                 break;
             }
+            table.queue = walk.candidates.into();
+        }
+
+        let culled_before = stats.culled;
+        let set_aside_before = table.skip.len();
+        while let Some(cand) = table.queue.pop_front() {
+            if target.met_by(&stats) || stop.load(Ordering::Relaxed) {
+                table.queue.push_front(cand);
+                break 'pass;
+            }
+            wd.kick();
+            stats.candidates += 1;
             match cand.atime_changed() {
                 Ok(false) => {}
                 Ok(true) => {
                     stats.skipped_changed += 1;
                     continue;
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    stats.gone += 1;
                     continue;
                 }
                 Err(e) => {
-                    warn!(path = %cand.path().display(), error = %e, "metadata recheck failed; skip");
                     stats.errored += 1;
+                    table.set_aside(&cand, Instant::now());
+                    errors.log(&cand.name, "metadata recheck failed; skipping", &e);
                     continue;
                 }
             }
+            let held = hold_for_reclaim(&cand.path());
             match cull_one(&cand) {
-                Ok(true) => {
+                Ok(CullOutcome::Culled) => {
+                    let (bytes, now_free) = reclaim(held, cand.allocated);
                     stats.culled += 1;
-                    stats.bytes_freed += cand.allocated;
+                    stats.bytes_freed += bytes;
                     stats.files_freed += 1;
+                    if !now_free {
+                        stats.bytes_async += bytes;
+                        stats.files_async += 1;
+                    }
                 }
-                Ok(false) => {
+                Ok(CullOutcome::Busy) => {
                     stats.skipped_busy += 1;
+                    table.set_aside(&cand, Instant::now());
+                }
+                Ok(CullOutcome::Gone) => stats.gone += 1,
+                Err(e) if e.raw_os_error() == Some(libc::EIO) => {
+                    // Usually the kernel has stopped the cache, and every
+                    // further command would fail the same way. The daemon
+                    // checks the cache state.
+                    stats.kernel_eio += 1;
+                    table.set_aside(&cand, Instant::now());
+                    warn!(name = cand.name, error = %e, "cull failed with EIO; ending pass");
+                    break 'pass;
                 }
                 Err(e) => {
-                    warn!(name = cand.name, error = %e, "cull failed");
                     stats.errored += 1;
+                    table.set_aside(&cand, Instant::now());
+                    errors.log(&cand.name, "cull failed", &e);
                 }
             }
         }
 
-        // A whole batch freed nothing: what is left is busy, recently used
-        // or failing, and walking again would find the same objects.
-        if stats.culled == culled_before {
+        // The batch is used up. If it freed nothing and set nothing new
+        // aside, walking again would return the same objects.
+        if stats.culled == culled_before && table.skip.len() == set_aside_before {
             break;
         }
     }
+    errors.finish();
 
-    info!(
-        elapsed_ms = started.elapsed().as_millis() as u64,
-        target_bytes = target.bytes,
-        target_files = target.files,
-        culled = stats.culled,
-        bytes_freed = stats.bytes_freed,
-        skipped_busy = stats.skipped_busy,
-        skipped_changed = stats.skipped_changed,
-        errored = stats.errored,
-        graveyard_removed = stats.graveyard_removed,
-        "cull pass done"
-    );
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    macro_rules! pass_done {
+        ($level:ident) => {
+            $level!(
+                elapsed_ms,
+                target_bytes = target.bytes,
+                target_files = target.files,
+                culled = stats.culled,
+                bytes_freed = stats.bytes_freed,
+                skipped_busy = stats.skipped_busy,
+                skipped_changed = stats.skipped_changed,
+                gone = stats.gone,
+                errored = stats.errored,
+                graveyard_removed = stats.graveyard_removed,
+                walks = stats.walks,
+                "cull pass done"
+            )
+        };
+    }
+    if stats.made_progress() {
+        pass_done!(info);
+    } else {
+        pass_done!(debug);
+    }
     stats
 }
 
-/// Walk the cache subtree and return the `k` oldest-by-atime objects in
-/// ascending-atime order. Uses a max-heap of size k → O(N log k) time,
-/// O(k) memory regardless of cache size.
-#[cfg(test)]
-fn collect_oldest(root: &Path, k: usize) -> Vec<Candidate> {
-    collect_oldest_interruptible(root, k, None)
+/// Open `path` so its inode outlives the unlink. `None` for directories
+/// (index cookies) or when it cannot be opened; the object is then freed
+/// by the filesystem in the background as usual.
+fn hold_for_reclaim(path: &Path) -> Option<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .ok()
 }
 
-fn collect_oldest_interruptible(
+/// Free the blocks of a file that was just culled (or deleted from the
+/// graveyard) through the descriptor that held it. Returns the allocated
+/// bytes released and whether they are free already (`false`: the
+/// filesystem frees them in the background). Truncates only an inode that
+/// no directory links to any more, so nothing else can reach it.
+fn reclaim(held: Option<std::fs::File>, walked: u64) -> (u64, bool) {
+    let Some(file) = held else {
+        return (walked, false);
+    };
+    let Ok(meta) = file.metadata() else {
+        return (walked, false);
+    };
+    let bytes = allocated_bytes(&meta);
+    if !meta.is_file() || meta.nlink() != 0 {
+        return (bytes, false);
+    }
+    match file.set_len(0) {
+        Ok(()) => (bytes, true),
+        Err(e) => {
+            debug!(error = %e, "truncate of culled file failed; space is freed in the background");
+            (bytes, false)
+        }
+    }
+}
+
+/// Logs the first few per-object errors of a pass and counts the rest.
+#[derive(Default)]
+struct ErrorLog {
+    seen: usize,
+}
+
+impl ErrorLog {
+    fn log(&mut self, name: &str, what: &str, err: &dyn fmt::Display) {
+        self.seen += 1;
+        if self.seen <= MAX_ERROR_LOGS_PER_PASS {
+            warn!(name, error = %err, "{what}");
+        }
+    }
+
+    fn finish(self) {
+        if self.seen > MAX_ERROR_LOGS_PER_PASS {
+            warn!(
+                not_logged = self.seen - MAX_ERROR_LOGS_PER_PASS,
+                "further per-object cull errors in this pass"
+            );
+        }
+    }
+}
+
+/// One walk of the cache objects.
+#[derive(Debug)]
+pub(crate) struct Walk {
+    /// The `k` oldest objects not set aside, oldest first.
+    candidates: Vec<Candidate>,
+    /// Every object seen, set aside or not.
+    objects: u64,
+    allocated: u64,
+    /// False when the stop flag cut the walk short.
+    complete: bool,
+}
+
+/// Walk the cache subtree and return the `k` oldest-by-atime objects in
+/// ascending-atime order, leaving out those in `skip`. Uses a max-heap of
+/// size k → O(N log k) time, O(k) memory regardless of cache size.
+fn collect_oldest(
     root: &Path,
     k: usize,
+    skip: &HashMap<u64, Instant>,
     stop: Option<&AtomicBool>,
-) -> Vec<Candidate> {
-    if k == 0 {
-        return Vec::new();
-    }
-    let mut heap: BinaryHeap<Candidate> = BinaryHeap::with_capacity(k);
+    wd: &Watchdog,
+) -> Walk {
+    let mut walk = Walk {
+        candidates: Vec::new(),
+        objects: 0,
+        allocated: 0,
+        complete: true,
+    };
+    let mut heap: BinaryHeap<Candidate> = BinaryHeap::with_capacity(k.min(1 << 16));
+    let mut last_parent: Option<Rc<Path>> = None;
 
     // Depth 3 = cookie objects (see module docs for the layout). Both
     // bounds are required: min_depth(3) skips the volume index (depth 1)
@@ -329,8 +619,10 @@ fn collect_oldest_interruptible(
 
     for entry in entries {
         if stop_requested(stop) {
+            walk.complete = false;
             break;
         }
+        wd.kick();
         let Ok(entry) = entry else { continue };
         let file_type = entry.file_type();
         if !(file_type.is_file() || file_type.is_dir()) {
@@ -346,11 +638,26 @@ fn collect_oldest_interruptible(
             continue;
         };
         let Ok(meta) = entry.metadata() else { continue };
+        let allocated = allocated_bytes(&meta);
+        walk.objects += 1;
+        walk.allocated += allocated;
+
+        let parent = match &last_parent {
+            Some(last) if **last == *parent => Rc::clone(last),
+            _ => {
+                let shared: Rc<Path> = Rc::from(parent);
+                last_parent = Some(Rc::clone(&shared));
+                shared
+            }
+        };
+        if !skip.is_empty() && skip.contains_key(&object_key(&parent, name)) {
+            continue;
+        }
         let cand = Candidate {
             atime_secs: meta.atime(),
             atime_nsecs: meta.atime_nsec(),
-            allocated: allocated_bytes(&meta),
-            parent: parent.to_path_buf(),
+            allocated,
+            parent,
             name: name.to_string(),
         };
         if heap.len() < k {
@@ -366,7 +673,25 @@ fn collect_oldest_interruptible(
     }
 
     // Sorts ascending by Ord (atime_secs first) → oldest first.
-    heap.into_sorted_vec()
+    walk.candidates = heap.into_sorted_vec();
+    walk
+}
+
+/// Objects and allocated bytes in the cache, by walking it. `None` when the
+/// stop flag cut the walk short.
+pub fn cache_usage(cache_root: &Path, stop: &AtomicBool, wd: &Watchdog) -> Option<Usage> {
+    let walk = collect_oldest(
+        &cache_root.join("cache"),
+        0,
+        &HashMap::new(),
+        Some(stop),
+        wd,
+    );
+    walk.complete.then(|| Usage {
+        objects: walk.objects,
+        allocated_bytes: walk.allocated,
+        at: Instant::now(),
+    })
 }
 
 fn stop_requested(stop: Option<&AtomicBool>) -> bool {
@@ -380,11 +705,11 @@ fn is_cache_object_name(name: &str) -> bool {
     )
 }
 
-pub fn clean_graveyard(cache_root: &Path) -> CullStats {
-    clean_graveyard_interruptible(cache_root, None)
-}
-
-fn clean_graveyard_interruptible(cache_root: &Path, stop: Option<&AtomicBool>) -> CullStats {
+/// Delete what the kernel moved into `<cache_root>/graveyard`. Each entry is
+/// removed contents first, one file at a time, so a large buried tree does
+/// not block the stop flag or the watchdog; what is left is finished on the
+/// next call.
+pub fn clean_graveyard(cache_root: &Path, stop: Option<&AtomicBool>, wd: &Watchdog) -> CullStats {
     let mut stats = CullStats::default();
     let graveyard = cache_root.join("graveyard");
     let Ok(entries) = std::fs::read_dir(&graveyard) else {
@@ -400,40 +725,70 @@ fn clean_graveyard_interruptible(cache_root: &Path, stop: Option<&AtomicBool>) -
             continue;
         };
         let path = entry.path();
-        // Measured before removal so a cull pass can count it toward its
-        // target.
-        let (bytes, files) = allocated_usage(&path);
-        let remove_result = match entry.file_type() {
-            Ok(ft) if ft.is_dir() => std::fs::remove_dir_all(&path),
-            Ok(_) => std::fs::remove_file(&path),
-            Err(e) => Err(e),
-        };
-        match remove_result {
-            Ok(()) => {
-                stats.graveyard_removed += 1;
-                stats.bytes_freed += bytes;
-                stats.files_freed += files;
+        let mut complete = true;
+        let mut first_error: Option<io::Error> = None;
+        let items = walkdir::WalkDir::new(&path)
+            .contents_first(true)
+            .follow_links(false)
+            .same_file_system(true);
+        for item in items {
+            if stop_requested(stop) {
+                complete = false;
+                break;
             }
-            Err(e) => {
-                stats.errored += 1;
-                warn!(path = %path.display(), error = %e, "failed to remove graveyard entry");
+            wd.kick();
+            let item = match item {
+                Ok(item) => item,
+                Err(e) => {
+                    complete = false;
+                    first_error.get_or_insert_with(|| io::Error::other(e.to_string()));
+                    continue;
+                }
+            };
+            // Measured before removal so a cull pass can count it toward
+            // its target.
+            let bytes = item.metadata().map(|m| allocated_bytes(&m)).unwrap_or(0);
+            let is_dir = item.file_type().is_dir();
+            let held = if item.file_type().is_file() {
+                hold_for_reclaim(item.path())
+            } else {
+                None
+            };
+            let removed = if is_dir {
+                std::fs::remove_dir(item.path())
+            } else {
+                std::fs::remove_file(item.path())
+            };
+            match removed {
+                Ok(()) => {
+                    let (bytes, now_free) = if held.is_some() {
+                        reclaim(held, bytes)
+                    } else {
+                        (bytes, false)
+                    };
+                    stats.bytes_freed += bytes;
+                    stats.files_freed += 1;
+                    if !now_free {
+                        stats.bytes_async += bytes;
+                        stats.files_async += 1;
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    complete = false;
+                    first_error.get_or_insert(e);
+                }
             }
+        }
+        if let Some(e) = first_error {
+            stats.errored += 1;
+            warn!(path = %path.display(), error = %e, "failed to remove graveyard entry");
+        }
+        if complete {
+            stats.graveyard_removed += 1;
         }
     }
     stats
-}
-
-/// Allocated bytes and inode count of `path`, including the whole subtree
-/// when it is a directory.
-fn allocated_usage(path: &Path) -> (u64, u64) {
-    walkdir::WalkDir::new(path)
-        .follow_links(false)
-        .same_file_system(true)
-        .into_iter()
-        .filter_map(|entry| entry.ok()?.metadata().ok())
-        .fold((0, 0), |(bytes, files), meta| {
-            (bytes + allocated_bytes(&meta), files + 1)
-        })
 }
 
 /// Space an object occupies on disk. `st_blocks` counts 512-byte units
@@ -445,8 +800,9 @@ fn allocated_bytes(meta: &std::fs::Metadata) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
     use std::fs;
-    use std::time::{Duration, SystemTime};
+    use std::time::SystemTime;
 
     fn touch(path: &Path, atime_offset_secs: i64) {
         // A full block, so the object has allocated space for a pass to free.
@@ -471,6 +827,10 @@ mod tests {
         bucket
     }
 
+    fn oldest(root: &Path, k: usize) -> Vec<Candidate> {
+        collect_oldest(root, k, &HashMap::new(), None, &Watchdog::disabled()).candidates
+    }
+
     #[test]
     fn top_k_returns_k_oldest_in_ascending_order() {
         let dir = tempdir();
@@ -478,8 +838,7 @@ mod tests {
         for (n, off) in [("Da", 100), ("Db", 50), ("Dc", 200), ("Dd", 25), ("De", 75)] {
             touch(&bucket.join(n), off);
         }
-        let oldest = collect_oldest(&dir, 3);
-        let names: Vec<_> = oldest.iter().map(|c| c.name.as_str()).collect();
+        let names: Vec<_> = oldest(&dir, 3).into_iter().map(|c| c.name).collect();
         assert_eq!(names, vec!["Dd", "Db", "De"]);
     }
 
@@ -489,18 +848,42 @@ mod tests {
         let bucket = cookie_bucket(&dir);
         touch(&bucket.join("Da"), 10);
         touch(&bucket.join("Db"), 20);
-        let oldest = collect_oldest(&dir, 100);
-        assert_eq!(oldest.len(), 2);
-        assert_eq!(oldest[0].name, "Da");
-        assert_eq!(oldest[1].name, "Db");
+        let found = oldest(&dir, 100);
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].name, "Da");
+        assert_eq!(found[1].name, "Db");
     }
 
     #[test]
-    fn top_k_zero_returns_empty() {
+    fn top_k_zero_keeps_nothing_but_counts_usage() {
         let dir = tempdir();
         let bucket = cookie_bucket(&dir);
         touch(&bucket.join("Da"), 10);
-        assert!(collect_oldest(&dir, 0).is_empty());
+        let walk = collect_oldest(&dir, 0, &HashMap::new(), None, &Watchdog::disabled());
+        assert!(walk.candidates.is_empty());
+        assert_eq!(walk.objects, 1);
+        assert!(walk.allocated > 0);
+        assert!(walk.complete);
+    }
+
+    #[test]
+    fn top_k_leaves_out_objects_set_aside() {
+        let dir = tempdir();
+        let bucket = cookie_bucket(&dir);
+        touch(&bucket.join("Da"), 10);
+        touch(&bucket.join("Db"), 20);
+        let mut skip = HashMap::new();
+        skip.insert(
+            object_key(&bucket, "Da"),
+            Instant::now() + Duration::from_secs(60),
+        );
+        let walk = collect_oldest(&dir, 10, &skip, None, &Watchdog::disabled());
+        let names: Vec<_> = walk.candidates.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["Db"]);
+        assert_eq!(
+            walk.objects, 2,
+            "set-aside objects still count as cache usage"
+        );
     }
 
     #[test]
@@ -515,8 +898,7 @@ mod tests {
         fs::create_dir_all(&bucket).unwrap();
         touch(&bucket.join("Scookie"), 100);
 
-        let oldest = collect_oldest(&dir, 10);
-        let names: Vec<_> = oldest.iter().map(|c| c.name.as_str()).collect();
+        let names: Vec<_> = oldest(&dir, 10).into_iter().map(|c| c.name).collect();
         assert_eq!(names, vec!["Scookie"]);
     }
 
@@ -532,28 +914,51 @@ mod tests {
         touch(&index_cookie.join("Schild"), 1);
         touch(&bucket.join("Scookie"), 2);
 
-        let oldest = collect_oldest(&dir, 10);
-        let mut names: Vec<_> = oldest.iter().map(|c| c.name.as_str()).collect();
+        let mut names: Vec<_> = oldest(&dir, 10).into_iter().map(|c| c.name).collect();
         names.sort_unstable();
         assert_eq!(names, vec!["Iindex", "Scookie"]);
+    }
+
+    #[test]
+    fn candidates_from_one_bucket_share_its_path() {
+        let dir = tempdir();
+        let bucket = cookie_bucket(&dir);
+        touch(&bucket.join("Da"), 1);
+        touch(&bucket.join("Db"), 2);
+        let found = oldest(&dir, 10);
+        assert!(Rc::ptr_eq(&found[0].parent, &found[1].parent));
     }
 
     #[test]
     fn graveyard_cleanup_removes_entries() {
         let dir = tempdir();
         let graveyard = dir.join("graveyard");
+        fs::create_dir_all(graveyard.join("dead-dir").join("sub")).unwrap();
+        fs::write(graveyard.join("dead-dir").join("child"), b"x").unwrap();
+        fs::write(graveyard.join("dead-dir").join("sub").join("deeper"), b"x").unwrap();
+        fs::write(graveyard.join("dead-file"), b"x").unwrap();
+
+        let stats = clean_graveyard(&dir, None, &Watchdog::disabled());
+        assert_eq!(stats.graveyard_removed, 2);
+        // dead-dir, sub, child, deeper, dead-file
+        assert_eq!(stats.files_freed, 5);
+        // The three files are truncated through a held descriptor; the
+        // two directories are left to the filesystem.
+        assert_eq!(stats.files_async, 2);
+        assert_eq!(stats.errored, 0);
+        assert!(fs::read_dir(&graveyard).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn graveyard_cleanup_stops_on_signal() {
+        let dir = tempdir();
+        let graveyard = dir.join("graveyard");
         fs::create_dir_all(graveyard.join("dead-dir")).unwrap();
         fs::write(graveyard.join("dead-dir").join("child"), b"x").unwrap();
-        fs::write(graveyard.join("dead-file"), b"x").unwrap();
-        let (dir_bytes, dir_files) = allocated_usage(&graveyard.join("dead-dir"));
-        let (file_bytes, _) = allocated_usage(&graveyard.join("dead-file"));
-
-        let stats = clean_graveyard(&dir);
-        assert_eq!(stats.graveyard_removed, 2);
-        assert_eq!(dir_files, 2);
-        assert_eq!(stats.files_freed, 3);
-        assert_eq!(stats.bytes_freed, dir_bytes + file_bytes);
-        assert!(fs::read_dir(&graveyard).unwrap().next().is_none());
+        let stop = AtomicBool::new(true);
+        let stats = clean_graveyard(&dir, Some(&stop), &Watchdog::disabled());
+        assert_eq!(stats.graveyard_removed, 0);
+        assert!(graveyard.join("dead-dir").join("child").exists());
     }
 
     #[test]
@@ -563,12 +968,12 @@ mod tests {
         let path = bucket.join("Scookie");
         touch(&path, 10);
 
-        let oldest = collect_oldest(&dir, 1);
-        assert_eq!(oldest.len(), 1);
-        assert!(!oldest[0].atime_changed().unwrap());
+        let found = oldest(&dir, 1);
+        assert_eq!(found.len(), 1);
+        assert!(!found[0].atime_changed().unwrap());
 
         touch(&path, 20);
-        assert!(oldest[0].atime_changed().unwrap());
+        assert!(found[0].atime_changed().unwrap());
     }
 
     fn pass_ctx(root: &Path, batch_size: usize) -> CullCtx {
@@ -589,15 +994,42 @@ mod tests {
     }
 
     /// Stands in for the kernel: culls by unlinking, reports `busy` names
-    /// as held.
-    fn fake_cull<'a>(busy: &'a [&'a str]) -> impl FnMut(&Candidate) -> Result<bool> + 'a {
+    /// as held, and records every name it was asked about.
+    fn fake_cull<'a>(
+        busy: &'a [&'a str],
+        asked: &'a RefCell<Vec<String>>,
+    ) -> impl FnMut(&Candidate) -> Result<CullOutcome> + 'a {
         move |cand: &Candidate| {
+            asked.borrow_mut().push(cand.name.clone());
             if busy.contains(&cand.name.as_str()) {
-                return Ok(false);
+                return Ok(CullOutcome::Busy);
             }
             fs::remove_file(cand.path())?;
-            Ok(true)
+            Ok(CullOutcome::Culled)
         }
+    }
+
+    fn pass(
+        ctx: &CullCtx,
+        table: &mut CullTable,
+        target: CullTarget,
+        busy: &[&str],
+    ) -> (CullStats, Vec<String>) {
+        let asked = RefCell::new(Vec::new());
+        let stop = AtomicBool::new(false);
+        let stats = run_pass_with(
+            ctx,
+            table,
+            target,
+            &stop,
+            &Watchdog::disabled(),
+            fake_cull(busy, &asked),
+        );
+        (stats, asked.into_inner())
+    }
+
+    fn files(n: u64) -> CullTarget {
+        CullTarget { bytes: 0, files: n }
     }
 
     fn allocated_of(bucket: &Path, names: &[&str]) -> u64 {
@@ -630,8 +1062,12 @@ mod tests {
             bytes: need,
             files: 0,
         };
-        let stop = AtomicBool::new(false);
-        let stats = run_pass_with(&pass_ctx(&dir, 1024), target, &stop, fake_cull(&[]));
+        let (stats, _) = pass(
+            &pass_ctx(&dir, 1024),
+            &mut CullTable::default(),
+            target,
+            &[],
+        );
 
         assert_eq!(stats.culled, 2);
         assert_eq!(stats.bytes_freed, need);
@@ -645,14 +1081,229 @@ mod tests {
             &dir,
             &[("Da", 10), ("Db", 20), ("Dc", 30), ("Dd", 40), ("De", 50)],
         );
-
-        let target = CullTarget { bytes: 0, files: 3 };
-        let stop = AtomicBool::new(false);
-        let stats = run_pass_with(&pass_ctx(&dir, 2), target, &stop, fake_cull(&[]));
+        // Nothing is known about object sizes before the first walk, so it
+        // keeps batch_size (2) candidates; the second walk finds the third.
+        let target = CullTarget {
+            bytes: allocated_of(&bucket, &["Da", "Db", "Dc"]),
+            files: 0,
+        };
+        let (stats, _) = pass(&pass_ctx(&dir, 2), &mut CullTable::default(), target, &[]);
 
         assert_eq!(stats.culled, 3);
-        assert_eq!(stats.candidates, 4, "two walks of batch_size 2");
+        assert_eq!(stats.walks, 2);
         assert_eq!(remaining(&bucket), vec!["Dd", "De"]);
+    }
+
+    #[test]
+    fn an_inode_target_sizes_the_first_walk() {
+        let dir = tempdir();
+        let bucket = cache_with(
+            &dir,
+            &[("Da", 10), ("Db", 20), ("Dc", 30), ("Dd", 40), ("De", 50)],
+        );
+        let (stats, _) = pass(&pass_ctx(&dir, 2), &mut CullTable::default(), files(3), &[]);
+        assert_eq!((stats.culled, stats.walks), (3, 1));
+        assert_eq!(remaining(&bucket), vec!["Dd", "De"]);
+    }
+
+    #[test]
+    fn pass_gets_past_a_busy_oldest_batch() {
+        // Regression: when every object of the oldest batch was busy, the
+        // pass ended without progress, and every later walk returned the
+        // same busy objects (still the oldest), so nothing was ever culled.
+        let dir = tempdir();
+        let bucket = cache_with(&dir, &[("Da", 10), ("Db", 20), ("Dc", 30), ("Dd", 40)]);
+
+        let (stats, asked) = pass(
+            &pass_ctx(&dir, 2),
+            &mut CullTable::default(),
+            files(1),
+            &["Da", "Db"],
+        );
+
+        assert_eq!(stats.culled, 1);
+        assert_eq!(stats.skipped_busy, 2);
+        assert_eq!(asked, vec!["Da", "Db", "Dc"]);
+        assert_eq!(remaining(&bucket), vec!["Da", "Db", "Dd"]);
+    }
+
+    #[test]
+    fn busy_objects_stay_set_aside_on_the_next_pass() {
+        let dir = tempdir();
+        cache_with(&dir, &[("Da", 10), ("Db", 20), ("Dc", 30), ("Dd", 40)]);
+        let ctx = pass_ctx(&dir, 1024);
+        let mut table = CullTable::default();
+
+        let (first, _) = pass(&ctx, &mut table, files(1), &["Da"]);
+        assert_eq!((first.culled, first.skipped_busy), (1, 1));
+        assert_eq!(table.skipped(), 1);
+
+        let (second, asked) = pass(&ctx, &mut table, files(1), &["Da"]);
+        assert_eq!(second.culled, 1);
+        assert_eq!(asked, vec!["Dc"], "Da is not asked about again");
+    }
+
+    #[test]
+    fn set_aside_objects_come_back_after_skip_ttl() {
+        let dir = tempdir();
+        let bucket = cache_with(&dir, &[("Da", 10)]);
+        let mut table = CullTable::default();
+        let walk = collect_oldest(
+            &dir.join("cache"),
+            10,
+            &table.skip,
+            None,
+            &Watchdog::disabled(),
+        );
+        let now = Instant::now();
+        table.set_aside(&walk.candidates[0], now);
+        assert_eq!(table.skipped(), 1);
+        table.expire(now + SKIP_TTL);
+        assert_eq!(table.skipped(), 0);
+        assert_eq!(remaining(&bucket), vec!["Da"]);
+    }
+
+    #[test]
+    fn pass_reuses_the_rest_of_the_previous_walk() {
+        let dir = tempdir();
+        let bucket = cache_with(&dir, &[("Da", 10), ("Db", 20), ("Dc", 30)]);
+        let ctx = pass_ctx(&dir, 1024);
+        let mut table = CullTable::default();
+
+        let (first, _) = pass(&ctx, &mut table, files(1), &[]);
+        assert_eq!((first.culled, first.walks), (1, 1));
+
+        let (second, asked) = pass(&ctx, &mut table, files(1), &[]);
+        assert_eq!(second.culled, 1);
+        assert_eq!(second.walks, 0, "candidates left from the first walk");
+        assert_eq!(asked, vec!["Db"]);
+        assert_eq!(remaining(&bucket), vec!["Dc"]);
+
+        // Too old to trust: the next pass walks again.
+        table.expire(Instant::now() + TABLE_TTL);
+        let (third, _) = pass(&ctx, &mut table, files(1), &[]);
+        assert_eq!((third.culled, third.walks), (1, 1));
+    }
+
+    #[test]
+    fn walk_grows_to_cover_the_target() {
+        let dir = tempdir();
+        let cookies: Vec<(String, i64)> = (0..10).map(|i| (format!("D{i:02}"), i)).collect();
+        let refs: Vec<(&str, i64)> = cookies.iter().map(|(n, a)| (n.as_str(), *a)).collect();
+        let bucket = cache_with(&dir, &refs);
+        let oldest_eight: Vec<&str> = refs.iter().take(8).map(|(n, _)| *n).collect();
+
+        let target = CullTarget {
+            bytes: allocated_of(&bucket, &oldest_eight),
+            files: 0,
+        };
+        let (stats, _) = pass(&pass_ctx(&dir, 2), &mut CullTable::default(), target, &[]);
+
+        assert_eq!(stats.culled, 8);
+        // First walk: batch_size 2. It shows the object size, so the
+        // second walk keeps enough for the remaining six.
+        assert_eq!(stats.walks, 2);
+    }
+
+    #[test]
+    fn batch_size_is_bounded() {
+        let mut table = CullTable::default();
+        assert_eq!(table.batch_size(100, 1 << 40, 0), 100, "no size known yet");
+        table.avg_allocated = Some(1 << 20);
+        assert_eq!(table.batch_size(100, 10 << 20, 0), 100);
+        assert_eq!(table.batch_size(100, 1000 << 20, 0), 1250);
+        assert_eq!(table.batch_size(100, 1 << 50, 0), 6400);
+        assert_eq!(table.batch_size(100, 0, 500), 625);
+    }
+
+    #[test]
+    fn culled_files_are_freed_through_the_held_descriptor() {
+        let dir = tempdir();
+        let bucket = cache_with(&dir, &[("Da", 10), ("Db", 20)]);
+        let need = allocated_of(&bucket, &["Da"]);
+        let target = CullTarget {
+            bytes: need,
+            files: 0,
+        };
+        let (stats, _) = pass(
+            &pass_ctx(&dir, 1024),
+            &mut CullTable::default(),
+            target,
+            &[],
+        );
+        assert_eq!(stats.culled, 1);
+        assert_eq!(stats.bytes_freed, need);
+        assert_eq!((stats.bytes_async, stats.files_async), (0, 0));
+    }
+
+    #[test]
+    fn a_file_still_linked_after_cull_is_not_truncated() {
+        // Should the kernel report success yet the name still point at our
+        // inode (a race with object replacement), the data must stay.
+        let dir = tempdir();
+        let bucket = cache_with(&dir, &[("Da", 10)]);
+        let size = fs::metadata(bucket.join("Da")).unwrap().len();
+        let stop = AtomicBool::new(false);
+        let stats = run_pass_with(
+            &pass_ctx(&dir, 1024),
+            &mut CullTable::default(),
+            files(1),
+            &stop,
+            &Watchdog::disabled(),
+            |_| Ok(CullOutcome::Culled),
+        );
+        assert_eq!(stats.culled, 1);
+        assert_eq!(stats.bytes_async, stats.bytes_freed);
+        assert_eq!(fs::metadata(bucket.join("Da")).unwrap().len(), size);
+    }
+
+    #[test]
+    fn eio_ends_the_pass() {
+        let dir = tempdir();
+        let bucket = cache_with(&dir, &[("Da", 10), ("Db", 20)]);
+        let stop = AtomicBool::new(false);
+        let mut asked = 0;
+        let stats = run_pass_with(
+            &pass_ctx(&dir, 1024),
+            &mut CullTable::default(),
+            files(2),
+            &stop,
+            &Watchdog::disabled(),
+            |_| {
+                asked += 1;
+                Err(Error::Kernel {
+                    cmd: "cull x".into(),
+                    source: io::Error::from_raw_os_error(libc::EIO),
+                })
+            },
+        );
+        assert_eq!(asked, 1);
+        assert_eq!(stats.kernel_eio, 1);
+        assert!(!stats.made_progress());
+        assert_eq!(remaining(&bucket), vec!["Da", "Db"]);
+    }
+
+    #[test]
+    fn vanished_objects_are_not_errors() {
+        let dir = tempdir();
+        let bucket = cache_with(&dir, &[("Da", 10), ("Db", 20)]);
+        let stop = AtomicBool::new(false);
+        let stats = run_pass_with(
+            &pass_ctx(&dir, 1024),
+            &mut CullTable::default(),
+            files(1),
+            &stop,
+            &Watchdog::disabled(),
+            |cand| {
+                if cand.name == "Da" {
+                    return Ok(CullOutcome::Gone);
+                }
+                fs::remove_file(cand.path())?;
+                Ok(CullOutcome::Culled)
+            },
+        );
+        assert_eq!((stats.gone, stats.errored, stats.culled), (1, 0, 1));
+        assert_eq!(remaining(&bucket), vec!["Da"]);
     }
 
     #[test]
@@ -660,9 +1311,12 @@ mod tests {
         let dir = tempdir();
         let bucket = cache_with(&dir, &[("Da", 10), ("Db", 20), ("Dc", 30), ("Dd", 40)]);
 
-        let target = CullTarget { bytes: 0, files: 2 };
-        let stop = AtomicBool::new(false);
-        let stats = run_pass_with(&pass_ctx(&dir, 1024), target, &stop, fake_cull(&["Da"]));
+        let (stats, _) = pass(
+            &pass_ctx(&dir, 1024),
+            &mut CullTable::default(),
+            files(2),
+            &["Da"],
+        );
 
         assert_eq!(stats.culled, 2);
         assert_eq!(stats.skipped_busy, 1);
@@ -678,12 +1332,16 @@ mod tests {
             bytes: u64::MAX,
             files: 0,
         };
-        let stop = AtomicBool::new(false);
-        let busy = ["Da", "Db"];
-        let stats = run_pass_with(&pass_ctx(&dir, 1024), target, &stop, fake_cull(&busy));
+        let (stats, asked) = pass(
+            &pass_ctx(&dir, 1024),
+            &mut CullTable::default(),
+            target,
+            &["Da", "Db"],
+        );
 
         assert!(!stats.made_progress());
         assert_eq!(stats.skipped_busy, 2);
+        assert_eq!(asked, vec!["Da", "Db"], "each busy object asked once");
         assert_eq!(remaining(&bucket), vec!["Da", "Db"]);
     }
 
@@ -692,12 +1350,16 @@ mod tests {
         let dir = tempdir();
         let bucket = cache_with(&dir, &[("Da", 10)]);
 
-        let stop = AtomicBool::new(false);
-        let ctx = pass_ctx(&dir, 1024);
-        let stats = run_pass_with(&ctx, CullTarget::default(), &stop, fake_cull(&[]));
+        let (stats, _) = pass(
+            &pass_ctx(&dir, 1024),
+            &mut CullTable::default(),
+            CullTarget::default(),
+            &[],
+        );
 
         assert_eq!(stats.culled, 0);
         assert_eq!(stats.candidates, 0);
+        assert_eq!(stats.walks, 0);
         assert_eq!(remaining(&bucket), vec!["Da"]);
     }
 
@@ -708,18 +1370,32 @@ mod tests {
         let graveyard = dir.join("graveyard");
         fs::create_dir_all(&graveyard).unwrap();
         touch(&graveyard.join("dead"), 0);
-        let (in_graveyard, _) = allocated_usage(&graveyard.join("dead"));
+        let in_graveyard = allocated_of(&graveyard, &["dead"]);
 
         let target = CullTarget {
             bytes: in_graveyard,
             files: 1,
         };
-        let stop = AtomicBool::new(false);
-        let stats = run_pass_with(&pass_ctx(&dir, 1024), target, &stop, fake_cull(&[]));
+        let (stats, _) = pass(
+            &pass_ctx(&dir, 1024),
+            &mut CullTable::default(),
+            target,
+            &[],
+        );
 
         assert_eq!(stats.graveyard_removed, 1);
         assert_eq!(stats.culled, 0);
         assert_eq!(remaining(&bucket), vec!["Da"]);
+    }
+
+    #[test]
+    fn cache_usage_counts_every_object() {
+        let dir = tempdir();
+        let bucket = cache_with(&dir, &[("Da", 10), ("Db", 20)]);
+        let usage = cache_usage(&dir, &AtomicBool::new(false), &Watchdog::disabled()).unwrap();
+        assert_eq!(usage.objects, 2);
+        assert_eq!(usage.allocated_bytes, allocated_of(&bucket, &["Da", "Db"]));
+        assert!(cache_usage(&dir, &AtomicBool::new(true), &Watchdog::disabled()).is_none());
     }
 
     #[test]
@@ -735,7 +1411,9 @@ mod tests {
         };
         let low = FreeSpace {
             block_size: 4096,
+            blocks_total: 10_000,
             blocks_avail: 600,
+            files_total: 1000,
             files_free: 90,
         };
         assert_eq!(
@@ -747,9 +1425,9 @@ mod tests {
         );
 
         let above_run = FreeSpace {
-            block_size: 4096,
             blocks_avail: 1200,
             files_free: 500,
+            ..low
         };
         assert!(CullTarget::new(&state, &above_run).is_zero());
     }

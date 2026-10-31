@@ -71,9 +71,9 @@ on-demand enabled would not be a natural fit for NFS, because the NFS
 client itself populates the cache via fscache writes — there's nothing for
 the daemon to fetch.
 
-Traditional mode also yields the simplest daemon: ~900 LOC of production
-Rust (plus a ~300 LOC diagnostic probe binary) to do configuration,
-monitor `/proc/fs/fscache/stats`-equivalent state, and drive cull.
+Traditional mode also keeps the daemon small — about 3.5k lines of Rust
+including comments, plus a diagnostic probe binary — for configuration,
+watching the kernel's state, and driving cull.
 
 ## Protocol
 
@@ -105,7 +105,7 @@ There is **no** `unbind` command; closing the fd unbinds the cache.
 A single line is returned on each successful `read()`:
 
 ```
-cull=N frun=H fcull=H fstop=H brun=H bcull=H bstop=H
+cull=N frun=H fcull=H fstop=H brun=H bcull=H bstop=H freleased=H breleased=H
 ```
 
 `cull=1` means the kernel wants culling: it is set when free space drops
@@ -115,18 +115,21 @@ writes. The other fields are **the limits themselves, not free counts**:
 the configured percentages converted at bind time into filesystem blocks
 (`b*`) and inodes (`f*`), in hex (no `0x` prefix). They stay fixed while
 the cache is bound; the kernel compares them with `f_bavail` / `f_ffree`
-from `statfs(cache_dir)`. The daemon's heartbeat log prints the current
-`bavail` / `ffree` next to the limits.
+from `statfs(cache_dir)`, minus the blocks of cache writes still in
+flight. `freleased` / `breleased` count the objects (and blocks) the
+kernel stopped using since the previous read; the daemon ignores them.
+The daemon's heartbeat log prints the current `bavail` / `ffree` next to
+the limits.
 
 The kernel sets `POLLIN` when the state line changed and `POLLOUT` for as
-long as culling remains active. The daemon listens for both, except while
-it waits for the space a pass freed to show up (see "Cull algorithm"),
-when it listens for `POLLIN` only so that `POLLOUT` does not spin the loop.
+long as culling remains active. The daemon polls for `POLLIN` only:
+`POLLOUT` would spin the loop whenever it decides to wait.
 
-The daemon also reads the state whenever `poll` times out (every 5 s; every
-0.5 s while waiting). The kernel re-checks free space only when the cache
-writes or the daemon reads, so without these reads an idle cache would
-never be told to cull while other data fills a shared filesystem.
+The daemon also reads the state whenever `poll` times out (at least every
+5 s, sooner when a timer or a cull decision is due). The kernel re-checks
+free space only when the cache writes or the daemon reads, so without
+these reads an idle cache would never be told to cull while other data
+fills a shared filesystem.
 
 ## Cache sizing
 
@@ -159,6 +162,35 @@ holds other data, that data counts too: the cache grows until the
 If the other data alone keeps free space below `brun`, culling cannot
 reach its target and ends up emptying the cache.
 
+### `max_size`: a budget through a project quota
+
+The kernel's percentages are of whatever `statfs(cache_dir)` reports, and
+on XFS and ext4 statfs on a directory that carries a project ID with the
+inherit flag reports the project's block limit as the size, and the
+smaller of "limit minus usage" and the real free space as available.
+With `max_size` set, the daemon (`quota.rs`), before bind:
+
+1. checks that project quota accounting and enforcement are on
+   (`quotactl_fd`, `Q_XGETQSTATV`);
+2. refuses a `quota_project_id` that already holds data elsewhere, or a
+   cache directory already tagged with another project;
+3. gives every file and directory of the cache tree the project ID, and
+   directories the inherit flag, so what the kernel creates later carries
+   it too (`FS_IOC_FSSETXATTR`);
+4. sets the project's block hard limit to `max_size` (soft limit 0, so
+   statfs reports the hard one), and checks that statfs on `cache_dir` now
+   reports it.
+
+The kernel computes its limits from that statfs at bind, so the
+percentages become percentages of the budget, while a filesystem that
+runs low still makes the cache shrink. Two details matter:
+
+- statfs goes to the root of the mount the kernel was given, which is why
+  `cache_dir` must be its own mount (the self-bind) for the quota to show.
+- The whole tree is tagged before bind. XFS refuses renames between
+  directories of different projects (`EXDEV`), and cachefiles treats a
+  failed rename into its graveyard as an I/O error that stops the cache.
+
 ## Cull algorithm
 
 The on-disk layout cachefiles produces (kernel ≥ 5.17) is:
@@ -169,17 +201,22 @@ The on-disk layout cachefiles produces (kernel ≥ 5.17) is:
 <cache_root>/cache/Ivolume,…/@xx/Scookie  ← cookie object  (depth 3)
 ```
 
-When `cull=1`:
+While the kernel reports `cull=1`, the daemon asks the planner
+(`planner.rs`, pure logic) what to do on every wakeup:
 
-1. Size the pass: from `statfs(cache_dir)`, the bytes and inodes missing
-   to bring free space back up to `brun` / `frun` — exactly what the
-   kernel needs to clear `cull=1`. If nothing is missing (the kernel also
-   counts in-flight cache writes as used), back off for a second and
-   re-read the state instead of culling.
-2. Delete entries that the kernel moved into `<cache_dir>/graveyard`,
-   counting what they occupied toward the target.
-3. Walk **only depth 3** under `<cache_dir>/cache/` using `walkdir`
-   (`min_depth(3).max_depth(3)`). Both bounds matter:
+1. **Size the pass** from `statfs(cache_dir)`: the blocks and inodes
+   missing to bring free space up to `brun` / `frun`, plus a small margin
+   above `brun` (a tenth of the `bcull`..`brun` band, at most 1 GiB): the
+   kernel only clears `cull=1` once free space *minus in-flight cache
+   writes* reaches `brun`, so stopping exactly at `brun` leaves the flag set
+   under steady writes. Space earlier passes freed in the background but
+   statfs does not show yet is subtracted (see step 5). If nothing is
+   missing, look again in a second.
+2. **Empty the graveyard** (`<cache_dir>/graveyard`, where the kernel moves
+   directories it deletes), counting what it held toward the target.
+3. **Take candidates** from the table the previous walk left, or walk the
+   cache: only depth 3 under `<cache_dir>/cache/` (`min_depth(3)` /
+   `max_depth(3)`):
    - skipping depth 1 protects the volume index — `cull Ivolume,…`
      succeeds whenever no client mount is currently using the volume
      (boot before mount, after umount, e2e setup) and erases the
@@ -189,36 +226,60 @@ When `cull=1`:
    - capping at depth 3 prevents the daemon from descending into an
      index-cookie directory and trying to cull its children
      individually — culling the parent removes the subtree.
-4. Keep the `cull.batch_size` oldest-by-atime cookies, each as
-   `(parent, basename, atime, allocated bytes)`. Allocated bytes are
-   `st_blocks × 512`, not `st_size`: cachefiles sizes each cache file to
-   the whole remote file but only stores the ranges that were read, so
-   `st_size` can be several times what culling the file gives back.
-5. Cull them oldest first and **stop as soon as the target is met**. For
-   each:
-   - `chdir(parent)`
-   - Send `cull <basename>`. Kernel returns `EBUSY` if held → skip.
 
-   If the batch runs out first, walk again. A batch that frees nothing
-   ends the pass (everything left is busy or failing); the daemon then
-   backs off briefly before trying again.
-6. Wait for the freed space to show up in statfs: until free space
-   reaches what the pass freed (capped at `brun` / `frun`), drops below
-   `bstop` / `fstop`, or 30 s have passed. XFS reclaims unlinked inodes
-   in background workers, so right after a pass statfs — and the kernel
-   with it — still reports the old free count and keeps `cull=1`. Sizing
-   another pass on those numbers would cull the same shortfall again.
-7. Read the state. If `cull=0`, done; else size a new pass from fresh
-   numbers.
+   A walk keeps the K oldest-by-atime objects as `(bucket, name, atime,
+   allocated bytes)`, leaving out objects set aside (step 4). K starts at
+   `cull.batch_size` and grows, up to 64 times that, to fit what is left to
+   free given the average object size of the last walk. Allocated bytes
+   are `st_blocks × 512`, not `st_size`: cachefiles sizes each cache file
+   to the whole remote file but only stores the ranges that were read, so
+   `st_size` can be several times what culling the file gives back. What a
+   pass does not use stays in the table for the next pass, for up to
+   5 minutes.
+4. **Cull oldest first and stop as soon as the target is met.** For each
+   candidate: re-check its atime (a changed one was just used: skip it),
+   open it, `chdir(bucket)` (skipped when the bucket is the previous one's),
+   send `cull <name>`, then free the blocks:
+   - `EBUSY`: the kernel uses the object. It is set aside — left out of
+     walks for 5 minutes — instead of coming back on every walk. Without
+     that, a batch of busy objects (files tenants keep open or mapped),
+     being the oldest, came back unchanged from every walk and the cull
+     never reached anything it could free.
+   - `ENOENT` / `ESTALE`: the object went away meanwhile; not an error.
+   - `EIO`: the kernel has most likely stopped the cache; the pass ends
+     and the daemon checks (see "Failure modes").
+   - Success: the kernel has unlinked the file. Once `st_nlink` on the
+     descriptor we opened is 0, no one else can reach the inode (cachefiles
+     never culls an object it uses and never picks a culled one up again),
+     and the daemon truncates it through that descriptor. XFS would
+     otherwise free the blocks in background workers, seconds later for a
+     file of hundreds of thousands of extents (measured: 4–5 s for 200k),
+     and statfs — and the kernel — would count them as used meanwhile. The
+     truncate frees them before the pass ends.
 
-Earlier versions culled a whole batch per pass and re-read the state right
-away. On caches made of a few thousand large files that emptied nearly the
-whole cache every time free space crossed `bcull`, instead of trimming it
-back to `brun`.
+   When the batch runs out first, walk again. A batch that frees nothing
+   and sets nothing new aside ends the pass.
+5. **Record the pass.** Statfs right after it is accurate, so the next
+   decision is sized on fresh numbers. What could not be freed on the spot
+   (directories, a failed truncate) the planner remembers as pending and
+   subtracts from later targets until statfs gains it, or for 60 s at most
+   so that space other writes take meanwhile is still given back.
+6. **Back off** when a pass freed nothing (everything left is busy,
+   failing, or the cache is empty while other data keeps free space low):
+   wait 1 s, doubling up to 60 s, and log the warning at most every five
+   minutes.
 
-This is the same shape as upstream cachefilesd's algorithm. The
-walk-on-demand approach scales to caches with hundreds of thousands of
-objects without keeping a persistent index in memory.
+Version 1.0.2 culled a whole batch per pass and re-read the state right
+away, which on caches made of a few thousand large files emptied nearly
+the whole cache every time free space crossed `bcull`. 1.0.3 sized passes
+but waited at most 30 s for statfs to catch up, after which a second pass
+could cull the same shortfall again; truncating culled files on the spot
+removed the wait.
+
+This is the same shape as upstream cachefilesd's algorithm (including its
+table of candidates kept between passes). The walk-on-demand approach
+scales to caches with hundreds of thousands of objects without keeping a
+persistent index in memory.
 
 ## Failure modes
 
@@ -228,10 +289,14 @@ objects without keeping a persistent index in memory.
 | another daemon holds the device | open returns EBUSY |
 | cache dir not its own mountpoint | `bind` returns EINVAL; daemon exits |
 | limits violate ordering | rejected before any kernel write |
-| daemon crash / SIGKILL | kernel auto-withdraws cache on fd close |
+| daemon crash / SIGKILL | kernel auto-withdraws cache on fd close; systemd restarts the daemon |
 | cache fs fills past `bstop` | kernel refuses new caching; warns in dmesg |
-| cull command races against kernel use | EBUSY; daemon skips and tries next |
-| malformed state line from kernel | logged as warn; loop continues |
+| cull command races against kernel use | EBUSY; object set aside for 5 min, daemon tries the next |
+| nothing cullable while `cull=1` | pass makes no progress; backoff 1 s → 60 s, rate-limited warning |
+| kernel stops the cache after an I/O error (state `E`; e.g. a cache xattr write failing with ENOSPC on a full disk) | every command fails with EIO and nothing is cached; the daemon notices within 10 s (or on the first EIO) and exits non-zero, systemd binds it again |
+| `max_size` set but project quotas not enforced | daemon refuses to start, says why |
+| daemon hangs | systemd watchdog (2 min) restarts it |
+| malformed state line from kernel | logged as warn (rate-limited); loop continues |
 
 ## Performance baseline
 
@@ -323,16 +388,23 @@ PCIe 5.0 NVMe + DDR5 expect proportionally higher ceilings.
 
 ```
 src/
-  main.rs        CLI, signal handlers, tracing init, runs Daemon
-  config.rs      TOML schema, validation, ConfigCmd conversion
-  daemon.rs      poll loop, state read, cull trigger, heartbeat
-  cull.rs        directory walk, atime sort, chdir + cull commands
-  error.rs       thiserror enum
+  main.rs            CLI, signal handlers, tracing init, runs Daemon
+  config.rs          TOML schema, validation, ConfigCmd conversion
+  daemon.rs          poll loop, state read, health check, timers, heartbeat
+  planner.rs         when to cull and how much (pure logic)
+  cull.rs            directory walk, candidate table, chdir + cull, truncate
+  quota.rs           max_size as a project quota (quotactl_fd)
+  fsattr.rs          FS_IOC_FS{GET,SET}XATTR: project IDs, extent size hints
+  metrics.rs         node_exporter textfile output
+  systemd_notify.rs  sd_notify: readiness, watchdog, start timeout
+  signals.rs         SIGTERM/SIGINT/SIGHUP wiring
+  util.rs            log rate limiting, byte formatting
+  error.rs           thiserror enum
   proto/
-    mod.rs       module re-exports + /dev/cachefiles path constant
-    cmd.rs       Device wrapper, ConfigCmd::apply_and_bind, cull(), inuse()
-    state.rs     parser for the kernel's state line
-  bin/probe.rs   throwaway diagnostic binary
+    mod.rs           module re-exports + /dev/cachefiles path constant
+    cmd.rs           Kernel trait, Device, ConfigCmd::apply_and_bind, cull(), inuse()
+    state.rs         parser for the kernel's state line
+  bin/probe.rs       diagnostic binary
 
 packaging/
   systemd/nfs-cachefs.service

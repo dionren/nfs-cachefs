@@ -25,6 +25,16 @@ pub enum Error {
         #[source]
         source: io::Error,
     },
+
+    /// The kernel stopped the cache after an I/O error (state `E` in
+    /// `/proc/fs/fscache/caches`). It caches nothing more until the daemon
+    /// closes `/dev/cachefiles` and binds again.
+    #[error("cache {tag:?} was stopped by the kernel after an I/O error")]
+    CacheDead { tag: String },
+
+    /// The stop signal arrived during startup work that runs before bind.
+    #[error("interrupted by stop signal")]
+    Interrupted,
 }
 
 impl Error {
@@ -33,6 +43,14 @@ impl Error {
     }
     pub fn config(msg: impl Into<String>) -> Self {
         Self::Config(msg.into())
+    }
+
+    /// The errno behind a kernel or I/O error, if any.
+    pub fn raw_os_error(&self) -> Option<i32> {
+        match self {
+            Self::Io(e) | Self::Kernel { source: e, .. } => e.raw_os_error(),
+            _ => None,
+        }
     }
 }
 

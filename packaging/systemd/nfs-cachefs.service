@@ -8,6 +8,9 @@ After=local-fs.target
 Wants=remote-fs-pre.target
 Before=remote-fs-pre.target
 ConditionFileNotEmpty=/etc/nfs-cachefs/daemon.toml
+# Keep retrying however often the daemon fails (the restart delay below
+# grows instead): without the daemon, fsc mounts silently stop caching.
+StartLimitIntervalSec=0
 
 [Service]
 Type=notify
@@ -17,11 +20,26 @@ ExecStart=/usr/sbin/nfs-cachefs --config /etc/nfs-cachefs/daemon.toml
 # The '+' prefix keeps CAP_SYS_MODULE out of the long-running daemon while
 # allowing this pre-start helper to load the module on a fresh boot.
 ExecStartPre=+/sbin/modprobe -q cachefiles
-Restart=on-failure
+# Restart on any exit systemd did not ask for: a stray SIGTERM/SIGHUP ends
+# the daemon cleanly (exit 0), and the daemon exits on purpose when the
+# kernel stops the cache after an I/O error, so that it is bound again.
+Restart=always
 RestartSec=2s
-TimeoutStartSec=30s
-TimeoutStopSec=10s
+RestartSteps=6
+RestartMaxDelaySec=2min
+# Startup can take longer the first time max_size tags a large cache; the
+# daemon extends this timeout while it works.
+TimeoutStartSec=90s
+# Closing /dev/cachefiles withdraws the cache, which syncs the whole cache
+# filesystem — on a disk shared with busy containers that takes a while.
+TimeoutStopSec=90s
+# The daemon notifies at least every half interval, also during long cull
+# passes and graveyard cleanups.
+WatchdogSec=2min
 KillSignal=SIGTERM
+# Writable for the metrics textfile (metrics.textfile under /run/nfs-cachefs).
+RuntimeDirectory=nfs-cachefs
+RuntimeDirectoryMode=0755
 
 # Hardening: cache dir is the only writable path. Daemon does no
 # networking, no kernel module loading (the '+' ExecStartPre handles
@@ -46,7 +64,8 @@ RestrictRealtime=true
 LockPersonality=true
 MemoryDenyWriteExecute=true
 SystemCallArchitectures=native
-# CAP_SYS_ADMIN is required to write /dev/cachefiles configuration.
+# CAP_SYS_ADMIN is required to write /dev/cachefiles configuration and to
+# set the max_size project quota.
 CapabilityBoundingSet=CAP_SYS_ADMIN CAP_DAC_READ_SEARCH
 
 [Install]

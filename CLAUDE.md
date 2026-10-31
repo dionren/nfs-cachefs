@@ -36,29 +36,36 @@ the generic invariants below.
   by `(server, export)` unless `nosharecache` is given — without it,
   the new `-o fsc` mount silently inherits the existing non-fsc SB
   and `/proc/fs/nfsfs/volumes` shows FSC=no.
-- **Daemon must be bound before any `mount -o fsc`.** Otherwise the
-  mount silently falls back to no-caching with no error logged.
+- **Daemon must be bound before any `mount -o fsc`.** A mount made while
+  no cache is bound shows `FSC=yes` but caches nothing, with no error
+  logged (6.x source suggests the first cache bound later takes it over;
+  unverified on the test box).
 
 ## Repo layout
 
 ```
-src/main.rs          CLI, signals, tracing
-src/config.rs        TOML schema + validation
-src/daemon.rs        poll loop, state read, cull trigger, heartbeat
-src/cull.rs          walk + atime sort + chdir + cull
-src/error.rs         thiserror enum
-src/proto/cmd.rs     Device, ConfigCmd::apply_and_bind, cull(), inuse()
-src/proto/state.rs   parse the kernel state line
-src/proto/mod.rs     re-exports + CACHEFILES_DEV constant
-src/bin/probe.rs     diagnostic-only binary
+src/main.rs           CLI, signals, tracing
+src/config.rs         TOML schema + validation (ByteSize for max_size/extsize)
+src/daemon.rs         poll loop, state read, health check, timers, heartbeat
+src/planner.rs        when to cull and how much (pure, simulated in tests)
+src/cull.rs           walk + candidate table + chdir + cull + truncate
+src/quota.rs          max_size as a project quota (quotactl_fd)
+src/fsattr.rs         FS_IOC_FS{GET,SET}XATTR: project ID, extsize hint
+src/metrics.rs        node_exporter textfile writer
+src/systemd_notify.rs sd_notify: READY, WATCHDOG, EXTEND_TIMEOUT_USEC
+src/error.rs          thiserror enum (CacheDead, Interrupted, ...)
+src/proto/cmd.rs      Kernel trait, Device, ConfigCmd::apply_and_bind, cull(), inuse()
+src/proto/state.rs    parse the kernel state line
+src/proto/mod.rs      re-exports + CACHEFILES_DEV constant
+src/bin/probe.rs      diagnostic-only binary
 
 packaging/{etc,systemd,share,install.sh}
 tests/e2e/nfs-fscache.sh   needs root + real NFS server
 ```
 
-Total ~1.2k LOC. No tokio / parking_lot / dashmap on purpose — single fd,
-low event rate, single-threaded cull. Don't add async runtime without a
-clear motivation.
+About 3.5k lines including doc comments. No tokio / parking_lot /
+dashmap on purpose — single fd, low event rate, single-threaded cull.
+Don't add async runtime without a clear motivation.
 
 ## Build / run
 
@@ -67,8 +74,12 @@ cargo build --release       # → target/release/{nfs-cachefs,nfs-cachefs-probe}
 sudo packaging/install.sh   # → /usr/sbin, /etc/nfs-cachefs, systemd, manpage
 ```
 
-Toolchain: Rust ≥ 1.75 (stable). Release profile uses thin LTO, single
-codegen unit, stripped symbols → ~1.9 MB stripped binary.
+Toolchain: Rust ≥ 1.75 (stable). `.cargo/config.toml` makes cargo
+resolve dependencies for `rust-version`, so `Cargo.lock` keeps building on
+1.75 (check with `cargo +1.75 build --locked --all-targets`). Run
+`cargo update` with a cargo ≥ 1.84 so the setting applies. Release profile
+uses thin LTO, single codegen unit, stripped symbols → ~2 MB stripped
+binary.
 
 ## Hard constraints (don't fight these)
 
@@ -97,16 +108,18 @@ codegen unit, stripped symbols → ~1.9 MB stripped binary.
   (blocks) and `f*` (inodes). Validated in both `Config::validate` and
   `ConfigCmd::apply_and_bind`.
 - **Daemon must start before any `mount -o fsc`.** Otherwise the mount
-  silently falls back to no caching. Systemd unit orders
+  caches nothing until a cache binds, silently. Systemd unit orders
   `Before=remote-fs-pre.target`.
-- **Needs `CAP_SYS_ADMIN`** to write `/dev/cachefiles`. Unit declares
+- **Needs `CAP_SYS_ADMIN`** to write `/dev/cachefiles` (and for the
+  `max_size` quota calls). Unit declares
   `CapabilityBoundingSet=CAP_SYS_ADMIN CAP_DAC_READ_SEARCH`.
 
 ## Protocol gotchas
 
 - One command per `write()`. Don't batch. No newline terminator.
 - `cull` and `inuse` returning `EBUSY` (kernel holds the object) is
-  normal — caller treats as "skip, try later" via `Ok(false)`. See
+  normal — "skip, try later" (`CullOutcome::Busy`); `ENOENT`/`ESTALE`
+  mean the object is already gone (`CullOutcome::Gone`). See
   `proto/cmd.rs::cull`.
 - Kernel state line is space-separated `k=v`; `cull` is decimal, others
   are **hex without `0x`**. Parser ignores unknown fields for forward
@@ -116,21 +129,40 @@ codegen unit, stripped symbols → ~1.9 MB stripped binary.
   from `statfs(cache_dir)` `f_bavail` / `f_ffree`, the same numbers the
   kernel compares against them.
 - The kernel marks the device readable to wake the daemon up for state
-  changes; we still poll with a 5 s timeout to drive heartbeat + check
-  the stop flag. `POLLOUT` stays asserted while `cull=1`.
+  changes; we still poll with a ≤ 5 s timeout to drive timers + check
+  the stop flag. `POLLOUT` stays asserted while `cull=1`, so the daemon
+  polls for `POLLIN` only (polling `POLLOUT` spins whenever it waits).
 - The kernel re-checks free space only on cache writes and daemon reads,
   so the daemon also reads the state on every poll timeout. Without that
   an idle cache never culls while other data fills a shared filesystem.
 - `/proc/fs/fscache/caches` keeps a cache record in state `-` after its
   daemon exits while an `fsc` mount references it; a restart's bind with
   the same tag takes it over. Only `P`/`A`/`E`/`W` mean the tag is taken.
-- **Size each cull pass, then wait for statfs.** A pass frees only the
-  shortfall to `brun` / `frun`, counted in `st_blocks` (cache files are
-  sparse; `st_size` overstates several-fold). XFS frees unlinked inodes
-  in background workers, so statfs — and the kernel — lag a burst of
-  culls; the daemon waits (`daemon.rs` `Settle`) before sizing another
-  pass. Culling whole batches and re-reading state immediately emptied
-  production caches on every cull episode.
+- **Size each cull pass on fresh statfs.** A pass frees only the
+  shortfall to `brun` / `frun` (+ a small margin), counted in `st_blocks`
+  (cache files are sparse; `st_size` overstates several-fold). XFS frees
+  unlinked inodes in background workers — seconds for a fragmented cache
+  file — so the pass opens each candidate first and, once the kernel has
+  unlinked it (`st_nlink` 0), truncates it through that descriptor: the
+  space is free when the pass ends. Only truncate an unlinked inode; the
+  kernel refuses `cull` with EBUSY while it uses an object. Whatever is
+  still freed in the background, `planner.rs` subtracts as pending for up
+  to 60 s. Culling whole batches and re-reading state immediately emptied
+  production caches on every cull episode (1.0.2); a fixed 30 s wait could
+  still cull a shortfall twice (1.0.3).
+- **Busy objects must not block the cull.** Objects that answer EBUSY (or
+  fail) are set aside for 5 min (`CullTable::skip`); otherwise a batch of
+  busy oldest objects comes back from every walk and nothing is ever
+  culled.
+- **A cache stopped by an I/O error (`E` in `/proc/fs/fscache/caches`)
+  stays stopped** until the fd is closed and the cache bound again; every
+  command returns EIO meanwhile. Setting a cache file's xattr failing with
+  ENOSPC on a full disk is enough. The daemon checks every 10 s and on
+  any cull EIO, and exits non-zero so systemd rebinds it.
+- **Project quota + XFS renames:** XFS refuses renames between directories
+  of different projects with EXDEV, and cachefiles turns a failed rename
+  into its graveyard into a stopped cache. `quota.rs` therefore tags the
+  whole tree before bind, never after.
 
 ## Verification commands (kernel side)
 
@@ -209,20 +241,27 @@ reintroduce a FUSE/userspace data path.
 
 ## Testing
 
-- Unit tests live inline (`#[cfg(test)] mod tests`) in `config.rs`,
-  `cull.rs`, `daemon.rs`, `proto/state.rs`, `proto/cmd.rs`. Run with
-  `cargo test`. Cull pass logic is tested through `run_pass_with` with a
-  fake kernel `cull`; production caches sit on XFS, so also run the tests
-  with `TMPDIR` on an XFS mount when touching size accounting.
+- Unit tests live inline (`#[cfg(test)] mod tests`) in most modules. Run
+  with `cargo test`. Cull pass logic is tested through `run_pass_with`
+  with a fake kernel `cull`; the planner against a simulated filesystem
+  whose frees show up late; the whole event loop (`daemon.rs`
+  `runner_culls_one_episode_end_to_end`) against `FakeKernel`, which
+  implements `proto::Kernel` with real unlinks and statfs. Production
+  caches sit on XFS, so also run the tests with `TMPDIR` on an XFS mount
+  when touching size accounting.
+- Real-filesystem tests are `#[ignore]`d: `NFS_CACHEFS_TEST_XFS_DIR=<dir on
+  XFS> cargo test -- --ignored extsize`, and, as root on a `prjquota`
+  mount, the quota test: build with `cargo test --no-run`, then
+  `sudo NFS_CACHEFS_TEST_PRJQUOTA_DIR=<mount> <test binary> --ignored quota`.
 - E2E (`tests/e2e/nfs-fscache.sh`) requires root, `cachefiles` module,
   `/var/cache/fscache` as its own mountpoint, and a reachable NFS
   server. Pass via env vars: `NFS_SERVER`, `NFS_EXPORT`, `TEST_FILE`.
 
 ## Branching
 
-- Active branch: `fscache`. Main is `main`.
-- Three commits on this branch tell the story: P0 prototype → P1+P2
-  daemon+cull → P3+P4 packaging+e2e+docs.
+- `main` carries the releases; each release is prepared on a
+  `release/vX.Y.Z` branch and squash-merged. The original `fscache`
+  branch holds the P0 → P4 history of the rewrite.
 - The earlier FUSE implementation was wiped in commit `76f5744`; do not
   resurrect it.
 
@@ -231,8 +270,10 @@ reintroduce a FUSE/userspace data path.
 - Keep dependencies minimal. The Cargo.toml deps are deliberate; see
   `docs/architecture.md` "Why no tokio / dashmap / parking_lot".
 - The `inuse()` helper in `proto/cmd.rs` is `#[allow(dead_code)]` on
-  purpose — kept for a future "skip-busy-before-trying-cull" optimization
-  but redundant today since `cull` itself returns `Ok(false)` on `EBUSY`.
+  purpose — redundant today since `cull` itself reports
+  `CullOutcome::Busy` on `EBUSY` and busy objects are then set aside.
+- Code that talks to the kernel takes `&impl proto::Kernel`, not
+  `&Device`, so tests can drive it with a fake.
 - When adding a new kernel command formatter, mirror the `cull`/`inuse`
   pattern: reject embedded `/`, `\0`, `\n`; map `EBUSY` to `Ok(false)`
   rather than an error if the kernel uses it as a soft signal.

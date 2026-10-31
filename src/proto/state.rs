@@ -3,17 +3,21 @@
 //! Format (from `fs/cachefiles/daemon.c::cachefiles_daemon_read`):
 //!
 //! ```text
-//! cull=N frun=H fcull=H fstop=H brun=H bcull=H bstop=H
+//! cull=N frun=H fcull=H fstop=H brun=H bcull=H bstop=H freleased=H breleased=H
 //! ```
 //!
 //! - `cull` is `1` while the kernel wants culling: it is set when free space
 //!   drops below `bcull`/`fcull` and cleared once free space is back at
 //!   `brun`/`frun`. The kernel re-checks free space on every read.
-//! - The other fields are the limits themselves, not free counts: the
-//!   configured percentages converted at bind time into filesystem blocks
-//!   (`b*`) and inodes (`f*`), hex-formatted (no `0x` prefix). They stay
-//!   fixed while the cache is bound. The kernel compares them with
-//!   `f_bavail` / `f_ffree` from `statfs(cache_dir)`.
+//! - The `*run`/`*cull`/`*stop` fields are the limits themselves, not free
+//!   counts: the configured percentages converted at bind time into
+//!   filesystem blocks (`b*`) and inodes (`f*`), hex-formatted (no `0x`
+//!   prefix). They stay fixed while the cache is bound. The kernel compares
+//!   them with `f_bavail` / `f_ffree` from `statfs(cache_dir)`, minus the
+//!   blocks of cache writes still in flight.
+//! - `freleased` / `breleased` count objects (and their blocks) the kernel
+//!   stopped using since the previous read; each read resets them. The
+//!   parser ignores them, like any field it does not know.
 //!
 //! There is no trailing newline. Whitespace separates fields.
 
@@ -133,5 +137,16 @@ mod tests {
     fn ignores_unknown_field() {
         let line = b"cull=0 frun=10 fcull=5 fstop=1 brun=10 bcull=5 bstop=1 future=42";
         assert!(CacheState::parse(line).is_ok());
+    }
+
+    #[test]
+    fn parses_full_kernel_6_8_line() {
+        // As formatted by cachefiles_do_daemon_read on 6.8, released counters
+        // included.
+        let line = b"cull=1 frun=2faf08 fcull=2160ec fstop=e4e1c brun=5f5e10 bcull=42c1d8 bstop=1c9c38 freleased=2 breleased=1f40";
+        let s = CacheState::parse(line).unwrap();
+        assert!(s.culling);
+        assert_eq!(s.brun, 0x5f5e10);
+        assert_eq!(s.fstop, 0xe4e1c);
     }
 }

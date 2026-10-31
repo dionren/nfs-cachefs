@@ -15,8 +15,28 @@ tag = "nfscache"
 # system enforces a non-default policy on the cache dir.
 # secctx = "system_u:system_r:cachefiles_kernel_t:s0"
 
+# Optional size budget for the cache, for a cache_dir on a filesystem shared
+# with other data. The daemon puts the cache tree under a project quota of
+# this size, and the [limits] percentages then apply to the budget instead
+# of the whole filesystem (the cache still gives space back when the
+# filesystem itself fills up). Needs XFS or ext4 mounted with project quotas
+# (mount option prjquota). Binary units: "500G", "3T".
+# max_size = "3T"
+
+# Project ID used for max_size. Nothing else on the filesystem may use it
+# (check with: xfs_quota -x -c 'report -p' <mountpoint>).
+# quota_project_id = 1852269427
+
+# Optional XFS extent size hint for new cache files. The kernel writes cache
+# files out of order as NFS reads complete, which can leave a large file in
+# hundreds of thousands of extents; a hint makes XFS allocate in aligned
+# chunks instead. Partially read files may then occupy up to one chunk more
+# per hole. Only new files are affected.
+# extsize = "4M"
+
 # Free space / inode thresholds, all percentages of the cache filesystem
-# (the whole filesystem: other data stored on it counts too):
+# (the whole filesystem: other data stored on it counts too; or of max_size
+# when set):
 #
 #   stop  - kernel refuses new caching below this level
 #   cull  - daemon starts deleting old objects below this level
@@ -33,10 +53,21 @@ fstop =  3
 
 [cull]
 # How many of the oldest cache objects to collect per walk of the cache
-# directory. Bounds memory and CPU when the cache is large. A cull pass
-# deletes only as many as it needs to bring free space back to `run`, and
-# walks again if one batch is not enough.
+# directory before anything is known about object sizes; later walks grow
+# to fit what a pass must free (up to 64 times this). A cull pass deletes
+# only as many as it needs to bring free space back to `run`.
 batch_size = 1024
+
+[metrics]
+# Prometheus metrics for node_exporter's textfile collector. The systemd
+# unit makes /run/nfs-cachefs writable; point the collector at that
+# directory (--collector.textfile.directory) or at a symlink to the file.
+# textfile = "/run/nfs-cachefs/nfs-cachefs.prom"
+
+# How often to rewrite the file, and how often to walk the cache to report
+# its size when no max_size quota reports it (0 = never walk).
+# interval_secs = 15
+# usage_scan_interval_secs = 300
 
 [log]
 # error | warn | info | debug | trace; overridden by RUST_LOG if set.
