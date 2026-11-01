@@ -53,7 +53,8 @@
 
 The daemon is **not on the data path**. Once `bind` succeeds, every read
 flows kernel-side through cachefiles → NVMe. The daemon's only runtime job
-is to delete LRU objects when free space drops.
+is to delete LRU objects when free space drops, and, with `max_idle`,
+objects nobody has used for that long.
 
 ## Why traditional mode (not on-demand)
 
@@ -281,6 +282,79 @@ table of candidates kept between passes). The walk-on-demand approach
 scales to caches with hundreds of thousands of objects without keeping a
 persistent index in memory.
 
+### Idle objects (`max_idle`)
+
+With `max_idle` set, the daemon also culls the objects nobody has used for
+that long, however much space is free (`cull::expire_pass`). Without it
+nothing here runs.
+
+**Last use** is the later of the cache file's atime and ctime, because
+the atime alone lags:
+
+- cachefiles touches the atime when it opens an object for a reader
+  (`cachefiles_open_file`: "atimes are only updated by read, write and
+  readdir but not lookup or open"), and reads through the object touch it
+  too. Under `relatime`, the default, the update happens only when the
+  atime is older than the mtime or ctime, or more than a day old. A reader
+  that keeps the file open for hours, or one that comes back within a day
+  of the last atime update, leaves the atime behind.
+- When the last reader closes the file, NFS hands fscache fresh auxiliary
+  data (`nfs_fscache_release_file`), and about 10 s later, when fscache
+  lets go of the object, cachefiles rewrites the object's xattr, which
+  moves the ctime. On a 7.0 kernel the cache files' ctimes sat 10–60 s
+  after their atimes (the read plus those 10 s), and a file read again
+  through NFS half an hour after an atime update kept the older atime
+  while its ctime moved past the second read.
+
+So the ctime marks the end of the last use, the atime its start (or a
+later read), and their maximum never makes a file that was read within
+`max_idle` look idle. Things that move the ctime without a read (the
+first `max_size` start tagging files with the project ID, an
+administrator's `chattr`) only keep an object longer.
+
+Every hour, or every tenth of `max_idle` when that is shorter (at least a
+minute apart), the daemon:
+
+1. computes the cutoff, now minus `max_idle`;
+2. walks the cache like a cull pass, keeping regular files at depth 3
+   last used before the cutoff (a depth-3 directory, an index cookie,
+   never expires by itself), longest unused first, at most 64 times
+   `cull.batch_size` of them; objects set aside as busy or failing are
+   left out;
+3. culls each with the same steps as a cull pass: re-check (an object
+   used since the walk is skipped), open, `chdir`, `cull <name>`, truncate
+   through the held descriptor; `EBUSY` sets the object aside;
+4. stops after 10 s of culling (at least one object per run) and, if the
+   walk found more idle objects than the run got to, runs again right
+   away, polling the device in between;
+5. on `EIO` ends the run and checks the cache's state: the daemon exits if
+   the kernel has stopped the cache. cachefiles also reports most failures
+   of a single cull as `EIO` (an immutable file, say) and keeps the cache
+   up; the object is set aside for 5 minutes, and the next run comes after
+   one, so that it is not first in line again and does not hold up the
+   rest.
+
+The first look comes one interval after the daemon starts, not at once.
+A restart detaches the files processes keep open from the cache until
+they are opened again; meanwhile the kernel does not refuse to cull their
+objects, and an object a process opened long ago and has served from the
+page cache since (no read or close to move its atime or ctime) would look
+idle. The delay gives an operator's reattach step (opening and closing
+those files through `/proc/<pid>/fd`), or the processes themselves, time
+to take them up again.
+
+A look is put off by a minute while the kernel culls for space: those
+passes take the oldest objects first anyway, and two removers at once
+would throw off the planner's sizing. Expiry keeps its candidates to
+itself and shares the set of objects set aside with the cull passes; a
+run that got to any object also drops the candidates the last cull pass
+left for the next, since it may have culled or set aside some of them
+(the next pass would otherwise go through those, free nothing, and stop
+without walking again). Its
+counters are separate (`expired_*`); in particular a look that finds
+nothing to cull is the normal case and does not count as a pass without
+progress.
+
 ## Failure modes
 
 | situation | outcome |
@@ -295,6 +369,8 @@ persistent index in memory.
 | nothing cullable while `cull=1` | pass makes no progress; backoff 1 s → 60 s, rate-limited warning |
 | kernel stops the cache after an I/O error (state `E`; e.g. a cache xattr write failing with ENOSPC on a full disk) | every command fails with EIO and nothing is cached; the daemon notices within 10 s (or on the first EIO) and exits non-zero, systemd binds it again |
 | `max_size` set but project quotas not enforced | daemon refuses to start, says why |
+| `max_idle` without a unit, or shorter than `1m` | daemon refuses to start, says why |
+| idle object in use when its time comes | EBUSY; set aside for 5 min, tried again at the next look |
 | daemon hangs | systemd watchdog (2 min) restarts it |
 | malformed state line from kernel | logged as warn (rate-limited); loop continues |
 
@@ -402,7 +478,7 @@ src/
   config.rs          TOML schema, validation, ConfigCmd conversion
   daemon.rs          poll loop, state read, health check, timers, heartbeat
   planner.rs         when to cull and how much (pure logic)
-  cull.rs            directory walk, candidate table, chdir + cull, truncate
+  cull.rs            directory walk, candidate table, chdir + cull, truncate, idle expiry
   quota.rs           max_size as a project quota (quotactl_fd)
   fsattr.rs          FS_IOC_FS{GET,SET}XATTR: project IDs, extent size hints
   metrics.rs         node_exporter textfile output

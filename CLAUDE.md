@@ -45,10 +45,10 @@ the generic invariants below.
 
 ```
 src/main.rs           CLI, signals, tracing
-src/config.rs         TOML schema + validation (ByteSize for max_size/extsize)
+src/config.rs         TOML schema + validation (ByteSize, TimeSpan for max_idle)
 src/daemon.rs         poll loop, state read, health check, timers, heartbeat
 src/planner.rs        when to cull and how much (pure, simulated in tests)
-src/cull.rs           walk + candidate table + chdir + cull + truncate
+src/cull.rs           walk + candidate table + chdir + cull + truncate, idle expiry
 src/quota.rs          max_size as a project quota (quotactl_fd)
 src/fsattr.rs         FS_IOC_FS{GET,SET}XATTR: project ID, extsize hint
 src/metrics.rs        node_exporter textfile writer
@@ -150,6 +150,16 @@ binary.
   to 60 s. Culling whole batches and re-reading state immediately emptied
   production caches on every cull episode (1.0.2); a fixed 30 s wait could
   still cull a shortfall twice (1.0.3).
+- **An object's last use is the later of its atime and ctime** (`max_idle`
+  expiry). cachefiles touches the atime when it opens an object, which
+  `relatime` limits to once a day while ctime and mtime are older; about
+  10 s after the last reader closes the NFS file, fscache lets go of the
+  object and cachefiles rewrites its xattr (NFS passes new aux data on
+  every close), which moves the ctime. The atime alone can lag a read by
+  up to a day. The space cull still orders by atime alone. A daemon
+  restart detaches files kept open from the cache until reopened, so
+  `cull` does not answer EBUSY for them: the first expiry look waits one
+  interval after start.
 - **Busy objects must not block the cull.** Objects that answer EBUSY (or
   fail) are set aside for 5 min (`CullTable::skip`); otherwise a batch of
   busy oldest objects comes back from every walk and nothing is ever

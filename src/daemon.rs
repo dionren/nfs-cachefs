@@ -1,12 +1,13 @@
 //! Main event loop. Polls `/dev/cachefiles`; on every wakeup reads the
 //! kernel's state line and, while it asks for culling, lets the planner
 //! (`planner.rs`) decide whether to run a cull pass and how big. Around
-//! that it watches the cache's kernel state, empties the graveyard, feeds
-//! the systemd watchdog and writes metrics.
+//! that it watches the cache's kernel state, empties the graveyard, culls
+//! objects idle for `max_idle`, feeds the systemd watchdog and writes
+//! metrics.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use tracing::{debug, error, info, warn};
 
@@ -29,6 +30,19 @@ const GRAVEYARD_INTERVAL: Duration = Duration::from_secs(30);
 
 /// How often to check the cache's state in `/proc/fs/fscache/caches`.
 const HEALTH_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Bounds of the time between two looks for objects idle for `max_idle`
+/// (a tenth of `max_idle` in between): an object is culled at most that
+/// long after it has been idle for `max_idle`.
+const EXPIRE_INTERVAL_MIN: Duration = Duration::from_secs(60);
+const EXPIRE_INTERVAL_MAX: Duration = Duration::from_secs(3600);
+
+/// How soon to look for idle objects again when the kernel was culling for
+/// space at the time (which takes the oldest objects first anyway), or when
+/// a cull failed with `EIO` but the cache is still up. Shorter than
+/// `cull::SKIP_TTL`, so that the failing object is still set aside then
+/// and the others are not held up behind it.
+const EXPIRE_RETRY: Duration = Duration::from_secs(60);
 
 /// Longest poll. The kernel marks the device readable on state changes,
 /// but waking up anyway re-reads the state (which makes the kernel
@@ -65,6 +79,13 @@ impl Daemon<'_> {
             cache_dir = %cfg.cache_dir.display(),
             "cache bound (traditional mode)"
         );
+        if let Some(max_idle) = cfg.max_idle {
+            info!(
+                max_idle = %max_idle,
+                check_every_s = expire_interval(max_idle.0).as_secs(),
+                "objects nobody has used for max_idle are culled"
+            );
+        }
         match systemd_notify::ready("cache bound") {
             Ok(true) => debug!("sent systemd readiness notification"),
             Ok(false) => debug!("NOTIFY_SOCKET not set; readiness notification skipped"),
@@ -147,10 +168,14 @@ struct Runner<'a, K: Kernel> {
     next_heartbeat: Instant,
     /// Cache size walks, only when metrics want a size no quota reports.
     next_usage: Option<Instant>,
+    /// Looks for idle objects, only with `max_idle`.
+    next_expire: Option<Instant>,
     usage: Option<Usage>,
     record_state: Option<String>,
     /// `/proc/fs/fscache/caches`; a test points it elsewhere.
     caches_proc: &'static str,
+    /// The time of day file timestamps are compared with; a test moves it.
+    clock: fn() -> SystemTime,
     logs: Logs,
 }
 
@@ -186,9 +211,14 @@ impl<'a, K: Kernel> Runner<'a, K> {
             next_graveyard: now + GRAVEYARD_INTERVAL,
             next_heartbeat: now + HEARTBEAT_INTERVAL,
             next_usage,
+            // Not right at start: files a process kept open across a
+            // restart are detached from the cache until reopened, and the
+            // kernel would not refuse to cull them meanwhile.
+            next_expire: cfg.max_idle.map(|span| now + expire_interval(span.0)),
             usage: None,
             record_state: None,
             caches_proc: CACHES_PROC,
+            clock: SystemTime::now,
             logs: Logs {
                 no_progress: limit(5),
                 statfs: limit(5),
@@ -261,6 +291,7 @@ impl<'a, K: Kernel> Runner<'a, K> {
             Some(self.next_graveyard),
             Some(self.next_heartbeat),
             self.next_usage,
+            self.next_expire,
             self.metrics.as_ref().map(MetricsFile::next_due),
             self.wd.interval().map(|i| now + i / 3),
         ]
@@ -373,6 +404,9 @@ impl<'a, K: Kernel> Runner<'a, K> {
                 self.scan_usage(interval);
             }
         }
+        if self.next_expire.is_some_and(|at| now >= at) {
+            self.expire_idle()?;
+        }
         if self.metrics.as_ref().is_some_and(|m| m.due(now)) {
             self.write_metrics(now);
         }
@@ -432,6 +466,47 @@ impl<'a, K: Kernel> Runner<'a, K> {
         }
     }
 
+    /// Cull the objects nobody has used for `max_idle`. Waits while the
+    /// kernel culls for space: those passes take the oldest objects first,
+    /// and their sizing must not be thrown off by a second remover.
+    fn expire_idle(&mut self) -> Result<()> {
+        let Some(max_idle) = self.cfg.max_idle.map(|span| span.0) else {
+            self.next_expire = None;
+            return Ok(());
+        };
+        if self.last_state.is_some_and(|s| s.culling) {
+            self.next_expire = Some(Instant::now() + EXPIRE_RETRY);
+            return Ok(());
+        }
+        let expiry = match (self.clock)().checked_sub(max_idle) {
+            Some(cutoff) => cull::expire_pass(
+                self.dev,
+                &self.ctx,
+                &mut self.table,
+                cutoff,
+                self.stop,
+                &self.wd,
+            ),
+            None => cull::Expiry::default(),
+        };
+        self.counters.record_expiry(&expiry.stats);
+        let wait = if expiry.stats.kernel_eio > 0 {
+            // Exits if the kernel has stopped the cache. Otherwise one
+            // object fails (cachefiles reports most cull failures as EIO);
+            // it is set aside, so the next run gets past it.
+            self.check_health()?;
+            EXPIRE_RETRY
+        } else if expiry.left > 0 {
+            // More than one run holds: go on right away, the loop polling
+            // in between.
+            Duration::ZERO
+        } else {
+            expire_interval(max_idle)
+        };
+        self.next_expire = Some(Instant::now() + wait);
+        Ok(())
+    }
+
     fn scan_usage(&mut self, interval: Duration) {
         // A cull pass that walked the cache recently already knows.
         if self
@@ -474,6 +549,7 @@ impl<'a, K: Kernel> Runner<'a, K> {
             cache_record: self.record_state.as_deref(),
             usage: self.current_usage(),
             quota,
+            max_idle: self.cfg.max_idle.map(|span| span.0),
             fscache_stats: fscache_stats.as_deref(),
         };
         if let Some(metrics) = &mut self.metrics {
@@ -503,6 +579,11 @@ impl<'a, K: Kernel> Runner<'a, K> {
             "heartbeat"
         );
     }
+}
+
+/// Time between two looks for objects idle for `max_idle`.
+fn expire_interval(max_idle: Duration) -> Duration {
+    (max_idle / 10).clamp(EXPIRE_INTERVAL_MIN, EXPIRE_INTERVAL_MAX)
 }
 
 /// Pre-bind sanity checks. None of them are fatal — they emit `warn!`
@@ -684,6 +765,8 @@ mod tests {
         brun: u64,
         bcull: u64,
         busy: Vec<&'static str>,
+        /// Culls that fail with EIO while the cache stays up.
+        failing: Vec<&'static str>,
         culling: Cell<bool>,
         culled: RefCell<Vec<String>>,
         quiet_reads: Cell<u32>,
@@ -705,6 +788,9 @@ mod tests {
             };
             if self.busy.contains(&name) {
                 return Err(kernel_error(std::io::Error::from_raw_os_error(libc::EBUSY)));
+            }
+            if self.failing.contains(&name) {
+                return Err(kernel_error(std::io::Error::from_raw_os_error(libc::EIO)));
             }
             std::fs::remove_file(name).map_err(kernel_error)?;
             self.culled.borrow_mut().push(name.to_string());
@@ -735,8 +821,17 @@ mod tests {
         }
     }
 
+    /// Held by tests whose culls go through `chdir`: the working directory
+    /// is shared by the whole test process.
+    static CWD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_cwd() -> std::sync::MutexGuard<'static, ()> {
+        CWD.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn runner_culls_one_episode_end_to_end() {
+        let _cwd = lock_cwd();
         static STOP: AtomicBool = AtomicBool::new(false);
         let root = std::env::temp_dir().join(format!(
             "nfs-cachefs-runner-{}-{}",
@@ -789,6 +884,7 @@ mod tests {
             brun,
             bcull,
             busy: vec!["D00"],
+            failing: Vec::new(),
             culling: Cell::new(false),
             culled: RefCell::new(Vec::new()),
             quiet_reads: Cell::new(0),
@@ -852,6 +948,7 @@ mod tests {
             brun: space.blocks_avail / 2,
             bcull: space.blocks_avail / 4,
             busy: Vec::new(),
+            failing: Vec::new(),
             culling: Cell::new(false),
             culled: RefCell::new(Vec::new()),
             quiet_reads: Cell::new(0),
@@ -868,5 +965,243 @@ mod tests {
             "{metrics}"
         );
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A cache under a fresh temp dir holding one 4 KiB object per name,
+    /// written now; returns the root and the bucket.
+    fn idle_cache(test: &str, names: &[&str]) -> (PathBuf, PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "nfs-cachefs-{test}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let bucket = root.join("cache").join("Ivol").join("@00");
+        std::fs::create_dir_all(&bucket).unwrap();
+        for name in names {
+            std::fs::write(bucket.join(name), [b'x'; 4096]).unwrap();
+        }
+        (root, bucket)
+    }
+
+    /// A kernel whose limits the test never crosses: it never asks for
+    /// culling.
+    fn calm_kernel(root: &Path, busy: Vec<&'static str>, stop: &'static AtomicBool) -> FakeKernel {
+        // SAFETY: eventfd returns a fresh descriptor or -1.
+        let event = unsafe {
+            let fd = libc::eventfd(1, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC);
+            assert!(fd >= 0);
+            OwnedFd::from_raw_fd(fd)
+        };
+        let space = FreeSpace::of(root).unwrap();
+        FakeKernel {
+            event,
+            root: root.to_path_buf(),
+            brun: space.blocks_avail / 2,
+            bcull: space.blocks_avail / 4,
+            busy,
+            failing: Vec::new(),
+            culling: Cell::new(false),
+            culled: RefCell::new(Vec::new()),
+            quiet_reads: Cell::new(0),
+            stop,
+        }
+    }
+
+    fn left_in(bucket: &Path) -> Vec<String> {
+        let mut left: Vec<_> = std::fs::read_dir(bucket)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort_unstable();
+        left
+    }
+
+    /// Two hours on: whatever the test wrote has been idle for an hour
+    /// more than a `max_idle` of an hour.
+    fn two_hours_on() -> SystemTime {
+        SystemTime::now() + Duration::from_secs(2 * 3600)
+    }
+
+    fn calm(culling: bool) -> CacheState {
+        CacheState {
+            culling,
+            frun: 0,
+            fcull: 0,
+            fstop: 0,
+            brun: 0,
+            bcull: 0,
+            bstop: 0,
+        }
+    }
+
+    #[test]
+    fn runner_culls_idle_objects_end_to_end() {
+        let _cwd = lock_cwd();
+        static STOP: AtomicBool = AtomicBool::new(false);
+        let (root, bucket) = idle_cache("idle", &["D00", "D01", "D02", "D03"]);
+        // D03 was read after the cutoff; D00 is in use.
+        std::fs::File::options()
+            .write(true)
+            .open(bucket.join("D03"))
+            .unwrap()
+            .set_times(FileTimes::new().set_accessed(two_hours_on() + Duration::from_secs(60)))
+            .unwrap();
+        let cfg: Config = toml::from_str(&format!(
+            "cache_dir = {:?}\ntag = \"t\"\nmax_idle = \"1h\"\n[metrics]\ntextfile = {:?}\ninterval_secs = 60\n",
+            root.display().to_string(),
+            root.join("nfs-cachefs.prom").display().to_string(),
+        ))
+        .unwrap();
+        let fake = calm_kernel(&root, vec!["D00"], &STOP);
+        let mut runner = Runner::new(&cfg, &fake, &STOP);
+        runner.clock = two_hours_on;
+        // The first look would come one interval after start.
+        assert!(runner.next_expire.unwrap() > Instant::now() + Duration::from_secs(300));
+        runner.next_expire = Some(Instant::now());
+
+        runner.run().unwrap();
+
+        assert_eq!(fake.culled.borrow().as_slice(), ["D01", "D02"]);
+        assert_eq!(left_in(&bucket), ["D00", "D03"]);
+        let metrics = std::fs::read_to_string(root.join("nfs-cachefs.prom")).unwrap();
+        for line in [
+            "nfs_cachefs_expired_objects_total 2",
+            "nfs_cachefs_cull_busy_skips_total 1",
+            "nfs_cachefs_culled_objects_total 0",
+            "nfs_cachefs_cull_passes_total 0",
+            "nfs_cachefs_max_idle_seconds 3600",
+        ] {
+            assert!(metrics.contains(line), "missing {line:?} in:\n{metrics}");
+        }
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn expiry_waits_while_the_kernel_culls_for_space() {
+        let _cwd = lock_cwd();
+        static STOP: AtomicBool = AtomicBool::new(false);
+        let (root, bucket) = idle_cache("idle-wait", &["D00"]);
+        let cfg: Config = toml::from_str(&format!(
+            "cache_dir = {:?}\ntag = \"t\"\nmax_idle = \"1h\"\n",
+            root.display().to_string(),
+        ))
+        .unwrap();
+        let fake = calm_kernel(&root, Vec::new(), &STOP);
+        let mut runner = Runner::new(&cfg, &fake, &STOP);
+        runner.clock = two_hours_on;
+
+        runner.last_state = Some(calm(true));
+        let before = Instant::now();
+        runner.expire_idle().unwrap();
+        assert!(fake.culled.borrow().is_empty());
+        assert!(runner.next_expire.unwrap() >= before + EXPIRE_RETRY);
+
+        runner.last_state = Some(calm(false));
+        let before = Instant::now();
+        runner.expire_idle().unwrap();
+        assert_eq!(fake.culled.borrow().as_slice(), ["D00"]);
+        assert!(left_in(&bucket).is_empty());
+        assert!(runner.next_expire.unwrap() >= before + expire_interval(Duration::from_secs(3600)));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn expiry_goes_on_right_away_when_one_walk_did_not_hold_everything() {
+        let _cwd = lock_cwd();
+        static STOP: AtomicBool = AtomicBool::new(false);
+        let names: Vec<String> = (0..66).map(|i| format!("D{i:02}")).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let (root, bucket) = idle_cache("idle-more", &refs);
+        // batch_size 1: a walk keeps 64.
+        let cfg: Config = toml::from_str(&format!(
+            "cache_dir = {:?}\ntag = \"t\"\nmax_idle = \"1h\"\n[cull]\nbatch_size = 1\n",
+            root.display().to_string(),
+        ))
+        .unwrap();
+        let fake = calm_kernel(&root, Vec::new(), &STOP);
+        let mut runner = Runner::new(&cfg, &fake, &STOP);
+        runner.clock = two_hours_on;
+        runner.last_state = Some(calm(false));
+
+        runner.expire_idle().unwrap();
+        assert_eq!(fake.culled.borrow().len(), 64);
+        assert!(runner.next_expire.unwrap() <= Instant::now());
+
+        runner.expire_idle().unwrap();
+        assert_eq!(fake.culled.borrow().len(), 66);
+        assert!(left_in(&bucket).is_empty());
+        assert!(runner.next_expire.unwrap() > Instant::now() + Duration::from_secs(300));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn expiry_is_off_without_max_idle() {
+        static STOP: AtomicBool = AtomicBool::new(false);
+        let (root, _) = idle_cache("idle-off", &["D00"]);
+        let cfg: Config = toml::from_str(&format!(
+            "cache_dir = {:?}\ntag = \"t\"\n",
+            root.display().to_string(),
+        ))
+        .unwrap();
+        let fake = calm_kernel(&root, Vec::new(), &STOP);
+        let runner = Runner::new(&cfg, &fake, &STOP);
+        assert_eq!(runner.next_expire, None);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn an_object_failing_with_eio_does_not_hold_up_expiry() {
+        // cachefiles turns most cull failures (EPERM on an immutable file,
+        // say) into EIO and keeps the cache up. The next run must come
+        // while the failing object is still set aside, or it fails first
+        // again every time and nothing else is culled.
+        let _cwd = lock_cwd();
+        static STOP: AtomicBool = AtomicBool::new(false);
+        let (root, bucket) = idle_cache("idle-eio", &["D00", "D01", "D02"]);
+        let cfg: Config = toml::from_str(&format!(
+            "cache_dir = {:?}\ntag = \"t\"\nmax_idle = \"168h\"\n",
+            root.display().to_string(),
+        ))
+        .unwrap();
+        let mut fake = calm_kernel(&root, Vec::new(), &STOP);
+        fake.failing = vec!["D00"];
+        let mut runner = Runner::new(&cfg, &fake, &STOP);
+        runner.clock = || SystemTime::now() + Duration::from_secs(169 * 3600);
+        runner.last_state = Some(calm(false));
+        // A cache record that is still active.
+        let caches = root.join("caches");
+        std::fs::write(&caches, CACHES.replace(" A nfscache", " A t")).unwrap();
+        runner.caches_proc = Box::leak(caches.display().to_string().into_boxed_str());
+
+        let before = Instant::now();
+        runner.expire_idle().unwrap();
+        assert!(fake.culled.borrow().is_empty());
+        let next = runner.next_expire.unwrap();
+        assert!(next >= before + EXPIRE_RETRY && next <= Instant::now() + EXPIRE_RETRY);
+
+        runner.expire_idle().unwrap();
+        assert_eq!(fake.culled.borrow().as_slice(), ["D01", "D02"]);
+        assert_eq!(left_in(&bucket), ["D00"]);
+        assert_eq!(runner.counters.errors, 1);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn expiry_retry_comes_before_the_set_aside_ends() {
+        assert!(EXPIRE_RETRY < cull::SKIP_TTL);
+    }
+
+    #[test]
+    fn expiry_interval_is_a_tenth_of_max_idle_within_bounds() {
+        let h = |hours: u64| Duration::from_secs(hours * 3600);
+        assert_eq!(expire_interval(h(168)), EXPIRE_INTERVAL_MAX);
+        assert_eq!(expire_interval(h(1)), Duration::from_secs(360));
+        assert_eq!(
+            expire_interval(Duration::from_secs(300)),
+            EXPIRE_INTERVAL_MIN
+        );
     }
 }

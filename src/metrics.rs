@@ -31,6 +31,11 @@ pub struct Counters {
     pub errors: u64,
     pub graveyard_removed: u64,
     pub last_pass: Option<SystemTime>,
+    /// Objects culled because nobody used them for `max_idle`, and their
+    /// allocated bytes. Not in `culled_*`, which count culls for space.
+    pub expired_objects: u64,
+    pub expired_bytes: u64,
+    pub last_expiry: Option<SystemTime>,
 }
 
 impl Counters {
@@ -51,6 +56,16 @@ impl Counters {
         self.graveyard_removed += stats.graveyard_removed as u64;
         self.errors += stats.errored as u64;
     }
+
+    /// A look for idle objects. Not a cull pass: finding nothing to cull
+    /// is the normal case, not a pass without progress.
+    pub fn record_expiry(&mut self, stats: &CullStats) {
+        self.expired_objects += stats.culled as u64;
+        self.expired_bytes += stats.bytes_freed;
+        self.busy_skips += stats.skipped_busy as u64;
+        self.errors += (stats.errored + stats.kernel_eio) as u64;
+        self.last_expiry = Some(SystemTime::now());
+    }
 }
 
 /// What the daemon knows at one point in time.
@@ -63,6 +78,8 @@ pub struct Snapshot<'a> {
     pub cache_record: Option<&'a str>,
     pub usage: Option<Usage>,
     pub quota: Option<quota::Usage>,
+    /// `max_idle`, when set.
+    pub max_idle: Option<Duration>,
     /// Contents of `/proc/fs/fscache/stats`.
     pub fscache_stats: Option<&'a str>,
 }
@@ -255,15 +272,36 @@ pub fn render(s: &Snapshot<'_>, c: &Counters) -> String {
         c.graveyard_removed,
     );
     if let Some(at) = c.last_pass {
-        let secs = at
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs_f64();
         out.gauge(
             "last_cull_pass_timestamp_seconds",
             "When the last cull pass finished.",
-            format!("{secs:.3}"),
+            unix_seconds(at),
         );
+    }
+    // Only with max_idle, so that the file stays as it was without it.
+    if let Some(max_idle) = s.max_idle {
+        out.gauge(
+            "max_idle_seconds",
+            "Objects nobody has used for this long are culled (max_idle).",
+            max_idle.as_secs(),
+        );
+        out.counter(
+            "expired_objects_total",
+            "Objects culled because nobody had used them for max_idle.",
+            c.expired_objects,
+        );
+        out.counter(
+            "expired_bytes_total",
+            "Allocated bytes freed by culling idle objects.",
+            c.expired_bytes,
+        );
+        if let Some(at) = c.last_expiry {
+            out.gauge(
+                "last_expiry_timestamp_seconds",
+                "When the last look for idle objects finished.",
+                unix_seconds(at),
+            );
+        }
     }
 
     if let Some(stats) = s.fscache_stats {
@@ -284,6 +322,14 @@ pub fn render(s: &Snapshot<'_>, c: &Counters) -> String {
         }
     }
     out.0
+}
+
+fn unix_seconds(at: SystemTime) -> String {
+    let secs = at
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
+    format!("{secs:.3}")
 }
 
 /// `(section, field, value)` from the `Section : key=value ...` lines of
@@ -421,11 +467,14 @@ IO     : rd=1\n";
                 inodes: 2,
                 limit_bytes: 3,
             }),
+            max_idle: Some(Duration::from_secs(168 * 3600)),
             fscache_stats: Some(FSCACHE_STATS),
         };
         let counters = Counters {
             passes: 4,
             culled_bytes: 1 << 30,
+            expired_objects: 5,
+            last_expiry: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)),
             ..Counters::default()
         };
         let text = render(&snap, &counters);
@@ -445,6 +494,10 @@ IO     : rd=1\n";
             "nfs_cachefs_culled_bytes_total 1073741824",
             "nfs_cachefs_fscache_stat{section=\"IO\",field=\"wr\"} 500",
             "# TYPE nfs_cachefs_cull_passes_total counter",
+            "nfs_cachefs_max_idle_seconds 604800",
+            "nfs_cachefs_expired_objects_total 5",
+            "nfs_cachefs_expired_bytes_total 0",
+            "nfs_cachefs_last_expiry_timestamp_seconds 1700000000.000",
         ] {
             assert!(text.contains(line), "missing {line:?} in:\n{text}");
         }
@@ -462,6 +515,9 @@ IO     : rd=1\n";
         assert!(text.contains("nfs_cachefs_up 1"));
         assert!(!text.contains("nfs_cachefs_culling"));
         assert!(!text.contains("last_cull_pass"));
+        assert!(!text.contains("max_idle_seconds"));
+        assert!(!text.contains("expired_"));
+        assert!(!text.contains("last_expiry"));
     }
 
     #[test]
