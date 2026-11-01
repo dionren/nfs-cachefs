@@ -248,6 +248,42 @@ shrinks when the shared filesystem itself runs low.
 - To drop the budget, remove `max_size` and clear the limit:
   `xfs_quota -x -c 'limit -p bhard=0 1852269427' <mountpoint>`.
 
+### Culling objects nobody uses (`max_idle`)
+
+By default an object stays in the cache until space runs short, however
+long ago it was last read. With
+
+```toml
+max_idle = "168h"
+```
+
+the daemon also culls every object nobody has used for 168 hours (7 days),
+however much space is free. Units are `s`, `m`, `h` and `d` (a bare number
+is refused); the minimum is `1m`. Without `max_idle` nothing changes.
+
+- **Last use** is the later of the cache file's atime and ctime.
+  cachefiles touches the atime when a reader opens the file through the
+  cache, though `relatime` (the default) skips that while the atime is
+  newer than the ctime and less than a day old; and about 10 s after the
+  last reader has closed the file the kernel rewrites its xattr, which
+  moves the ctime. A file therefore counts as used for as long as a reader
+  has it open.
+- **Files in use are never culled**: the kernel refuses (`EBUSY`), and the
+  daemon tries again at its next look. One exception: a daemon restart
+  detaches the files processes keep open from the cache until they are
+  opened again, and the kernel does not refuse to cull them meanwhile.
+  The first look therefore comes one interval (below) after the daemon
+  starts; reopen such files before then — opening and closing them through
+  `/proc/<pid>/fd` is enough — if they must keep their cached copy.
+- The daemon looks every hour, or every tenth of `max_idle` when that is
+  shorter (at least a minute apart): an object goes at most that long
+  after it has been idle for `max_idle`. A look culls for at most 10 s at a
+  time and carries on right away, so that the daemon keeps watching the
+  kernel's state meanwhile. While the kernel culls for space, the look
+  waits.
+- Only the cached copy goes. The next read of the file fetches it from the
+  NFS server again.
+
 ### XFS extent size hint (`extsize`)
 
 The kernel writes cache files out of order as NFS reads complete, so a
@@ -345,8 +381,10 @@ drop-in. The file is removed when the daemon stops.
 | `nfs_cachefs_limit_bytes{limit="run"\|"cull"\|"stop"}` | the kernel's thresholds |
 | `nfs_cachefs_cache_objects`, `nfs_cachefs_cache_allocated_bytes` | cache size, from a walk of the cache every 5 min |
 | `nfs_cachefs_quota_used_bytes`, `nfs_cachefs_quota_limit_bytes` | the same from the project quota, with `max_size` |
-| `nfs_cachefs_culled_objects_total`, `nfs_cachefs_culled_bytes_total` | what culling removed |
-| `nfs_cachefs_cull_passes_total`, `nfs_cachefs_cull_passes_without_progress_total`, `nfs_cachefs_cull_busy_skips_total`, `nfs_cachefs_cull_errors_total` | cull activity |
+| `nfs_cachefs_culled_objects_total`, `nfs_cachefs_culled_bytes_total` | what culling for space removed |
+| `nfs_cachefs_expired_objects_total`, `nfs_cachefs_expired_bytes_total` | what culling objects idle for `max_idle` removed (only with `max_idle`, like the next two) |
+| `nfs_cachefs_max_idle_seconds`, `nfs_cachefs_last_expiry_timestamp_seconds` | `max_idle`, and when the daemon last looked for idle objects |
+| `nfs_cachefs_cull_passes_total`, `nfs_cachefs_cull_passes_without_progress_total`, `nfs_cachefs_cull_busy_skips_total`, `nfs_cachefs_cull_errors_total` | cull activity (busy skips and errors include idle culling) |
 | `nfs_cachefs_fscache_stat{section,field}` | every counter of `/proc/fs/fscache/stats`, e.g. `section="IO",field="rd"` (reads served from the cache) |
 
 Worth alerting on: `nfs_cachefs_cache_io_error == 1` (left in the file

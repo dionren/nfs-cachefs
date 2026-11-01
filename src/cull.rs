@@ -65,6 +65,22 @@
 //! (files tenants keep open or mapped) came back unchanged from every walk,
 //! being the oldest, and the cull never reached anything it could free.
 //!
+//! ## Idle objects
+//!
+//! With `max_idle` set, the daemon also culls the objects nobody has used
+//! for that long, however much space is free ([`expire_pass`]). An object's
+//! last use is the later of its atime and ctime. cachefiles touches the
+//! atime when it opens the object for a reader, but `relatime` (the
+//! default) moves it at most once a day while the ctime and mtime are
+//! older; and about 10 s after the last reader has closed the file, when
+//! the kernel lets go of the object, it rewrites the object's xattr, which
+//! moves the ctime. The later of the two follows the last use where the
+//! atime lags: a reader that kept the file open for hours, or came back
+//! within a day of an atime update. Only data files expire; an object in
+//! use answers `EBUSY` as in any cull and is set aside. A run culls for at
+//! most [`EXPIRE_RUN_BUDGET`] and drops the candidates the last cull pass
+//! left, since it may have culled or set aside some of them.
+//!
 //! ## Memory
 //!
 //! O(K) regardless of cache size, plus the skip set (one hash per object
@@ -80,13 +96,14 @@
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::fmt;
+use std::fs::Metadata;
 use std::hash::{Hash, Hasher};
 use std::io;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tracing::{debug, info, warn};
 
@@ -103,6 +120,11 @@ pub const SKIP_TTL: Duration = Duration::from_secs(300);
 
 /// A walk keeps at most this many times `cull.batch_size` candidates.
 const MAX_BATCH_FACTOR: usize = 64;
+
+/// How long one expiry run may cull before it hands back to the event loop
+/// (which starts the next run right away). Truncating a fragmented file
+/// can take seconds, and the loop must keep reading the kernel's state.
+pub const EXPIRE_RUN_BUDGET: Duration = Duration::from_secs(10);
 
 /// Per-object cull errors logged per pass; the rest are only counted.
 const MAX_ERROR_LOGS_PER_PASS: usize = 5;
@@ -221,14 +243,72 @@ pub struct Usage {
     pub at: Instant,
 }
 
+/// A file timestamp: seconds and nanoseconds since the epoch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct Stamp {
+    secs: i64,
+    nsecs: i64,
+}
+
+impl Stamp {
+    fn atime(meta: &Metadata) -> Self {
+        Self {
+            secs: meta.atime(),
+            nsecs: meta.atime_nsec(),
+        }
+    }
+
+    /// When the object was last used: the later of its atime and ctime
+    /// (see "Idle objects" above).
+    fn last_use(meta: &Metadata) -> Self {
+        let ctime = Self {
+            secs: meta.ctime(),
+            nsecs: meta.ctime_nsec(),
+        };
+        Self::atime(meta).max(ctime)
+    }
+
+    /// `None` before the epoch, when no cache file can be older anyway.
+    fn of(time: SystemTime) -> Option<Self> {
+        let since = time.duration_since(UNIX_EPOCH).ok()?;
+        Some(Self {
+            secs: i64::try_from(since.as_secs()).ok()?,
+            nsecs: i64::from(since.subsec_nanos()),
+        })
+    }
+}
+
+/// Which objects a walk collects, and the order they are culled in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Select {
+    /// Every object, oldest atime first: culling for space.
+    Oldest,
+    /// Data files last used before the cutoff, longest unused first.
+    IdleBefore(Stamp),
+}
+
+impl Select {
+    /// The sort key of the object `meta` describes, or `None` when the
+    /// selection leaves it out.
+    fn stamp(self, meta: &Metadata) -> Option<Stamp> {
+        match self {
+            Self::Oldest => Some(Stamp::atime(meta)),
+            Self::IdleBefore(cutoff) => {
+                let last_use = Stamp::last_use(meta);
+                (meta.is_file() && last_use < cutoff).then_some(last_use)
+            }
+        }
+    }
+}
+
 #[derive(Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub(crate) struct Candidate {
-    // atime_secs is the primary sort key. Putting it first makes the
-    // derived Ord rank by it, which is what the BinaryHeap relies on:
-    // as a max-heap, the root is the YOUNGEST of the K kept so far —
-    // the one we should evict if a still-older file shows up.
-    atime_secs: i64,
-    atime_nsecs: i64,
+    // The stamp (atime, or last use for idle expiry) is the primary sort
+    // key. Putting it first makes the derived Ord rank by it, which is what
+    // the BinaryHeap relies on: as a max-heap, the root is the YOUNGEST of
+    // the K kept so far — the one we should evict if a still-older file
+    // shows up.
+    stamp: Stamp,
     /// Allocated bytes, what culling this object gives back. For an index
     /// cookie directory only its own blocks: the kernel moves its subtree
     /// to the graveyard, which is counted when the graveyard is emptied.
@@ -247,13 +327,16 @@ impl Candidate {
         object_key(&self.parent, &self.name)
     }
 
-    fn atime_changed(&self) -> std::io::Result<bool> {
+    /// Whether the object no longer stands where the walk put it: its
+    /// atime moved, or it no longer counts as idle. Either way someone just
+    /// used it.
+    fn changed(&self, select: Select) -> std::io::Result<bool> {
         let meta = std::fs::symlink_metadata(self.path())?;
-        Ok(meta.atime() != self.atime_secs || meta.atime_nsec() != self.atime_nsecs)
+        Ok(select.stamp(&meta) != Some(self.stamp))
     }
 
     fn is_older_than(&self, other: &Self) -> bool {
-        (self.atime_secs, self.atime_nsecs) < (other.atime_secs, other.atime_nsecs)
+        self.stamp < other.stamp
     }
 }
 
@@ -346,9 +429,16 @@ pub fn run_pass(
     stop: &AtomicBool,
     wd: &Watchdog,
 ) -> CullStats {
-    let saved_cwd = std::env::current_dir().ok();
+    let _cwd = CwdGuard::save();
+    run_pass_with(ctx, table, target, stop, wd, kernel_cull(dev))
+}
+
+/// The kernel `cull` command for a candidate, sent from its bucket: the
+/// kernel resolves the name against the daemon's working directory. The
+/// `chdir` is skipped when the bucket is the previous candidate's.
+fn kernel_cull<K: Kernel>(dev: &K) -> impl FnMut(&Candidate) -> Result<CullOutcome> + '_ {
     let mut cwd: Option<Rc<Path>> = None;
-    let stats = run_pass_with(ctx, table, target, stop, wd, |cand| {
+    move |cand| {
         let same_dir = cwd
             .as_ref()
             .is_some_and(|dir| Rc::ptr_eq(dir, &cand.parent) || **dir == *cand.parent);
@@ -362,13 +452,26 @@ pub fn run_pass(
             cwd = Some(Rc::clone(&cand.parent));
         }
         cmd::cull(dev, &cand.name)
-    });
-    if let Some(dir) = saved_cwd {
-        if let Err(e) = std::env::set_current_dir(&dir) {
-            warn!(cwd = %dir.display(), error = %e, "failed to restore cwd");
+    }
+}
+
+/// Puts the working directory back when dropped; culling changes it.
+struct CwdGuard(Option<PathBuf>);
+
+impl CwdGuard {
+    fn save() -> Self {
+        Self(std::env::current_dir().ok())
+    }
+}
+
+impl Drop for CwdGuard {
+    fn drop(&mut self) {
+        if let Some(dir) = &self.0 {
+            if let Err(e) = std::env::set_current_dir(dir) {
+                warn!(cwd = %dir.display(), error = %e, "failed to restore cwd");
+            }
         }
     }
-    stats
 }
 
 /// [`run_pass`] with the kernel `cull` command passed in, so the pass logic
@@ -401,7 +504,14 @@ fn run_pass_with(
                 target.bytes.saturating_sub(stats.bytes_freed),
                 target.files.saturating_sub(stats.files_freed),
             );
-            let walk = collect_oldest(&cache_subdir, k, &table.skip, Some(stop), wd);
+            let walk = collect_oldest(
+                &cache_subdir,
+                k,
+                &table.skip,
+                Select::Oldest,
+                Some(stop),
+                wd,
+            );
             stats.walks += 1;
             table.note_walk(&walk, Instant::now());
             debug!(
@@ -426,54 +536,12 @@ fn run_pass_with(
             }
             wd.kick();
             stats.candidates += 1;
-            match cand.atime_changed() {
-                Ok(false) => {}
-                Ok(true) => {
-                    stats.skipped_changed += 1;
-                    continue;
-                }
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                    stats.gone += 1;
-                    continue;
-                }
-                Err(e) => {
-                    stats.errored += 1;
-                    table.set_aside(&cand, Instant::now());
-                    errors.log(&cand.name, "metadata recheck failed; skipping", &e);
-                    continue;
-                }
+            if !still_eligible(&cand, Select::Oldest, table, &mut stats, &mut errors) {
+                continue;
             }
-            let held = hold_for_reclaim(&cand.path());
-            match cull_one(&cand) {
-                Ok(CullOutcome::Culled) => {
-                    let (bytes, now_free) = reclaim(held, cand.allocated);
-                    stats.culled += 1;
-                    stats.bytes_freed += bytes;
-                    stats.files_freed += 1;
-                    if !now_free {
-                        stats.bytes_async += bytes;
-                        stats.files_async += 1;
-                    }
-                }
-                Ok(CullOutcome::Busy) => {
-                    stats.skipped_busy += 1;
-                    table.set_aside(&cand, Instant::now());
-                }
-                Ok(CullOutcome::Gone) => stats.gone += 1,
-                Err(e) if e.raw_os_error() == Some(libc::EIO) => {
-                    // Usually the kernel has stopped the cache, and every
-                    // further command would fail the same way. The daemon
-                    // checks the cache state.
-                    stats.kernel_eio += 1;
-                    table.set_aside(&cand, Instant::now());
-                    warn!(name = cand.name, error = %e, "cull failed with EIO; ending pass");
-                    break 'pass;
-                }
-                Err(e) => {
-                    stats.errored += 1;
-                    table.set_aside(&cand, Instant::now());
-                    errors.log(&cand.name, "cull failed", &e);
-                }
+            if cull_candidate(&cand, table, &mut stats, &mut errors, &mut cull_one) == Next::EndPass
+            {
+                break 'pass;
             }
         }
 
@@ -510,6 +578,206 @@ fn run_pass_with(
         pass_done!(debug);
     }
     stats
+}
+
+/// What an idle expiry run did.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Expiry {
+    pub stats: CullStats,
+    /// Idle objects found but left for the next run: more than one walk
+    /// keeps, or more than the run's time budget allowed.
+    pub left: u64,
+}
+
+/// Cull every data file nobody has used since `cutoff` (see "Idle
+/// objects"), however much space is free: one walk, which keeps at most
+/// `MAX_BATCH_FACTOR` times `cull.batch_size` objects, longest unused
+/// first, culled for at most [`EXPIRE_RUN_BUDGET`]; [`Expiry::left`] counts
+/// what is left for the next run. Objects are re-checked, culled and set
+/// aside as in [`run_pass`], and the run ends early on stop or the first
+/// `EIO`.
+pub fn expire_pass(
+    dev: &impl Kernel,
+    ctx: &CullCtx,
+    table: &mut CullTable,
+    cutoff: SystemTime,
+    stop: &AtomicBool,
+    wd: &Watchdog,
+) -> Expiry {
+    let _cwd = CwdGuard::save();
+    expire_pass_with(
+        ctx,
+        table,
+        cutoff,
+        EXPIRE_RUN_BUDGET,
+        stop,
+        wd,
+        kernel_cull(dev),
+    )
+}
+
+/// [`expire_pass`] with the time budget and the kernel `cull` command
+/// passed in.
+fn expire_pass_with(
+    ctx: &CullCtx,
+    table: &mut CullTable,
+    cutoff: SystemTime,
+    budget: Duration,
+    stop: &AtomicBool,
+    wd: &Watchdog,
+    mut cull_one: impl FnMut(&Candidate) -> Result<CullOutcome>,
+) -> Expiry {
+    let started = Instant::now();
+    let Some(cutoff) = Stamp::of(cutoff) else {
+        return Expiry::default();
+    };
+    let cache_subdir = ctx.cache_root.join("cache");
+    if !cache_subdir.is_dir() {
+        warn!(
+            path = %cache_subdir.display(),
+            "cache subdir does not exist; kernel layout changed or bind never created it"
+        );
+        return Expiry::default();
+    }
+    table.expire(started);
+    let select = Select::IdleBefore(cutoff);
+    let k = ctx.batch_size.saturating_mul(MAX_BATCH_FACTOR);
+    // Not noted in the table: its candidates and walk time belong to the
+    // culls for space.
+    let walk = collect_oldest(&cache_subdir, k, &table.skip, select, Some(stop), wd);
+    let found = walk.candidates.len();
+    let mut stats = CullStats {
+        walks: 1,
+        ..CullStats::default()
+    };
+    let mut errors = ErrorLog::default();
+    for cand in walk.candidates {
+        // At least one per run, so that a slow walk cannot starve it.
+        if stop.load(Ordering::Relaxed) || (stats.candidates > 0 && started.elapsed() >= budget) {
+            break;
+        }
+        wd.kick();
+        stats.candidates += 1;
+        if !still_eligible(&cand, select, table, &mut stats, &mut errors) {
+            continue;
+        }
+        if cull_candidate(&cand, table, &mut stats, &mut errors, &mut cull_one) == Next::EndPass {
+            break;
+        }
+    }
+    errors.finish();
+    if stats.candidates > 0 {
+        // What the last cull pass left for the next one may now be culled
+        // or set aside; that pass would then find nothing to do in it and
+        // stop instead of walking again.
+        table.queue.clear();
+    }
+    let left = walk.eligible.saturating_sub(stats.candidates as u64);
+
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    macro_rules! run_done {
+        ($level:ident) => {
+            $level!(
+                elapsed_ms,
+                objects = walk.objects,
+                idle = found,
+                culled = stats.culled,
+                bytes_freed = stats.bytes_freed,
+                skipped_busy = stats.skipped_busy,
+                skipped_changed = stats.skipped_changed,
+                gone = stats.gone,
+                errored = stats.errored + stats.kernel_eio,
+                left,
+                "idle objects expired"
+            )
+        };
+    }
+    if found > 0 {
+        run_done!(info);
+    } else {
+        run_done!(debug);
+    }
+    Expiry { stats, left }
+}
+
+/// Re-read a candidate's metadata right before culling it. `false`, with
+/// the reason counted, when it must be left alone: used since the walk,
+/// gone, or unreadable (then also set aside).
+fn still_eligible(
+    cand: &Candidate,
+    select: Select,
+    table: &mut CullTable,
+    stats: &mut CullStats,
+    errors: &mut ErrorLog,
+) -> bool {
+    match cand.changed(select) {
+        Ok(false) => true,
+        Ok(true) => {
+            stats.skipped_changed += 1;
+            false
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            stats.gone += 1;
+            false
+        }
+        Err(e) => {
+            stats.errored += 1;
+            table.set_aside(cand, Instant::now());
+            errors.log(&cand.name, "metadata recheck failed; skipping", &e);
+            false
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Next {
+    Continue,
+    EndPass,
+}
+
+/// Have the kernel cull `cand`, free its blocks through a descriptor held
+/// across the cull, and count the outcome. Busy and failing objects are set
+/// aside. `EndPass` after an `EIO`.
+fn cull_candidate(
+    cand: &Candidate,
+    table: &mut CullTable,
+    stats: &mut CullStats,
+    errors: &mut ErrorLog,
+    cull_one: &mut impl FnMut(&Candidate) -> Result<CullOutcome>,
+) -> Next {
+    let held = hold_for_reclaim(&cand.path());
+    match cull_one(cand) {
+        Ok(CullOutcome::Culled) => {
+            let (bytes, now_free) = reclaim(held, cand.allocated);
+            stats.culled += 1;
+            stats.bytes_freed += bytes;
+            stats.files_freed += 1;
+            if !now_free {
+                stats.bytes_async += bytes;
+                stats.files_async += 1;
+            }
+        }
+        Ok(CullOutcome::Busy) => {
+            stats.skipped_busy += 1;
+            table.set_aside(cand, Instant::now());
+        }
+        Ok(CullOutcome::Gone) => stats.gone += 1,
+        Err(e) if e.raw_os_error() == Some(libc::EIO) => {
+            // Usually the kernel has stopped the cache, and every further
+            // command would fail the same way. The daemon checks the cache
+            // state.
+            stats.kernel_eio += 1;
+            table.set_aside(cand, Instant::now());
+            warn!(name = cand.name, error = %e, "cull failed with EIO; ending pass");
+            return Next::EndPass;
+        }
+        Err(e) => {
+            stats.errored += 1;
+            table.set_aside(cand, Instant::now());
+            errors.log(&cand.name, "cull failed", &e);
+        }
+    }
+    Next::Continue
 }
 
 /// Open `path` so its inode outlives the unlink. `None` for directories
@@ -577,22 +845,26 @@ impl ErrorLog {
 /// One walk of the cache objects.
 #[derive(Debug)]
 pub(crate) struct Walk {
-    /// The `k` oldest objects not set aside, oldest first.
+    /// The `k` oldest objects the selection took, oldest first.
     candidates: Vec<Candidate>,
     /// Every object seen, set aside or not.
     objects: u64,
     allocated: u64,
+    /// Objects the selection took, not set aside: more than `candidates`
+    /// when there were more than `k`.
+    eligible: u64,
     /// False when the stop flag cut the walk short.
     complete: bool,
 }
 
-/// Walk the cache subtree and return the `k` oldest-by-atime objects in
-/// ascending-atime order, leaving out those in `skip`. Uses a max-heap of
-/// size k → O(N log k) time, O(k) memory regardless of cache size.
+/// Walk the cache subtree and return the `k` objects `select` ranks oldest,
+/// oldest first, leaving out those in `skip`. Uses a max-heap of size k →
+/// O(N log k) time, O(k) memory regardless of cache size.
 fn collect_oldest(
     root: &Path,
     k: usize,
     skip: &HashMap<u64, Instant>,
+    select: Select,
     stop: Option<&AtomicBool>,
     wd: &Watchdog,
 ) -> Walk {
@@ -600,6 +872,7 @@ fn collect_oldest(
         candidates: Vec::new(),
         objects: 0,
         allocated: 0,
+        eligible: 0,
         complete: true,
     };
     let mut heap: BinaryHeap<Candidate> = BinaryHeap::with_capacity(k.min(1 << 16));
@@ -653,9 +926,12 @@ fn collect_oldest(
         if !skip.is_empty() && skip.contains_key(&object_key(&parent, name)) {
             continue;
         }
+        let Some(stamp) = select.stamp(&meta) else {
+            continue;
+        };
+        walk.eligible += 1;
         let cand = Candidate {
-            atime_secs: meta.atime(),
-            atime_nsecs: meta.atime_nsec(),
+            stamp,
             allocated,
             parent,
             name: name.to_string(),
@@ -672,7 +948,7 @@ fn collect_oldest(
         }
     }
 
-    // Sorts ascending by Ord (atime_secs first) → oldest first.
+    // Sorts ascending by Ord (stamp first) → oldest first.
     walk.candidates = heap.into_sorted_vec();
     walk
 }
@@ -684,6 +960,7 @@ pub fn cache_usage(cache_root: &Path, stop: &AtomicBool, wd: &Watchdog) -> Optio
         &cache_root.join("cache"),
         0,
         &HashMap::new(),
+        Select::Oldest,
         Some(stop),
         wd,
     );
@@ -828,7 +1105,15 @@ mod tests {
     }
 
     fn oldest(root: &Path, k: usize) -> Vec<Candidate> {
-        collect_oldest(root, k, &HashMap::new(), None, &Watchdog::disabled()).candidates
+        collect_oldest(
+            root,
+            k,
+            &HashMap::new(),
+            Select::Oldest,
+            None,
+            &Watchdog::disabled(),
+        )
+        .candidates
     }
 
     #[test]
@@ -859,7 +1144,14 @@ mod tests {
         let dir = tempdir();
         let bucket = cookie_bucket(&dir);
         touch(&bucket.join("Da"), 10);
-        let walk = collect_oldest(&dir, 0, &HashMap::new(), None, &Watchdog::disabled());
+        let walk = collect_oldest(
+            &dir,
+            0,
+            &HashMap::new(),
+            Select::Oldest,
+            None,
+            &Watchdog::disabled(),
+        );
         assert!(walk.candidates.is_empty());
         assert_eq!(walk.objects, 1);
         assert!(walk.allocated > 0);
@@ -877,7 +1169,7 @@ mod tests {
             object_key(&bucket, "Da"),
             Instant::now() + Duration::from_secs(60),
         );
-        let walk = collect_oldest(&dir, 10, &skip, None, &Watchdog::disabled());
+        let walk = collect_oldest(&dir, 10, &skip, Select::Oldest, None, &Watchdog::disabled());
         let names: Vec<_> = walk.candidates.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, vec!["Db"]);
         assert_eq!(
@@ -970,10 +1262,10 @@ mod tests {
 
         let found = oldest(&dir, 1);
         assert_eq!(found.len(), 1);
-        assert!(!found[0].atime_changed().unwrap());
+        assert!(!found[0].changed(Select::Oldest).unwrap());
 
         touch(&path, 20);
-        assert!(found[0].atime_changed().unwrap());
+        assert!(found[0].changed(Select::Oldest).unwrap());
     }
 
     fn pass_ctx(root: &Path, batch_size: usize) -> CullCtx {
@@ -1152,6 +1444,7 @@ mod tests {
             &dir.join("cache"),
             10,
             &table.skip,
+            Select::Oldest,
             None,
             &Watchdog::disabled(),
         );
@@ -1430,6 +1723,297 @@ mod tests {
             ..low
         };
         assert!(CullTarget::new(&state, &above_run).is_zero());
+    }
+
+    /// `secs` from now, negative into the past.
+    fn now_plus(secs: i64) -> SystemTime {
+        let now = SystemTime::now();
+        let delta = Duration::from_secs(secs.unsigned_abs());
+        if secs >= 0 {
+            now + delta
+        } else {
+            now - delta
+        }
+    }
+
+    /// A read at `at`. Like any timestamp change it also moves the ctime
+    /// to now.
+    fn set_atime(path: &Path, at: SystemTime) {
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_accessed(at))
+            .unwrap();
+    }
+
+    /// Names of the objects under `root` unused since `cutoff`, longest
+    /// unused first.
+    fn idle(root: &Path, cutoff: SystemTime) -> Vec<String> {
+        let select = Select::IdleBefore(Stamp::of(cutoff).unwrap());
+        collect_oldest(
+            root,
+            100,
+            &HashMap::new(),
+            select,
+            None,
+            &Watchdog::disabled(),
+        )
+        .candidates
+        .into_iter()
+        .map(|c| c.name)
+        .collect()
+    }
+
+    #[test]
+    fn idle_walk_takes_data_files_unused_since_the_cutoff() {
+        let dir = tempdir();
+        let bucket = cookie_bucket(&dir);
+        // The fixture gives files an old atime and a ctime of now.
+        touch(&bucket.join("Dold"), 0);
+        touch(&bucket.join("Dread"), 0);
+        set_atime(&bucket.join("Dread"), now_plus(7200));
+        // An index cookie directory does not expire by itself.
+        fs::create_dir_all(bucket.join("Iindex")).unwrap();
+        let walk = collect_oldest(
+            &dir,
+            100,
+            &HashMap::new(),
+            Select::IdleBefore(Stamp::of(now_plus(3600)).unwrap()),
+            None,
+            &Watchdog::disabled(),
+        );
+        let names: Vec<_> = walk.candidates.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["Dold"]);
+        assert_eq!((walk.objects, walk.eligible), (3, 1));
+    }
+
+    #[test]
+    fn a_recent_ctime_keeps_an_object_whose_atime_lags() {
+        // relatime left the atime far behind, but the kernel rewrote the
+        // object's xattr when its last reader closed it, which moved the
+        // ctime: the object was in use until then.
+        let dir = tempdir();
+        let bucket = cookie_bucket(&dir);
+        touch(&bucket.join("Da"), 0);
+        assert!(idle(&dir, now_plus(-3600)).is_empty());
+        assert_eq!(idle(&dir, now_plus(3600)), vec!["Da"]);
+    }
+
+    #[test]
+    fn idle_objects_are_ranked_by_last_use() {
+        let dir = tempdir();
+        let bucket = cookie_bucket(&dir);
+        for name in ["Da", "Db", "Dc"] {
+            touch(&bucket.join(name), 0);
+        }
+        set_atime(&bucket.join("Da"), now_plus(200));
+        set_atime(&bucket.join("Db"), now_plus(100));
+        // Dc: last use is its ctime, now.
+        assert_eq!(idle(&dir, now_plus(3600)), vec!["Dc", "Db", "Da"]);
+    }
+
+    fn expire(
+        ctx: &CullCtx,
+        table: &mut CullTable,
+        cutoff: SystemTime,
+        busy: &[&str],
+    ) -> (Expiry, Vec<String>) {
+        let asked = RefCell::new(Vec::new());
+        let stop = AtomicBool::new(false);
+        let expiry = expire_pass_with(
+            ctx,
+            table,
+            cutoff,
+            NO_BUDGET,
+            &stop,
+            &Watchdog::disabled(),
+            fake_cull(busy, &asked),
+        );
+        (expiry, asked.into_inner())
+    }
+
+    #[test]
+    fn expiry_culls_every_idle_object_and_sets_busy_ones_aside() {
+        let dir = tempdir();
+        let bucket = cache_with(&dir, &[("Da", 10), ("Db", 20), ("Dc", 30), ("Dd", 40)]);
+        set_atime(&bucket.join("Dd"), now_plus(7200));
+        let freed = allocated_of(&bucket, &["Da", "Dc"]);
+        let ctx = pass_ctx(&dir, 1024);
+        let mut table = CullTable::default();
+
+        let (expiry, asked) = expire(&ctx, &mut table, now_plus(3600), &["Db"]);
+
+        assert_eq!(asked, vec!["Da", "Db", "Dc"]);
+        let stats = expiry.stats;
+        assert_eq!((stats.culled, stats.skipped_busy, expiry.left), (2, 1, 0));
+        assert_eq!((stats.bytes_freed, stats.bytes_async), (freed, 0));
+        assert_eq!(table.skipped(), 1);
+        assert_eq!(remaining(&bucket), vec!["Db", "Dd"]);
+
+        // Db stays set aside for the next run.
+        let (_, asked) = expire(&ctx, &mut table, now_plus(3600), &[]);
+        assert!(asked.is_empty(), "{asked:?}");
+    }
+
+    #[test]
+    fn expiry_skips_objects_used_since_the_walk() {
+        let dir = tempdir();
+        let bucket = cache_with(&dir, &[("Da", 10), ("Db", 20)]);
+        let stop = AtomicBool::new(false);
+        let db = bucket.join("Db");
+        let expiry = expire_pass_with(
+            &pass_ctx(&dir, 1024),
+            &mut CullTable::default(),
+            now_plus(3600),
+            NO_BUDGET,
+            &stop,
+            &Watchdog::disabled(),
+            |cand| {
+                // A reader opens Db while Da is culled.
+                set_atime(&db, now_plus(7200));
+                fs::remove_file(cand.path())?;
+                Ok(CullOutcome::Culled)
+            },
+        );
+        assert_eq!((expiry.stats.culled, expiry.stats.skipped_changed), (1, 1));
+        assert_eq!(remaining(&bucket), vec!["Db"]);
+    }
+
+    #[test]
+    fn expiry_leaves_what_one_walk_does_not_keep_for_the_next_run() {
+        let dir = tempdir();
+        // batch_size 1: a walk keeps MAX_BATCH_FACTOR objects.
+        let names: Vec<String> = (0..MAX_BATCH_FACTOR + 3)
+            .map(|i| format!("D{i:03}"))
+            .collect();
+        let cookies: Vec<(&str, i64)> = names.iter().map(|n| (n.as_str(), 0)).collect();
+        let bucket = cache_with(&dir, &cookies);
+        let ctx = pass_ctx(&dir, 1);
+        let mut table = CullTable::default();
+
+        let (first, _) = expire(&ctx, &mut table, now_plus(3600), &[]);
+        assert_eq!((first.stats.culled, first.left), (MAX_BATCH_FACTOR, 3));
+        let (second, _) = expire(&ctx, &mut table, now_plus(3600), &[]);
+        assert_eq!((second.stats.culled, second.left), (3, 0));
+        assert!(remaining(&bucket).is_empty());
+    }
+
+    #[test]
+    fn expiry_ends_on_eio() {
+        let dir = tempdir();
+        let bucket = cache_with(&dir, &[("Da", 10), ("Db", 20)]);
+        let stop = AtomicBool::new(false);
+        let mut asked = 0;
+        let expiry = expire_pass_with(
+            &pass_ctx(&dir, 1024),
+            &mut CullTable::default(),
+            now_plus(3600),
+            NO_BUDGET,
+            &stop,
+            &Watchdog::disabled(),
+            |_| {
+                asked += 1;
+                Err(Error::Kernel {
+                    cmd: "cull x".into(),
+                    source: io::Error::from_raw_os_error(libc::EIO),
+                })
+            },
+        );
+        assert_eq!(asked, 1);
+        assert_eq!((expiry.stats.kernel_eio, expiry.stats.culled), (1, 0));
+        assert_eq!(remaining(&bucket), vec!["Da", "Db"]);
+    }
+
+    #[test]
+    fn expiry_leaves_the_space_cull_table_alone() {
+        let dir = tempdir();
+        cache_with(&dir, &[("Da", 10), ("Db", 20), ("Dc", 30)]);
+        let ctx = pass_ctx(&dir, 1024);
+        let mut table = CullTable::default();
+        let (first, _) = pass(&ctx, &mut table, files(1), &[]);
+        assert_eq!(first.culled, 1);
+        let (walked_at, queued) = (table.walked_at, table.queue.len());
+
+        let (expiry, _) = expire(&ctx, &mut table, now_plus(-3600), &[]);
+        assert_eq!((expiry.stats.candidates, expiry.stats.walks), (0, 1));
+        assert_eq!((table.walked_at, table.queue.len()), (walked_at, queued));
+    }
+
+    /// A budget no test reaches.
+    const NO_BUDGET: Duration = Duration::from_secs(3600);
+
+    #[test]
+    fn expiry_hands_back_once_its_time_budget_is_spent() {
+        let dir = tempdir();
+        let bucket = cache_with(&dir, &[("Da", 10), ("Db", 20), ("Dc", 30)]);
+        let ctx = pass_ctx(&dir, 1024);
+        let mut table = CullTable::default();
+        let stop = AtomicBool::new(false);
+        let run = |table: &mut CullTable| {
+            let asked = RefCell::new(Vec::new());
+            let expiry = expire_pass_with(
+                &ctx,
+                table,
+                now_plus(3600),
+                Duration::ZERO,
+                &stop,
+                &Watchdog::disabled(),
+                fake_cull(&[], &asked),
+            );
+            (expiry, asked.into_inner())
+        };
+        // Spent before it starts: still one object per run.
+        let (first, asked) = run(&mut table);
+        assert_eq!(
+            (first.stats.culled, first.left, asked),
+            (1, 2, vec!["Da".to_string()])
+        );
+        let (second, _) = run(&mut table);
+        assert_eq!((second.stats.culled, second.left), (1, 1));
+        let (third, _) = run(&mut table);
+        assert_eq!((third.stats.culled, third.left), (1, 0));
+        assert!(remaining(&bucket).is_empty());
+    }
+
+    #[test]
+    fn a_cull_pass_after_expiry_walks_again() {
+        // Regression: the candidates a cull pass left behind could all have
+        // been culled or set aside by expiry since. The next pass then went
+        // through them, freed nothing, set nothing new aside, and stopped
+        // without walking again, although De could be culled.
+        let dir = tempdir();
+        let bucket = cache_with(
+            &dir,
+            &[("Da", 10), ("Db", 20), ("Dc", 30), ("Dd", 40), ("De", 50)],
+        );
+        set_atime(&bucket.join("De"), now_plus(7200));
+        let ctx = pass_ctx(&dir, 2);
+        let mut table = CullTable::default();
+
+        let (first, _) = pass(&ctx, &mut table, files(1), &["Db"]);
+        assert_eq!(first.culled, 1, "Da; Db is left for the next pass");
+        let (expiry, _) = expire(&ctx, &mut table, now_plus(3600), &["Db"]);
+        assert_eq!((expiry.stats.culled, expiry.stats.skipped_busy), (2, 1));
+
+        let (second, asked) = pass(&ctx, &mut table, files(1), &["Db"]);
+        assert_eq!((second.culled, second.walks), (1, 1));
+        assert_eq!(asked, vec!["De"]);
+        assert_eq!(remaining(&bucket), vec!["Db"]);
+    }
+
+    #[test]
+    fn nothing_is_idle_since_before_the_epoch() {
+        let dir = tempdir();
+        cache_with(&dir, &[("Da", 10)]);
+        let (expiry, asked) = expire(
+            &pass_ctx(&dir, 1024),
+            &mut CullTable::default(),
+            UNIX_EPOCH - Duration::from_secs(1),
+            &[],
+        );
+        assert!(asked.is_empty());
+        assert_eq!(expiry, Expiry::default());
     }
 
     #[test]

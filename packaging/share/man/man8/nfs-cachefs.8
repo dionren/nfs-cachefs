@@ -1,4 +1,4 @@
-.TH NFS-CACHEFS 8 "2026-10-31" "nfs-cachefs 1.1" "System Manager's Manual"
+.TH NFS-CACHEFS 8 "2026-11-01" "nfs-cachefs 1.2" "System Manager's Manual"
 .SH NAME
 nfs-cachefs \- userspace daemon for Linux fscache + cachefiles (traditional mode)
 .SH SYNOPSIS
@@ -18,7 +18,8 @@ filesystem approaches its
 .B bcull
 or
 .B fcull
-thresholds.
+thresholds, and optionally objects nobody has used for
+.BR max_idle .
 
 The daemon does not handle cache hits or misses on the data path \(em that
 is done entirely by the kernel
@@ -65,6 +66,17 @@ changes take effect at the next start.
 Project ID for
 .BR max_size .
 Nothing else on the filesystem may use it.
+.TP
+.B max_idle
+Also cull cache objects nobody has used for this long (for example
+.IR \(dq168h\(dq ;
+units s, m, h, d; at least 1m), however much space is free. An object's
+last use is the later of its cache file's atime and ctime; files in use
+are never culled. Checked every hour, or every tenth of
+.B max_idle
+when that is shorter, the first time one such interval after start (a
+restart detaches files kept open from the cache until they are reopened).
+Unset: objects are culled only when space runs short.
 .TP
 .B extsize
 XFS extent size hint inherited by new cache files.

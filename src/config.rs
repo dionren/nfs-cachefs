@@ -5,6 +5,7 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::time::Duration;
 
 use serde::Deserialize;
 
@@ -25,6 +26,11 @@ pub struct Config {
     /// may use it.
     #[serde(default = "default_quota_project_id")]
     pub quota_project_id: u32,
+    /// Cull objects nobody has used for this long, however much space is
+    /// free (see `cull::expire_pass`). Unset: objects stay until space runs
+    /// short.
+    #[serde(default)]
+    pub max_idle: Option<TimeSpan>,
     /// XFS extent size hint inherited by new cache files. Unset: leave the
     /// cache directories as they are.
     #[serde(default)]
@@ -50,6 +56,10 @@ fn default_quota_project_id() -> u32 {
 /// Smallest accepted `max_size`. The kernel turns the percentages into
 /// blocks with integer division, so tiny budgets give meaningless limits.
 pub const MIN_MAX_SIZE: u64 = 64 << 20;
+
+/// Smallest accepted `max_idle`. Anything shorter is more likely a slip
+/// than a wish to cull objects almost as soon as their reader closes them.
+pub const MIN_MAX_IDLE: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -212,6 +222,14 @@ impl Config {
                 "quota_project_id must be between 1 and 4294967294",
             ));
         }
+        if let Some(idle) = self.max_idle {
+            if idle.0 < MIN_MAX_IDLE {
+                return Err(Error::config(format!(
+                    "max_idle must be at least {}",
+                    TimeSpan(MIN_MAX_IDLE)
+                )));
+            }
+        }
         if let Some(extsize) = self.extsize {
             if extsize.0 < 4096 || extsize.0 > 1 << 30 || extsize.0 % 4096 != 0 {
                 return Err(Error::config(
@@ -337,6 +355,77 @@ impl fmt::Display for ByteSize {
     }
 }
 
+/// A length of time in whole seconds. In TOML a string with a unit:
+/// `"90s"`, `"30m"`, `"168h"`, `"7d"`. A bare number is refused: `168`
+/// could mean seconds or hours.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[serde(try_from = "SpanRepr")]
+pub struct TimeSpan(pub Duration);
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum SpanRepr {
+    Int(i64),
+    Float(f64),
+    Str(String),
+}
+
+impl TryFrom<SpanRepr> for TimeSpan {
+    type Error = String;
+
+    fn try_from(repr: SpanRepr) -> std::result::Result<Self, String> {
+        match repr {
+            SpanRepr::Int(n) => Err(format!(
+                "{n} needs a unit, as in \"{n}h\": s (seconds), m (minutes), h (hours) or d (days)"
+            )),
+            SpanRepr::Float(x) => Err(format!(
+                "{x} is not a duration: use a whole number and a unit, as in \"90m\""
+            )),
+            SpanRepr::Str(s) => s.parse(),
+        }
+    }
+}
+
+impl FromStr for TimeSpan {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, String> {
+        let s = s.trim();
+        let split = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+        let (number, unit) = s.split_at(split);
+        let unit_secs: u64 = match unit.trim() {
+            "s" => 1,
+            "m" => 60,
+            "h" => 60 * 60,
+            "d" => 24 * 60 * 60,
+            "" => return Err(format!("{s:?} needs a unit, as in \"168h\": s, m, h or d")),
+            other => {
+                return Err(format!(
+                    "unknown time unit {other:?} in {s:?}: use s, m, h or d"
+                ))
+            }
+        };
+        let n: u64 = number.parse().map_err(|_| {
+            format!("invalid duration {s:?}: expected a whole number and a unit, as in \"168h\"")
+        })?;
+        n.checked_mul(unit_secs)
+            .map(|secs| TimeSpan(Duration::from_secs(secs)))
+            .ok_or_else(|| format!("duration {s:?} is too long"))
+    }
+}
+
+impl fmt::Display for TimeSpan {
+    /// In the largest unit that divides it: `7d`, `90m`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let secs = self.0.as_secs();
+        let (n, unit) = [(24 * 60 * 60, "d"), (60 * 60, "h"), (60, "m")]
+            .into_iter()
+            .find(|(unit_secs, _)| secs > 0 && secs % unit_secs == 0)
+            .map_or((secs, "s"), |(unit_secs, unit)| (secs / unit_secs, unit));
+        write!(f, "{n}{unit}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -348,6 +437,7 @@ mod tests {
             secctx: None,
             max_size: None,
             quota_project_id: DEFAULT_QUOTA_PROJECT_ID,
+            max_idle: None,
             extsize: None,
             limits: Limits::default(),
             cull: Cull::default(),
@@ -367,6 +457,7 @@ mod tests {
         assert_eq!(cfg.limits.bcull, 7);
         assert_eq!(cfg.max_size, None);
         assert_eq!(cfg.quota_project_id, DEFAULT_QUOTA_PROJECT_ID);
+        assert_eq!(cfg.max_idle, None);
         assert_eq!(cfg.metrics.textfile, None);
         cfg.validate().unwrap();
     }
@@ -388,6 +479,7 @@ mod tests {
         let cfg: Config = toml::from_str(&enabled.join("\n")).unwrap();
         cfg.validate().unwrap();
         assert!(cfg.max_size.is_some() && cfg.extsize.is_some() && cfg.secctx.is_some());
+        assert!(cfg.max_idle.is_some());
         assert!(cfg.metrics.textfile.is_some());
     }
 
@@ -442,6 +534,53 @@ mod tests {
         assert!(p("-1G").is_err());
         assert!(p("99999999999P").is_err());
         assert_eq!(ByteSize(3 << 40).to_string(), "3.0 TiB");
+    }
+
+    fn max_idle(value: &str) -> std::result::Result<Config, String> {
+        let s = format!("cache_dir = \"/x\"\ntag = \"t\"\nmax_idle = {value}\n");
+        let cfg: Config = toml::from_str(&s).map_err(|e| e.to_string())?;
+        cfg.validate().map_err(|e| e.to_string())?;
+        Ok(cfg)
+    }
+
+    #[test]
+    fn parses_max_idle() {
+        let secs = |value: &str| max_idle(value).unwrap().max_idle.unwrap().0.as_secs();
+        assert_eq!(secs("\"168h\""), 168 * 3600);
+        assert_eq!(secs("\"7d\""), 7 * 86_400);
+        assert_eq!(secs("\"90m\""), 5400);
+        assert_eq!(secs("\" 600 s \""), 600);
+        assert_eq!(TimeSpan(Duration::from_secs(168 * 3600)).to_string(), "7d");
+        assert_eq!(TimeSpan(Duration::from_secs(36 * 3600)).to_string(), "36h");
+        assert_eq!(TimeSpan(Duration::from_secs(5400)).to_string(), "90m");
+        assert_eq!(TimeSpan(Duration::from_secs(61)).to_string(), "61s");
+    }
+
+    #[test]
+    fn rejects_bad_max_idle() {
+        // A bare number: seconds or hours?
+        let err = max_idle("168").unwrap_err();
+        assert!(err.contains("needs a unit"), "{err}");
+        let err = max_idle("\"168\"").unwrap_err();
+        assert!(err.contains("needs a unit"), "{err}");
+        let err = max_idle("1.5").unwrap_err();
+        assert!(err.contains("whole number"), "{err}");
+        for value in [
+            "\"1.5h\"",
+            "\"7 days\"",
+            "\"-1h\"",
+            "\"h\"",
+            "\"\"",
+            "\"7D\"",
+        ] {
+            assert!(max_idle(value).is_err(), "{value} accepted");
+        }
+        assert!(max_idle("\"99999999999999999999d\"").is_err());
+        let err = max_idle("\"999999999999999999d\"").unwrap_err();
+        assert!(err.contains("too long"), "{err}");
+        let err = max_idle("\"30s\"").unwrap_err();
+        assert!(err.contains("at least 1m"), "{err}");
+        max_idle("\"60s\"").unwrap();
     }
 
     #[test]
